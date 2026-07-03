@@ -42,6 +42,6 @@ Commits convencionales (conventional commits) en español. Nunca agregar "Co-Aut
 
 ## Fuente canónica de reglas de negocio
 
-La fuente canónica de las reglas de negocio (RN-xxx) es `docs/01-business/BUSINESS_ANALYSIS.md`.
+La fuente canónica de las reglas de negocio (RN-xxx) es `docs/01-business/BUSINESS_ANALYSIS.md`, sección 15. Toda regla de negocio nueva debe agregarse a ese catálogo; nunca redefinirse de forma local en otro documento.
 
-Problema conocido pendiente de resolución: `docs/02-requirements/SOFTWARE_REQUIREMENTS_SPECIFICATION.md` (sección 11) y `docs/03-architecture/DOMAIN_MODEL.md` numeran sus propias reglas de negocio también como RN-xxx, pero con esquemas de numeración independientes y no equivalentes entre sí. No usar ni propagar los identificadores RN-xxx de esos dos documentos como si fueran los mismos que los de BUSINESS_ANALYSIS.md hasta que se unifique la numeración.
+`docs/03-architecture/DOMAIN_MODEL.md` numera sus invariantes de nivel de entidad con el prefijo RD-xxx (Regla de Dominio), un espacio de numeración distinto e independiente de las reglas de negocio. `docs/02-requirements/SOFTWARE_REQUIREMENTS_SPECIFICATION.md` (sección 11) no define reglas propias: referencia las reglas canónicas de `BUSINESS_ANALYSIS.md` relevantes para los requisitos. El conflicto de numeración previo entre estos tres documentos está resuelto.

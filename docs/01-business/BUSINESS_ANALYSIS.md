@@ -168,7 +168,7 @@ El siguiente diagrama describe el proceso propuesto, incorporando el Motor de In
 
 ## 15. Reglas de Negocio
 
-Las siguientes reglas expresan las restricciones y comportamientos que el negocio exige a la plataforma:
+Las siguientes reglas expresan las restricciones y comportamientos que el negocio exige a la plataforma. Este catálogo es la fuente canónica única de reglas de negocio (RN-xxx) del proyecto: toda regla de negocio nueva debe incorporarse aquí, nunca redefinirse de forma independiente en otro documento. Los invariantes de nivel de entidad del modelo de dominio se numeran de forma independiente con el prefijo RD-xxx en `docs/03-architecture/DOMAIN_MODEL.md`.
 
 #### RN-001
 
@@ -239,6 +239,12 @@ Los resultados de inspección podrán utilizarse para mejorar futuros modelos de
 #### RN-012
 
 Todas las decisiones automáticas deberán ser explicables.
+
+---
+
+#### RN-013
+
+Todo lote deberá procesarse completamente antes de ejecutar la IA.
 
 ---
 

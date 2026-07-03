@@ -403,33 +403,17 @@ El sistema deberá cumplir las recomendaciones OWASP Top 10.
 
 # 11. Reglas de Negocio
 
-RN-001
+Las reglas de negocio del proyecto se definen de forma canónica en `docs/01-business/BUSINESS_ANALYSIS.md`, sección 15. La siguiente tabla referencia, bajo su identificador canónico, las reglas de ese catálogo más relevantes para los requisitos descriptos en este documento.
 
-Todo suministro pertenece a un único cliente.
-
-RN-002
-
-Todo lote deberá procesarse completamente antes de ejecutar la IA.
-
-RN-003
-
-Toda anomalía deberá poseer un IRE.
-
-RN-004
-
-El IRE siempre estará entre 0 y 100.
-
-RN-005
-
-Una anomalía no implica fraude.
-
-RN-006
-
-Toda inspección deberá registrar un resultado.
-
-RN-007
-
-Los resultados podrán utilizarse para mejorar el modelo.
+| RN canónica | Regla |
+|---|---|
+| RN-001 | Todo suministro pertenece a un único cliente. |
+| RN-006 | Toda anomalía detectada deberá recibir un Índice de Riesgo Energético (IRE). |
+| RN-007 | El IRE deberá expresarse en una escala de 0 a 100. |
+| RN-008 | La detección de una anomalía no constituye evidencia de fraude. |
+| RN-010 | Toda inspección deberá registrar un resultado. |
+| RN-011 | Los resultados de inspección podrán utilizarse para mejorar futuros modelos de Inteligencia Artificial. |
+| RN-013 | Todo lote deberá procesarse completamente antes de ejecutar la IA. |
 
 ---
 

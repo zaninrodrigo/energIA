@@ -282,15 +282,17 @@ El Cliente existe únicamente como propietario de suministros y no participa dir
 
 ### Reglas del Negocio
 
-RN-001
+Las reglas identificadas como RD-xxx en este documento son invariantes de dominio locales a este modelo. Las reglas de negocio (RN-xxx) se definen de forma canónica en `docs/01-business/BUSINESS_ANALYSIS.md`, sección 15.
 
-Un cliente puede poseer múltiples suministros.
+RD-001
 
-RN-002
+Un cliente puede poseer múltiples suministros. (implementa RN-002)
 
-Todo suministro debe pertenecer a un único cliente.
+RD-002
 
-RN-003
+Todo suministro debe pertenecer a un único cliente. (implementa RN-001)
+
+RD-003
 
 Un cliente inactivo mantiene su historial.
 
@@ -360,19 +362,19 @@ Todas las operaciones inteligentes del sistema se realizan sobre un suministro.
 
 ### Reglas del Negocio
 
-RN-004
+RD-004
 
 Un suministro posee múltiples consumos.
 
-RN-005
+RD-005
 
-Todo suministro pertenece a una única categoría tarifaria.
+Todo suministro pertenece a una única categoría tarifaria. (implementa RN-003)
 
-RN-006
+RD-006
 
-No puede existir un suministro sin cliente.
+No puede existir un suministro sin cliente. (implementa RN-001)
 
-RN-007
+RD-007
 
 El historial nunca puede eliminarse.
 
@@ -449,11 +451,11 @@ Alumbrado Público
 
 ### Reglas
 
-RN-008
+RD-008
 
-Todo suministro debe pertenecer a una categoría.
+Todo suministro debe pertenecer a una categoría. (implementa RN-003)
 
-RN-009
+RD-009
 
 La IA solo compara suministros de categorías equivalentes.
 
@@ -505,15 +507,15 @@ Error
 
 ### Reglas
 
-RN-010
+RD-010
 
 Un lote no puede ejecutarse dos veces.
 
-RN-011
+RD-011
 
 Un lote debe finalizar antes de iniciar otro.
 
-RN-012
+RD-012
 
 Todo consumo pertenece a un lote.
 
@@ -563,15 +565,15 @@ Es el origen de los consumos históricos.
 
 ### Reglas
 
-RN-013
+RD-013
 
 La lectura actual debe ser mayor o igual que la anterior.
 
-RN-014
+RD-014
 
 Los días facturados deben ser mayores que cero.
 
-RN-015
+RD-015
 
 Una lectura pertenece a un único suministro.
 
@@ -620,19 +622,19 @@ Es la principal fuente de información para el modelo de Inteligencia Artificial
 
 ### Reglas
 
-RN-016
+RD-016
 
 El consumo debe ser mayor o igual a cero.
 
-RN-017
+RD-017
 
 El período no puede superponerse con otro.
 
-RN-018
+RD-018
 
 Debe existir una lectura asociada.
 
-RN-019
+RD-019
 
 Todo consumo pertenece a un lote.
 
@@ -749,19 +751,19 @@ Crítico
 
 ## Reglas del Negocio
 
-RN-020
+RD-020
 
 Todo ResultadoIA pertenece a un único suministro.
 
-RN-021
+RD-021
 
 Todo ResultadoIA pertenece a un único lote.
 
-RN-022
+RD-022
 
 Debe registrarse la versión del modelo utilizada.
 
-RN-023
+RD-023
 
 No puede existir más de un ResultadoIA por suministro y lote.
 
@@ -845,15 +847,15 @@ Crítica
 
 ## Reglas
 
-RN-024
+RD-024
 
 Toda anomalía pertenece a un ResultadoIA.
 
-RN-025
+RD-025
 
-Una anomalía nunca representa automáticamente fraude.
+Una anomalía nunca representa automáticamente fraude. (implementa RN-008)
 
-RN-026
+RD-026
 
 Debe existir evidencia histórica.
 
@@ -992,15 +994,15 @@ Generar indicadores ejecutivos.
 
 ## Reglas
 
-RN-027
+RD-027
 
 El monto nunca puede ser negativo.
 
-RN-028
+RD-028
 
 Toda estimación debe ser reproducible.
 
-RN-029
+RD-029
 
 Debe conservarse el histórico.
 
@@ -1311,19 +1313,19 @@ Cancelada
 
 ## Reglas del Negocio
 
-RN-030
+RD-030
 
 Toda orden debe estar asociada a un suministro.
 
-RN-031
+RD-031
 
 Toda orden debe estar asociada a un Resultado IA.
 
-RN-032
+RD-032
 
 Una orden finalizada no puede volver a estado pendiente.
 
-RN-033
+RD-033
 
 No pueden existir dos órdenes activas para el mismo suministro.
 
@@ -1377,15 +1379,15 @@ Agrupa múltiples órdenes para optimizar los recorridos.
 
 ## Reglas
 
-RN-034
+RD-034
 
 Las órdenes deben pertenecer preferentemente a la misma localidad.
 
-RN-035
+RD-035
 
 Se priorizarán agrupamientos por barrio.
 
-RN-036
+RD-036
 
 Las órdenes críticas siempre tendrán prioridad.
 
@@ -1505,15 +1507,15 @@ Normalizado
 
 ## Reglas
 
-RN-037
+RD-037
 
-Toda inspección debe tener un resultado.
+Toda inspección debe tener un resultado. (implementa RN-010)
 
-RN-038
+RD-038
 
-El resultado es obligatorio.
+El resultado es obligatorio. (implementa RN-010)
 
-RN-039
+RD-039
 
 Toda inspección debe cerrar una orden.
 
@@ -1619,11 +1621,11 @@ Este indicador permitirá medir el retorno de inversión del sistema EnergIA.
 
 ## Reglas
 
-RN-040
+RD-040
 
 El recupero nunca puede ser negativo.
 
-RN-041
+RD-041
 
 Solo puede registrarse si existe una inspección finalizada.
 
@@ -1803,15 +1805,15 @@ Su función es indicar si la predicción realizada fue correcta o incorrecta.
 
 ## Reglas del Negocio
 
-RN-042
+RD-042
 
 Todo Feedback debe estar asociado a una inspección finalizada.
 
-RN-043
+RD-043
 
 Debe conservarse el resultado original del modelo.
 
-RN-044
+RD-044
 
 El feedback nunca modifica predicciones históricas.
 
@@ -1875,11 +1877,11 @@ Lectura Incorrecta
 
 ## Reglas
 
-RN-045
+RD-045
 
-Solo pueden incorporarse datos provenientes de inspecciones finalizadas.
+Solo pueden incorporarse datos provenientes de inspecciones finalizadas. (implementa RN-011)
 
-RN-046
+RD-046
 
 Las etiquetas no pueden modificarse sin auditoría.
 
@@ -1945,15 +1947,15 @@ Error
 
 ## Reglas
 
-RN-047
+RD-047
 
 Nunca debe reemplazarse un modelo sin validación.
 
-RN-048
+RD-048
 
 Toda versión debe conservarse.
 
-RN-049
+RD-049
 
 Debe registrarse la configuración utilizada.
 
