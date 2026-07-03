@@ -1,0 +1,40 @@
+# Tooling caches
+.atl/
+.engram/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Data (keep samples only, never raw datasets)
+datasets/raw/
+*.parquet
+*.sqlite
+
+# ML artifacts
+*.pkl
+*.joblib
+mlruns/
