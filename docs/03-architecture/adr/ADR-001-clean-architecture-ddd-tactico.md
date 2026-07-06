@@ -2,10 +2,10 @@
 
 | Campo | Valor |
 |---|---|
-| Estado | Propuesto |
+| Estado | Aceptado |
 | Fecha | 2026-07-06 |
 | Autor | Rodrigo Zanin |
-| Decisores | Pendiente de validación |
+| Decisores | Rodrigo Zanin (2026-07-06) |
 
 ## Contexto
 
