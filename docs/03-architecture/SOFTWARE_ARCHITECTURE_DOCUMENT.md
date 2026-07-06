@@ -74,7 +74,7 @@ Frontend
 
 Backend
 
-Motor IA
+Motor de Inteligencia Energética
 
 Persistencia
 
@@ -182,7 +182,7 @@ Feature Engineering
 
 ---
 
-# 12. Arquitectura del Motor IA
+# 12. Arquitectura del Motor de Inteligencia Energética
 
 Isolation Forest
 

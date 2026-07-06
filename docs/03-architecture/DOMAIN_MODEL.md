@@ -43,7 +43,7 @@ Este documento constituye la base para el diseño de:
 - Base de datos.
 - API REST.
 - Casos de uso.
-- Motor de Inteligencia Artificial.
+- Motor de Inteligencia Energética.
 - Arquitectura Clean Architecture.
 
 ---
@@ -142,7 +142,7 @@ Representa el historial de consumos y lecturas.
 
 ---
 
-## 4.4 Motor de Inteligencia Artificial
+## 4.4 Motor de Inteligencia Energética
 
 Analiza los consumos y determina anomalías.
 
@@ -202,7 +202,7 @@ Cliente
      Lecturas         Consumos
                             │
                             ▼
-                 Motor de Inteligencia Artificial
+                 Motor de Inteligencia Energética
                             │
                 ┌───────────┴───────────┐
                 │                       │
@@ -424,7 +424,7 @@ obtenerUltimaAnomalia()
 
 Clasifica comercialmente un suministro.
 
-Esta clasificación será utilizada por el Motor IA para comparar suministros similares.
+Esta clasificación será utilizada por el Motor de Inteligencia Energética para comparar suministros similares.
 
 ---
 
@@ -694,7 +694,7 @@ El contexto de Inteligencia Artificial es el núcleo del sistema EnergIA.
 
 Su objetivo es analizar automáticamente el comportamiento histórico de los suministros para detectar patrones anómalos, estimar el riesgo asociado y recomendar acciones de inspección.
 
-El Motor IA nunca modifica datos operativos.
+El Motor de Inteligencia Energética nunca modifica datos operativos.
 
 Su función consiste en generar conocimiento para asistir la toma de decisiones.
 
@@ -704,7 +704,7 @@ Su función consiste en generar conocimiento para asistir la toma de decisiones.
 
 ## Descripción
 
-Representa el resultado completo generado por el Motor de Inteligencia Artificial para un suministro durante el procesamiento de un lote.
+Representa el resultado completo generado por el Motor de Inteligencia Energética para un suministro durante el procesamiento de un lote.
 
 Cada ejecución del modelo genera exactamente un ResultadoIA por suministro analizado.
 
@@ -1234,7 +1234,7 @@ El dominio de Inteligencia Artificial tiene como finalidad transformar grandes v
 
 # 9. Dominio de Gestión Inteligente de Inspecciones
 
-El dominio de Gestión Inteligente de Inspecciones tiene como objetivo transformar los resultados obtenidos por el Motor de Inteligencia Artificial en acciones concretas para el personal operativo.
+El dominio de Gestión Inteligente de Inspecciones tiene como objetivo transformar los resultados obtenidos por el Motor de Inteligencia Energética en acciones concretas para el personal operativo.
 
 Este dominio representa el puente entre el análisis inteligente y la operación diaria de la empresa.
 
@@ -1752,7 +1752,7 @@ El dominio de Gestión Inteligente de Inspecciones busca:
 - Reducir tiempos de traslado.
 - Incrementar la tasa de detección de irregularidades.
 - Maximizar el recupero económico.
-- Retroalimentar continuamente el Motor de Inteligencia Artificial mediante los resultados obtenidos en campo.
+- Retroalimentar continuamente el Motor de Inteligencia Energética mediante los resultados obtenidos en campo.
 
 ---
 
@@ -1762,7 +1762,7 @@ El dominio de Gestión Inteligente de Inspecciones busca:
 
 ## Descripción
 
-El contexto de Aprendizaje Continuo tiene como objetivo mejorar progresivamente la precisión del Motor de Inteligencia Artificial a partir de los resultados obtenidos durante las inspecciones realizadas por la empresa.
+El contexto de Aprendizaje Continuo tiene como objetivo mejorar progresivamente la precisión del Motor de Inteligencia Energética a partir de los resultados obtenidos durante las inspecciones realizadas por la empresa.
 
 A diferencia de un modelo estático, EnergIA incorpora un mecanismo de retroalimentación (Feedback Loop) que permite utilizar la información obtenida en campo para enriquecer el conjunto de datos históricos y generar nuevas versiones del modelo predictivo.
 
@@ -1774,7 +1774,7 @@ Este proceso garantiza que el sistema evolucione junto con los cambios en los pa
 
 ## Descripción
 
-Representa la información que retorna desde una inspección hacia el Motor de Inteligencia Artificial.
+Representa la información que retorna desde una inspección hacia el Motor de Inteligencia Energética.
 
 Su función es indicar si la predicción realizada fue correcta o incorrecta.
 
@@ -2115,7 +2115,7 @@ Toda nueva versión del modelo será gestionada desde esta entidad para mantener
 
 El contexto de Aprendizaje Continuo busca:
 
-- Mejorar progresivamente la precisión del Motor IA.
+- Mejorar progresivamente la precisión del Motor de Inteligencia Energética.
 - Reducir falsos positivos.
 - Reducir falsos negativos.
 - Adaptarse a nuevos patrones de consumo.

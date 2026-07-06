@@ -115,7 +115,7 @@ API FastAPI
 
 ↓
 
-Motor IA
+Motor de Inteligencia Energética
 
 ↓
 
@@ -524,7 +524,7 @@ RF-006
 
 Dado un lote correctamente procesado
 
-Cuando finaliza el Motor IA
+Cuando finaliza el Motor de Inteligencia Energética
 
 Entonces deberán registrarse todas las anomalías detectadas junto con su IRE correspondiente.
 

@@ -168,14 +168,14 @@ Para enriquecer el análisis.
 
 Como Sistema
 
-Quiero ejecutar automáticamente el motor IA
+Quiero ejecutar automáticamente el Motor de Inteligencia Energética
 
 Cuando finalice un lote.
 
 ---
 
 # ÉPICA 3
-## Motor IA
+## Motor de Inteligencia Energética
 
 ---
 

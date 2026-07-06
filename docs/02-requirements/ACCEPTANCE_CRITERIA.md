@@ -192,12 +192,12 @@ El sistema detecta que existen nuevos consumos.
 
 Then
 
-El Motor IA deberá ejecutarse automáticamente.
+El Motor de Inteligencia Energética deberá ejecutarse automáticamente.
 
 ---
 
 # ÉPICA 3
-## Motor IA
+## Motor de Inteligencia Energética
 
 ---
 

@@ -344,7 +344,7 @@ Ejemplos:
 
 ## 17. KPIs
 
-Los siguientes indicadores permiten medir el desempeño operativo, el rendimiento del motor de Inteligencia Artificial y el impacto de negocio de la plataforma:
+Los siguientes indicadores permiten medir el desempeño operativo, el rendimiento del Motor de Inteligencia Energética y el impacto de negocio de la plataforma:
 
 ### Operativos
 
