@@ -22,7 +22,7 @@ coverage/
 # Environment
 .env
 .env.*
-!.env.example
+# plantilla versionada: env.example (sin punto inicial)
 
 # IDE / OS
 .vscode/

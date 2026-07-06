@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: energia-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-energia}
+      POSTGRES_USER: ${POSTGRES_USER:-energia}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      # HOST:CONTAINER. El host expone 5434 porque 5432 y 5433 ya están
+      # ocupados por otras instancias de PostgreSQL en esta máquina. Dentro del
+      # contenedor Postgres sigue escuchando en su puerto estándar, 5432.
+      - "${POSTGRES_HOST_PORT:-5434}:5432"
+    volumes:
+      - energia_db_data:/var/lib/postgresql/data
+      # :ro -> los scripts de init nunca se modifican desde el contenedor.
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-energia} -d ${POSTGRES_DB:-energia}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  energia_db_data:

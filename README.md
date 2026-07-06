@@ -18,7 +18,7 @@ Fase de documentación y diseño — sin código aún. El repositorio contiene l
 |---|---|---|
 | `docs/01-business` | PRODUCT_VISION.md, BUSINESS_ANALYSIS.md | Completo / Borrador |
 | `docs/02-requirements` | SOFTWARE_REQUIREMENTS_SPECIFICATION.md, USER_STORIES.md, ACCEPTANCE_CRITERIA.md | Completo |
-| `docs/03-architecture` | DOMAIN_MODEL.md, DATABASE_DESIGN.md, SOFTWARE_ARCHITECTURE_DOCUMENT.md, API_SPEC.md | Completo / Borrador / Esqueleto / Pendiente |
+| `docs/03-architecture` | DOMAIN_MODEL.md, DATABASE_DESIGN.md, SOFTWARE_ARCHITECTURE_DOCUMENT.md, API_SPEC.md | Completo / Completo / Esqueleto / Pendiente |
 | `docs/04-ai` | AI_ENGINE_SPEC.md, DATA_SCIENCE_NOTEBOOK.md | Pendiente |
 | `docs/05-devops` | SECURITY_SPEC.md, TESTING_SPEC.md, DEPLOYMENT_SPEC.md, ROADMAP.md | Pendiente |
 
@@ -34,6 +34,26 @@ Para el detalle de estado de cada documento y la deuda documental conocida, ver 
 - **Testing:** Pytest, Playwright
 - **Origen de datos:** Oracle (facturación por lotes)
 - **Arquitectura:** Clean Architecture + Domain-Driven Design
+
+## Base de datos local
+
+PostgreSQL 16 corre en Docker para desarrollo local. El DDL ejecutable (24 tablas, particionado de `consumos`, restricciones CHECK mapeadas a invariantes de dominio) vive en [`docker/postgres/init/`](./docker/postgres/init/); las decisiones detrás de ese diseño están documentadas en [`docs/03-architecture/DATABASE_DESIGN.md`](./docs/03-architecture/DATABASE_DESIGN.md).
+
+Requisitos: Docker y Docker Compose.
+
+```bash
+cp env.example .env        # ajustar credenciales si hace falta
+docker compose up -d db
+docker compose ps           # esperar "healthy"
+```
+
+Conexión (puerto host **5434**, no 5432 — ver DATABASE_DESIGN.md §2):
+
+```bash
+psql -h localhost -p 5434 -U energia -d energia
+# o sin instalar psql en el host:
+docker exec -it energia-db psql -U energia -d energia
+```
 
 ## Estructura del repositorio
 
