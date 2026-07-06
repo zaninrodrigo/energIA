@@ -280,11 +280,17 @@ CI/CD
 
 # 19. Decisiones Arquitectónicas
 
-ADR-001
+Los Architectural Decision Records (ADR) del proyecto viven en `docs/03-architecture/adr/`. Son registros inmutables: una vez aceptado, un ADR no se edita para cambiar la decisión — si la decisión cambia, se crea un nuevo ADR que reemplaza al anterior. Cada ADR sigue el ciclo de estados Propuesto → Aceptado → Reemplazado.
 
-ADR-002
-
-...
+| ID | Título | Estado | Enlace |
+|---|---|---|---|
+| ADR-001 | Estilo arquitectónico del backend — Clean Architecture + DDD táctico | Propuesto | [adr/ADR-001-clean-architecture-ddd-tactico.md](adr/ADR-001-clean-architecture-ddd-tactico.md) |
+| ADR-002 | Plataforma backend — Python + FastAPI | Propuesto | [adr/ADR-002-backend-python-fastapi.md](adr/ADR-002-backend-python-fastapi.md) |
+| ADR-003 | Frontend — React + TypeScript | Propuesto | [adr/ADR-003-frontend-react-typescript.md](adr/ADR-003-frontend-react-typescript.md) |
+| ADR-004 | Almacén analítico-operativo — PostgreSQL propio, Oracle como fuente de solo lectura vía ETL incremental | Propuesto | [adr/ADR-004-almacen-postgresql-oracle-etl.md](adr/ADR-004-almacen-postgresql-oracle-etl.md) |
+| ADR-005 | Motor de detección — enfoque híbrido (reglas + estadística + Isolation Forest no supervisado) | Propuesto | [adr/ADR-005-motor-deteccion-hibrido.md](adr/ADR-005-motor-deteccion-hibrido.md) |
+| ADR-006 | Topología de despliegue — monolito modular contenedorizado (Docker), no microservicios | Propuesto | [adr/ADR-006-monolito-modular-docker.md](adr/ADR-006-monolito-modular-docker.md) |
+| ADR-007 | Modelo de procesamiento — batch orientado a lotes de facturación, no streaming | Propuesto | [adr/ADR-007-procesamiento-batch-no-streaming.md](adr/ADR-007-procesamiento-batch-no-streaming.md) |
 
 ---
 
