@@ -42,6 +42,12 @@ curl http://localhost:8000/health
   local corriendo (contenedor `energia-db`, puerto host `5434`). Los valores por defecto de
   `Settings` ya apuntan ahí, así que no hace falta configurar variables de entorno para
   correrlos en desarrollo.
+  - La mayoría (todo lo que no sea `test_health_integration.py`) corre contra una base
+    `energia_test` separada, nunca contra `energia`: `tests/integration/conftest.py` la crea
+    (o recrea) y reaplica el DDL de `docker/postgres/init/*.sql` una vez por sesión de test;
+    cada contexto compone sus propios fixtures de app/cliente/limpieza sobre esa base (ver
+    `tests/integration/contexts/clientes/conftest.py` como primer ejemplo). Funciona igual en
+    CI: solo depende de las mismas variables de entorno que `Settings`.
 
 ## Configuración
 
@@ -56,8 +62,8 @@ backend/
   src/energia/
     api/            # FastAPI app factory + routers (presentation)
     shared/          # config y wiring de base de datos, transversal a todos los contextos
-    contexts/         # un paquete por bounded context (ver contexts/README.md) — vacío hasta
-                        # que aterrice la primera feature de cada contexto
+    contexts/         # un paquete por bounded context (ver contexts/README.md)
+      clientes/         # Gestión de Clientes — implementado (US-001, import + listado)
   tests/
     unit/            # sin red ni DB real
     integration/      # contra energia-db real

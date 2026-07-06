@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from energia.api.routes.health import router as health_router
+from energia.contexts.clientes.presentation.routes import router as clientes_router
 from energia.shared.config import get_settings
 from energia.shared.db import build_engine, build_sessionmaker
 
@@ -30,4 +31,5 @@ def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     app = FastAPI(title="EnergIA API", lifespan=lifespan)
     app.include_router(health_router)
+    app.include_router(clientes_router)
     return app

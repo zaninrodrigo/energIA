@@ -23,7 +23,7 @@ Este documento es el índice maestro de toda la documentación de EnergIA. Reún
 | `docs/03-architecture/DATABASE_DESIGN.md` | Diseño lógico y físico de la base de datos PostgreSQL | Completo (v1.0.0, DDL ejecutable en `docker/postgres/init/`) |
 | `docs/03-architecture/SOFTWARE_ARCHITECTURE_DOCUMENT.md` | Documento de arquitectura de software | Esqueleto (sin contenido, salvo §19 Decisiones Arquitectónicas) |
 | `docs/03-architecture/adr/` | Architectural Decision Records (ADR-001 a ADR-007) | Aceptados (2026-07-06) |
-| `docs/03-architecture/API_SPEC.md` | Especificación de la API REST del backend | Pendiente |
+| `docs/03-architecture/API_SPEC.md` | Especificación de la API REST del backend | En progreso (Gestión de Clientes documentado) |
 | `docs/04-ai/AI_ENGINE_SPEC.md` | Especificación del Motor de Inteligencia Energética | Pendiente |
 | `docs/04-ai/DATA_SCIENCE_NOTEBOOK.md` | Plan de análisis exploratorio de datos | Pendiente |
 | `docs/05-devops/SECURITY_SPEC.md` | Especificación de seguridad (autenticación, autorización, OWASP) | Pendiente |
@@ -48,3 +48,5 @@ Este documento es el índice maestro de toda la documentación de EnergIA. Reún
 7. **Matriz de roles y permisos diferida por decisión del 2026-07-06** — definir al implementar autenticación. Todas las tablas de `docker/postgres/init/01_schema.sql` ya tienen columnas `created_by`/`updated_by` (UUID) preparadas para auditoría, pero sin FK a una tabla de usuarios porque esa tabla todavía no existe.
 
 8. **Diseño de tablas staging y proceso de carga pendiente de conocer el formato de los datos históricos a recibir.** `docker/postgres/init/03_staging.sql` crea el schema `staging` vacío a propósito: no hay acceso a Oracle (ADR-004) y una persona entregará archivos con el histórico de consumos en un formato todavía sin definir. Diseñar las tablas de staging y el proceso de carga queda pendiente hasta conocer ese formato.
+
+9. **Reimportación de clientes soft-deleted crea nueva identidad** — decidir si corresponde resurrección de la fila original (impacta FKs históricas de suministros). Comportamiento actual documentado en `backend/src/energia/contexts/README.md` ("Comportamiento ante soft-delete"): `uq_clientes_numero_cliente` es un índice único parcial (`WHERE deleted_at IS NULL`), por lo que reimportar un `numero_cliente` soft-deleted crea una fila nueva con `id` nuevo en lugar de reactivar la fila original. Pendiente de decisión de negocio.
