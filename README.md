@@ -10,7 +10,7 @@ EnergIA incorpora un Motor de Inteligencia Energética que analiza automáticame
 
 ## Estado del proyecto
 
-Fase de documentación y diseño — sin código aún. El repositorio contiene la especificación funcional, de negocio, de arquitectura y de dominio sobre la cual se construirá la implementación.
+Sprint 0 — esqueleto de backend. El repositorio contiene la especificación funcional, de negocio, de arquitectura y de dominio, y ahora también el andamiaje inicial del backend (FastAPI, Clean Architecture, endpoint de salud, cobertura de tests ≥ 90%) sobre el cual se construirán los bounded contexts.
 
 ## Mapa de documentación
 
@@ -55,11 +55,24 @@ psql -h localhost -p 5434 -U energia -d energia
 docker exec -it energia-db psql -U energia -d energia
 ```
 
+## Backend
+
+API FastAPI (Clean Architecture + DDD, ver `docs/03-architecture/adr/ADR-001` y siguientes). Requiere Python 3.12 y la base de datos local levantada (sección anterior).
+
+```bash
+cd backend
+make install   # crea .venv e instala el proyecto en modo editable con dependencias de dev
+make test      # unit + integration, con gate de cobertura del 90%
+make run       # uvicorn con reload en http://localhost:8000
+```
+
+Detalle completo (targets de Makefile, estructura, variables de entorno) en [`backend/README.md`](./backend/README.md).
+
 ## Estructura del repositorio
 
 ```
 energIA/
-├── backend/           # API FastAPI (Clean Architecture + DDD) — vacío por ahora
+├── backend/           # API FastAPI (Clean Architecture + DDD) — esqueleto Sprint 0
 ├── frontend/          # Aplicación React/TypeScript — vacío por ahora
 ├── docker/            # Definiciones de contenedores y orquestación local
 ├── datasets/          # Muestras de datos (los datasets crudos no se versionan)
