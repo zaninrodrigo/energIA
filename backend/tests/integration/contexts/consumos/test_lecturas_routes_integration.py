@@ -206,6 +206,78 @@ async def test_import_rejects_a_type_broken_record_individually_instead_of_422in
     assert any("fecha_lectura" in reason for reason in reasons_by_fecha["not-a-date"])
 
 
+async def test_import_rejects_a_typo_field_instead_of_silently_dropping_it(
+    lecturas_client: AsyncClient,
+) -> None:
+    """A typo'd key (e.g. `dias_facturadoo` instead of `dias_facturados`) used to be dropped
+    silently by `extra="ignore"` -- the record then failed only as a *domain* rejection (missing
+    `dias_facturados`), with no hint the key was ever misspelled. `extra="forbid"` (DECISION #11,
+    aligning `LecturaImportItem` with `LoteImportItem`/`ConsumoImportItem`) rejects it
+    structurally instead, naming the offending key.
+
+    `dias_facturadoo` (not `dias_facturado`) is deliberate: a typo that merely drops the trailing
+    `s` would still be a substring of the real field name, so it would accidentally match the
+    domain-rejection message's mention of `dias_facturados` too -- masking whether this test is
+    actually exercising the structural (`extra="forbid"`) path instead of the pre-existing domain
+    one.
+    """
+    await _seed_cliente(lecturas_client, "9001")
+    await _seed_suministro(lecturas_client, numero_suministro="SUM-9001", numero_cliente="9001")
+    payload = [
+        {
+            "numero_suministro": "SUM-9001",
+            "fecha_lectura": "2024-01-01",
+            "lectura_anterior": 0.0,
+            "lectura_actual": 10.0,
+            "dias_facturados": 30,
+        },
+        {
+            "numero_suministro": "SUM-9001",
+            "fecha_lectura": "2024-01-02",
+            "lectura_anterior": 0.0,
+            "lectura_actual": 10.0,
+            "dias_facturadoo": 30,
+        },
+    ]
+
+    response = await lecturas_client.post("/api/v1/lecturas/import", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] == 1
+    assert len(body["rejected"]) == 1
+    assert any("dias_facturadoo" in reason for reason in body["rejected"][0]["reasons"])
+
+
+async def test_import_rejects_a_previously_silently_ignored_extra_field(
+    lecturas_client: AsyncClient,
+) -> None:
+    """Before DECISION #11, a plausible-looking but undeclared field (e.g. `observaciones`) was
+    silently dropped by `extra="ignore"` -- the record was created anyway, with no trace the
+    field was ever sent. `extra="forbid"` closes that silent-drop path: the record is now
+    rejected structurally, naming the offending key."""
+    await _seed_cliente(lecturas_client, "9101")
+    await _seed_suministro(lecturas_client, numero_suministro="SUM-9101", numero_cliente="9101")
+    payload = [
+        {
+            "numero_suministro": "SUM-9101",
+            "fecha_lectura": "2024-01-01",
+            "lectura_anterior": 0.0,
+            "lectura_actual": 10.0,
+            "dias_facturados": 30,
+            "observaciones": "medidor cambiado",
+        }
+    ]
+
+    response = await lecturas_client.post("/api/v1/lecturas/import", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] == 0
+    assert len(body["rejected"]) == 1
+    assert any("observaciones" in reason for reason in body["rejected"][0]["reasons"])
+
+
 async def test_import_rejects_a_nan_bearing_record_individually_instead_of_500ing_the_batch(
     lecturas_client: AsyncClient,
 ) -> None:
@@ -530,14 +602,15 @@ async def test_get_lecturas_filtered_by_a_nonexistent_numero_suministro_returns_
     assert body["items"] == []
 
 
-async def test_reimporting_a_soft_deleted_key_creates_a_new_identity(
+async def test_reimporting_a_soft_deleted_key_resurrects_the_original_row(
     lecturas_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Same current, deliberate semantics as clientes/suministros (see `contexts/README.md`,
-    "Comportamiento ante soft-delete"): re-importing a soft-deleted `(suministro_id,
-    fecha_lectura)` creates a brand-new row with a new id, it does not resurrect the original
-    row -- because `uq_lecturas_suministro_fecha` is a partial unique index (`WHERE deleted_at
-    IS NULL`).
+    """DECISION #9 (confirmed by business, 2026-07-13): same resurrection semantics as
+    clientes/suministros (see `contexts/README.md`, "Comportamiento ante soft-delete") --
+    re-importing a soft-deleted `(suministro_id, fecha_lectura)` revives the original row (same
+    `id`) instead of creating a brand-new identity. `uq_lecturas_suministro_fecha` is a partial
+    unique index (`WHERE deleted_at IS NULL`), which is exactly why the dead row can be found and
+    revived without colliding with anything.
     """
     await _seed_cliente(lecturas_client, "9001")
     await _seed_suministro(lecturas_client, numero_suministro="SUM-9001", numero_cliente="9001")
@@ -570,15 +643,18 @@ async def test_reimporting_a_soft_deleted_key_creates_a_new_identity(
                 "numero_suministro": "SUM-9001",
                 "fecha_lectura": "2024-01-01",
                 "lectura_anterior": 0.0,
-                "lectura_actual": 10.0,
+                "lectura_actual": 20.0,
                 "dias_facturados": 30,
             }
         ],
     )
 
-    assert second.json()["created"] == 1
+    second_body = second.json()
+    assert second_body["created"] == 0
+    assert second_body["restored"] == 1
     listing_after = (await lecturas_client.get("/api/v1/lecturas")).json()
-    new_id = next(
-        item["id"] for item in listing_after["items"] if item["fecha_lectura"] == "2024-01-01"
+    resurrected = next(
+        item for item in listing_after["items"] if item["fecha_lectura"] == "2024-01-01"
     )
-    assert new_id != original_id
+    assert resurrected["id"] == original_id  # SAME identity, not a new row
+    assert resurrected["lectura_actual"] == "20.000"

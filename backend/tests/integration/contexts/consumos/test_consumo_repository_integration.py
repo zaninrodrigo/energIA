@@ -431,3 +431,274 @@ async def test_a_fecha_inicio_outside_2022_2026_lands_in_the_default_partition(
         suministro_id, date(2019, 6, 1), date(2019, 6, 30)
     )
     assert found is not None
+
+
+# --- DECISION #9: resurrection -----------------------------------------------------------------
+
+
+async def test_get_most_recently_deleted_by_suministro_and_periodo_picks_the_latest_deleted_at(
+    db_session: AsyncSession, suministro_id: UUID, lote_id: UUID
+) -> None:
+    repository = SqlAlchemyConsumoRepository(db_session)
+    older = Consumo.create(
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-06-01",
+        fecha_fin="2024-06-30",
+        dias_facturados=30,
+        kwh="60.000",
+    )
+    await repository.save(older)
+    await db_session.execute(
+        text("UPDATE consumos SET deleted_at = now() - interval '2 hours' WHERE id = :id"),
+        {"id": older.id},
+    )
+    newer = Consumo.create(
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-06-01",
+        fecha_fin="2024-06-30",
+        dias_facturados=30,
+        kwh="90.000",
+    )
+    await repository.save(newer)
+    await db_session.execute(
+        text("UPDATE consumos SET deleted_at = now() - interval '1 hour' WHERE id = :id"),
+        {"id": newer.id},
+    )
+    await db_session.commit()
+
+    dead = await repository.get_most_recently_deleted_by_suministro_and_periodo(
+        suministro_id, date(2024, 6, 1), date(2024, 6, 30)
+    )
+
+    assert dead is not None
+    assert dead.id == newer.id
+
+
+async def test_resurrect_clears_deleted_at_and_writes_every_mutable_field(
+    db_session: AsyncSession, suministro_id: UUID, lote_id: UUID
+) -> None:
+    repository = SqlAlchemyConsumoRepository(db_session)
+    original = Consumo.create(
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-07-01",
+        fecha_fin="2024-07-31",
+        dias_facturados=31,
+        kwh="310.000",
+    )
+    await repository.save(original)
+    await db_session.execute(
+        text("UPDATE consumos SET deleted_at = now() WHERE id = :id"), {"id": original.id}
+    )
+    await db_session.commit()
+
+    resurrected = Consumo.create(
+        id=original.id,
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-07-01",
+        fecha_fin="2024-07-31",
+        dias_facturados=31,
+        kwh="620.000",
+    )
+    await repository.resurrect(resurrected)
+
+    found = await repository.get_by_suministro_and_periodo(
+        suministro_id, date(2024, 7, 1), date(2024, 7, 31)
+    )
+    assert found is not None
+    assert found.id == original.id
+    assert found.kwh == Decimal("620.000")
+    assert found.consumo_promedio_diario == Decimal("20.000")
+    row = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM consumos WHERE id = :id"), {"id": original.id}
+        )
+    ).one()
+    assert row.deleted_at is None
+
+
+async def test_resurrect_raises_consumo_conflict_error_on_a_natural_key_race(
+    db_session: AsyncSession, suministro_id: UUID, lote_id: UUID
+) -> None:
+    """A dead row's own `(suministro_id, fecha_inicio, fecha_fin)` can be claimed by a
+    concurrent active insert before its resurrection commits; the update that clears
+    `deleted_at` back to a duplicate active period violates `uq_consumos_suministro_periodo` --
+    surfaced as `ConsumoConflictError`, not an unhandled IntegrityError."""
+    repository = SqlAlchemyConsumoRepository(db_session)
+    dead = Consumo.create(
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-11-01",
+        fecha_fin="2024-11-30",
+        dias_facturados=30,
+        kwh="10.000",
+    )
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE consumos SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    await repository.save(
+        Consumo.create(
+            suministro_id=suministro_id,
+            lote_id=lote_id,
+            fecha_inicio="2024-11-01",
+            fecha_fin="2024-11-30",
+            dias_facturados=30,
+            kwh="20.000",
+        )
+    )
+
+    with pytest.raises(ConsumoConflictError):
+        await repository.resurrect(
+            Consumo.create(
+                id=dead.id,
+                suministro_id=suministro_id,
+                lote_id=lote_id,
+                fecha_inicio="2024-11-01",
+                fecha_fin="2024-11-30",
+                dias_facturados=30,
+                kwh="30.000",
+            )
+        )
+
+
+async def test_resurrect_raises_consumo_conflict_error_when_the_row_is_no_longer_dead(
+    db_session: AsyncSession, suministro_id: UUID, lote_id: UUID
+) -> None:
+    """FIX 1 (lost-update race): two concurrent resurrections of the SAME dead row used to both
+    "succeed" with no guard on `deleted_at` in `resurrect()`'s `WHERE` clause -- whichever commit
+    landed last silently won, with no error raised at all. Simulated here by clearing
+    `deleted_at` directly via SQL (standing in for "a concurrent session already resurrected this
+    row first") before calling `resurrect()`: the `deleted_at IS NOT NULL` guard then matches
+    zero rows, and the zero-`rowcount` check raises `ConsumoConflictError` instead of silently
+    re-applying (and overwriting) whatever the winner wrote."""
+    repository = SqlAlchemyConsumoRepository(db_session)
+    dead = Consumo.create(
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-12-01",
+        fecha_fin="2024-12-31",
+        dias_facturados=31,
+        kwh="10.000",
+    )
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE consumos SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    # Simulates the concurrent winner: by the time this resurrect() call runs, the row is no
+    # longer dead.
+    await db_session.execute(
+        text("UPDATE consumos SET deleted_at = NULL WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+
+    with pytest.raises(ConsumoConflictError):
+        await repository.resurrect(
+            Consumo.create(
+                id=dead.id,
+                suministro_id=suministro_id,
+                lote_id=lote_id,
+                fecha_inicio="2024-12-01",
+                fecha_fin="2024-12-31",
+                dias_facturados=31,
+                kwh="999.000",
+            )
+        )
+
+    found = await repository.get_by_suministro_and_periodo(
+        suministro_id, date(2024, 12, 1), date(2024, 12, 31)
+    )
+    assert found is not None
+    assert found.kwh == Decimal("10.000")
+
+
+# --- DECISION #13: soft-delete correction path --------------------------------------------------
+
+
+async def test_soft_delete_marks_an_active_consumo_deleted_and_returns_true(
+    db_session: AsyncSession, suministro_id: UUID, lote_id: UUID
+) -> None:
+    repository = SqlAlchemyConsumoRepository(db_session)
+    consumo = Consumo.create(
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-08-01",
+        fecha_fin="2024-08-31",
+        dias_facturados=31,
+        kwh="100.000",
+    )
+    await repository.save(consumo)
+
+    deleted = await repository.soft_delete(consumo.id)
+
+    assert deleted is True
+    assert (
+        await repository.get_by_suministro_and_periodo(
+            suministro_id, date(2024, 8, 1), date(2024, 8, 31)
+        )
+        is None
+    )
+    row = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM consumos WHERE id = :id"), {"id": consumo.id}
+        )
+    ).one()
+    assert row.deleted_at is not None
+
+
+async def test_soft_delete_returns_false_for_an_unknown_id(db_session: AsyncSession) -> None:
+    repository = SqlAlchemyConsumoRepository(db_session)
+
+    assert await repository.soft_delete(uuid4()) is False
+
+
+async def test_soft_delete_returns_false_for_an_already_deleted_consumo(
+    db_session: AsyncSession, suministro_id: UUID, lote_id: UUID
+) -> None:
+    repository = SqlAlchemyConsumoRepository(db_session)
+    consumo = Consumo.create(
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio="2024-09-01",
+        fecha_fin="2024-09-30",
+        dias_facturados=30,
+        kwh="50.000",
+    )
+    await repository.save(consumo)
+    assert await repository.soft_delete(consumo.id) is True
+
+    assert await repository.soft_delete(consumo.id) is False
+
+
+async def test_soft_delete_does_not_commit_the_transaction(
+    test_session_factory: async_sessionmaker[AsyncSession],
+    suministro_id: UUID,
+    lote_id: UUID,
+) -> None:
+    async with test_session_factory() as session:
+        repository = SqlAlchemyConsumoRepository(session)
+        consumo = Consumo.create(
+            suministro_id=suministro_id,
+            lote_id=lote_id,
+            fecha_inicio="2024-10-01",
+            fecha_fin="2024-10-31",
+            dias_facturados=31,
+            kwh="70.000",
+        )
+        await repository.save(consumo)
+        await session.commit()
+
+        await repository.soft_delete(consumo.id)
+        # Deliberately no commit here: closing the session below rolls back the soft-delete.
+
+    async with test_session_factory() as verify_session:
+        verify_repository = SqlAlchemyConsumoRepository(verify_session)
+        found = await verify_repository.get_by_suministro_and_periodo(
+            suministro_id, date(2024, 10, 1), date(2024, 10, 31)
+        )
+        assert found is not None

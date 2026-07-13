@@ -444,13 +444,15 @@ async def test_get_lotes_orders_most_recently_imported_first(
     assert codigos.index("LOTE-D2") < codigos.index("LOTE-D1")
 
 
-async def test_reimporting_a_soft_deleted_codigo_lote_creates_a_new_identity(
+async def test_reimporting_a_soft_deleted_codigo_lote_resurrects_the_original_row(
     lotes_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Same current, deliberate semantics as clientes/suministros/lecturas (see
-    `contexts/README.md`, "Comportamiento ante soft-delete"): re-importing a soft-deleted
-    `codigo_lote` creates a brand-new row with a new id, it does not resurrect the original row
-    -- because `uq_lotes_codigo_lote` is a partial unique index (`WHERE deleted_at IS NULL`).
+    """DECISION #9 (confirmed by business, 2026-07-13): same resurrection semantics as
+    clientes/suministros/lecturas (see `contexts/README.md`, "Comportamiento ante soft-delete")
+    -- re-importing a soft-deleted `codigo_lote` revives the original row (same `id`) instead of
+    creating a brand-new identity. `uq_lotes_codigo_lote` is a partial unique index (`WHERE
+    deleted_at IS NULL`), which is exactly why the dead row can be found and revived without
+    colliding with anything.
     """
     await lotes_client.post(
         "/api/v1/lotes/import", json=[{"codigo_lote": "LOTE-E1", "cantidad_registros": 5}]
@@ -466,10 +468,41 @@ async def test_reimporting_a_soft_deleted_codigo_lote_creates_a_new_identity(
     await db_session.commit()
 
     second = await lotes_client.post(
-        "/api/v1/lotes/import", json=[{"codigo_lote": "LOTE-E1", "cantidad_registros": 5}]
+        "/api/v1/lotes/import", json=[{"codigo_lote": "LOTE-E1", "cantidad_registros": 9}]
     )
 
-    assert second.json()["created"] == 1
+    second_body = second.json()
+    assert second_body["created"] == 0
+    assert second_body["restored"] == 1
     listing_after = (await lotes_client.get("/api/v1/lotes")).json()
-    new_id = next(item["id"] for item in listing_after["items"] if item["codigo_lote"] == "LOTE-E1")
-    assert new_id != original_id
+    resurrected = next(item for item in listing_after["items"] if item["codigo_lote"] == "LOTE-E1")
+    assert resurrected["id"] == original_id  # SAME identity, not a new row
+    assert resurrected["cantidad_registros"] == 9
+    assert resurrected["estado"] == "Pendiente"
+
+
+async def test_resurrecting_a_lote_that_transitioned_to_procesado_keeps_that_estado(
+    lotes_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """DECISION #9's Lote-specific rule: a resurrected lote KEEPS the `estado` it had when
+    soft-deleted -- the repository's UPDATE never writes `estado`/`fecha_importacion` on
+    resurrection, exactly like an ordinary update (RD-010's intent)."""
+    await lotes_client.post(
+        "/api/v1/lotes/import", json=[{"codigo_lote": "LOTE-E2", "cantidad_registros": 5}]
+    )
+    await db_session.execute(
+        text("UPDATE lotes SET estado = 'Procesado' WHERE codigo_lote = 'LOTE-E2'")
+    )
+    await db_session.execute(
+        text("UPDATE lotes SET deleted_at = now() WHERE codigo_lote = 'LOTE-E2'")
+    )
+    await db_session.commit()
+
+    response = await lotes_client.post(
+        "/api/v1/lotes/import", json=[{"codigo_lote": "LOTE-E2", "cantidad_registros": 5}]
+    )
+
+    assert response.json()["restored"] == 1
+    listing = (await lotes_client.get("/api/v1/lotes")).json()
+    resurrected = next(item for item in listing["items"] if item["codigo_lote"] == "LOTE-E2")
+    assert resurrected["estado"] == "Procesado"

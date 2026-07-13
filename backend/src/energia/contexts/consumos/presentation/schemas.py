@@ -18,7 +18,15 @@ class LecturaImportItem(BaseModel):
     (reported per-record in `ImportSummarySchema.rejected`, HTTP 200), not a structural one.
     `numero_suministro` is a natural key (not a UUID) -- the use case resolves it, rejecting the
     record if the suministro does not exist.
+
+    `model_config = ConfigDict(extra="forbid")` (DECISION #11, aligning with `LoteImportItem`/
+    `ConsumoImportItem` below): an unrecognized key (a typo like `dias_facturadoo`, or any other
+    undeclared field) is rejected as a structural violation (per-record, HTTP 200, naming the
+    offending key in the reason), not silently dropped. This used to default to Pydantic's
+    `extra="ignore"` (undeclared fields dropped with no trace at all).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     numero_suministro: str | None = None
     fecha_lectura: str | None = None
@@ -56,6 +64,7 @@ class ImportSummarySchema(BaseModel):
     created: int
     updated: int
     unchanged: int
+    restored: int
     rejected: list[RejectedRecordSchema]
 
 
@@ -91,9 +100,10 @@ class LoteImportItem(BaseModel):
     sending `estado` had no effect, but also meant a *typo'd* field name (e.g.
     `canditad_registros` instead of `cantidad_registros`) vanished exactly the same invisible
     way, silently defaulting the real field to its own default instead of surfacing any error.
-    `clientes`/`suministros`/`lecturas`' own import DTOs still use `extra="ignore"` -- aligning
-    them the same way is a separate, not-yet-made decision (see `PROJECT_MASTER_SPEC.md`,
-    pending items).
+    `clientes`/`suministros`/`lecturas`' own import DTOs (`ClienteImportItem`,
+    `SuministroImportItem`, `LecturaImportItem` above) were aligned to this same `extra="forbid"`
+    too (DECISION #11, confirmed by business 2026-07-13 -- see `PROJECT_MASTER_SPEC.md`, resolved
+    items).
     """
 
     model_config = ConfigDict(extra="forbid")

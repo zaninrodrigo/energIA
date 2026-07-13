@@ -22,16 +22,32 @@ _SUMINISTRO_IDS = {"S1": uuid4(), "S2": uuid4()}
 
 @dataclass
 class _FakeLecturaRepository:
-    """In-memory stand-in for `LecturaRepository`, keyed by `(suministro_id, fecha_lectura)`."""
+    """In-memory stand-in for `LecturaRepository`, keyed by `(suministro_id, fecha_lectura)`.
+
+    `_deleted` models soft-deleted rows (DECISION #9, resurrection) -- mirrors
+    `contexts.clientes.application.test_import_clientes._FakeClienteRepository` exactly.
+    """
 
     _by_key: dict[tuple[UUID, date], Lectura] = field(default_factory=dict)
+    _deleted: list[Lectura] = field(default_factory=list)
     saved: list[Lectura] = field(default_factory=list)
+    resurrected: list[Lectura] = field(default_factory=list)
     poisoned_keys: frozenset[tuple[UUID, date]] = frozenset()
 
     async def get_by_suministro_and_fecha(
         self, suministro_id: UUID, fecha_lectura: date
     ) -> Lectura | None:
         return self._by_key.get((suministro_id, fecha_lectura))
+
+    async def get_most_recently_deleted_by_suministro_and_fecha(
+        self, suministro_id: UUID, fecha_lectura: date
+    ) -> Lectura | None:
+        candidates = [
+            lectura
+            for lectura in self._deleted
+            if (lectura.suministro_id, lectura.fecha_lectura) == (suministro_id, fecha_lectura)
+        ]
+        return candidates[-1] if candidates else None
 
     async def save(self, lectura: Lectura) -> None:
         key = (lectura.suministro_id, lectura.fecha_lectura)
@@ -40,6 +56,14 @@ class _FakeLecturaRepository:
         self._by_key[key] = lectura
         self.saved.append(lectura)
 
+    async def resurrect(self, lectura: Lectura) -> None:
+        key = (lectura.suministro_id, lectura.fecha_lectura)
+        if key in self.poisoned_keys:
+            raise LecturaConflictError(f"conflicto simulado para {key!r}")
+        self._deleted = [item for item in self._deleted if item.id != lectura.id]
+        self._by_key[key] = lectura
+        self.resurrected.append(lectura)
+
     async def list_active(
         self, *, limit: int, offset: int, suministro_id: UUID | None = None
     ) -> list[Lectura]:
@@ -47,6 +71,16 @@ class _FakeLecturaRepository:
 
     async def count_active(self, *, suministro_id: UUID | None = None) -> int:
         raise NotImplementedError("not needed by ImportLecturas")
+
+
+async def _soft_delete(
+    repository: _FakeLecturaRepository, suministro_id: UUID, fecha_lectura: date
+) -> Lectura:
+    """Test helper: simulate a soft-delete without a real database -- mirrors
+    `test_import_clientes._soft_delete` exactly."""
+    lectura = repository._by_key.pop((suministro_id, fecha_lectura))
+    repository._deleted.append(lectura)
+    return lectura
 
 
 @dataclass
@@ -219,6 +253,56 @@ async def test_execute_updates_a_record_whose_data_changed(
     assert updated is not None
     assert updated.lectura_actual == Decimal("175.000")
     assert updated.id == original.id
+
+
+async def test_execute_resurrects_a_soft_deleted_record_preserving_its_identity(
+    repository: _FakeLecturaRepository, suministro_directory: _FakeSuministroDirectory
+) -> None:
+    """DECISION #9: re-importing a soft-deleted `(suministro_id, fecha_lectura)` revives the
+    original row (same `id`) instead of creating a brand-new identity."""
+    use_case = _use_case(repository, suministro_directory)
+    await use_case.execute(
+        _ListLecturaSource([_record(fecha_lectura="2024-01-01", lectura_actual="150.000")])
+    )
+    dead = await _soft_delete(repository, _SUMINISTRO_IDS["S1"], date(2024, 1, 1))
+
+    summary = await use_case.execute(
+        _ListLecturaSource([_record(fecha_lectura="2024-01-01", lectura_actual="175.000")])
+    )
+
+    assert summary.created == 0
+    assert summary.updated == 0
+    assert summary.unchanged == 0
+    assert summary.restored == 1
+    assert summary.rejected == []
+    resurrected = await repository.get_by_suministro_and_fecha(
+        _SUMINISTRO_IDS["S1"], date(2024, 1, 1)
+    )
+    assert resurrected is not None
+    assert resurrected.id == dead.id
+    assert resurrected.lectura_actual == Decimal("175.000")
+
+
+async def test_execute_rejects_a_record_whose_resurrect_raises_a_conflict(
+    repository: _FakeLecturaRepository, suministro_directory: _FakeSuministroDirectory
+) -> None:
+    """A `LecturaConflictError` from `repository.resurrect()` (e.g. a race against a concurrent
+    insert claiming the same composite natural key) rejects only that record, exactly like
+    `save()`."""
+    use_case = _use_case(repository, suministro_directory)
+    await use_case.execute(_ListLecturaSource([_record(fecha_lectura="2024-05-01")]))
+    await _soft_delete(repository, _SUMINISTRO_IDS["S1"], date(2024, 5, 1))
+    repository.poisoned_keys = frozenset({(_SUMINISTRO_IDS["S1"], date(2024, 5, 1))})
+
+    summary = await use_case.execute(_ListLecturaSource([_record(fecha_lectura="2024-05-01")]))
+
+    assert summary.restored == 0
+    assert summary.created == 0
+    assert len(summary.rejected) == 1
+    assert (
+        await repository.get_by_suministro_and_fecha(_SUMINISTRO_IDS["S1"], date(2024, 5, 1))
+        is None
+    )
 
 
 async def test_execute_treats_the_same_fecha_for_a_different_suministro_as_a_different_record(

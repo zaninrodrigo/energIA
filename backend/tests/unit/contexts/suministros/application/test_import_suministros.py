@@ -25,14 +25,26 @@ _CATEGORIA_IDS = {"Residencial": uuid4(), "Comercial": uuid4()}
 
 @dataclass
 class _FakeSuministroRepository:
-    """In-memory stand-in for `SuministroRepository`, keyed by numero_suministro."""
+    """In-memory stand-in for `SuministroRepository`, keyed by numero_suministro.
+
+    `_deleted` models soft-deleted rows (DECISION #9, resurrection) -- mirrors
+    `contexts.clientes.application.test_import_clientes._FakeClienteRepository` exactly.
+    """
 
     _by_numero_suministro: dict[str, Suministro] = field(default_factory=dict)
+    _deleted: list[Suministro] = field(default_factory=list)
     saved: list[Suministro] = field(default_factory=list)
+    resurrected: list[Suministro] = field(default_factory=list)
     poisoned_numero_suministros: frozenset[str] = frozenset()
 
     async def get_by_numero_suministro(self, numero_suministro: str) -> Suministro | None:
         return self._by_numero_suministro.get(numero_suministro)
+
+    async def get_most_recently_deleted_by_numero_suministro(
+        self, numero_suministro: str
+    ) -> Suministro | None:
+        candidates = [s for s in self._deleted if s.numero_suministro == numero_suministro]
+        return candidates[-1] if candidates else None
 
     async def save(self, suministro: Suministro) -> None:
         if suministro.numero_suministro in self.poisoned_numero_suministros:
@@ -42,6 +54,15 @@ class _FakeSuministroRepository:
         self._by_numero_suministro[suministro.numero_suministro] = suministro
         self.saved.append(suministro)
 
+    async def resurrect(self, suministro: Suministro) -> None:
+        if suministro.numero_suministro in self.poisoned_numero_suministros:
+            raise SuministroConflictError(
+                f"conflicto simulado para numero_suministro={suministro.numero_suministro!r}"
+            )
+        self._deleted = [s for s in self._deleted if s.id != suministro.id]
+        self._by_numero_suministro[suministro.numero_suministro] = suministro
+        self.resurrected.append(suministro)
+
     async def list_active(
         self, *, limit: int, offset: int, cliente_id: UUID | None = None
     ) -> list[Suministro]:
@@ -49,6 +70,14 @@ class _FakeSuministroRepository:
 
     async def count_active(self, *, cliente_id: UUID | None = None) -> int:
         raise NotImplementedError("not needed by ImportSuministros")
+
+
+async def _soft_delete(repository: _FakeSuministroRepository, numero_suministro: str) -> Suministro:
+    """Test helper: simulate a soft-delete without a real database -- mirrors
+    `test_import_clientes._soft_delete` exactly."""
+    suministro = repository._by_numero_suministro.pop(numero_suministro)
+    repository._deleted.append(suministro)
+    return suministro
 
 
 @dataclass
@@ -344,6 +373,53 @@ async def test_execute_rejects_a_record_whose_save_raises_a_conflict_without_abo
     assert await repository.get_by_numero_suministro("S1") is not None
     assert await repository.get_by_numero_suministro("S2") is None
     assert await repository.get_by_numero_suministro("S3") is not None
+
+
+async def test_execute_resurrects_a_soft_deleted_record_preserving_its_identity(
+    repository: _FakeSuministroRepository,
+    cliente_directory: _FakeClienteDirectory,
+    categoria_directory: _FakeCategoriaTarifariaDirectory,
+) -> None:
+    """DECISION #9: re-importing a soft-deleted `numero_suministro` revives the original row
+    (same `id`) instead of creating a brand-new identity."""
+    use_case = _use_case(repository, cliente_directory, categoria_directory)
+    await use_case.execute(_ListSuministroSource([_record("S1", localidad="Original")]))
+    dead = await _soft_delete(repository, "S1")
+
+    summary = await use_case.execute(
+        _ListSuministroSource([_record("S1", localidad="Resurrected")])
+    )
+
+    assert summary.created == 0
+    assert summary.updated == 0
+    assert summary.unchanged == 0
+    assert summary.restored == 1
+    assert summary.rejected == []
+    resurrected = await repository.get_by_numero_suministro("S1")
+    assert resurrected is not None
+    assert resurrected.id == dead.id
+    assert resurrected.localidad == "Resurrected"
+
+
+async def test_execute_rejects_a_record_whose_resurrect_raises_a_conflict(
+    repository: _FakeSuministroRepository,
+    cliente_directory: _FakeClienteDirectory,
+    categoria_directory: _FakeCategoriaTarifariaDirectory,
+) -> None:
+    """A `SuministroConflictError` from `repository.resurrect()` (e.g. a race against a
+    concurrent insert claiming the same natural key) rejects only that record, exactly like
+    `save()`."""
+    use_case = _use_case(repository, cliente_directory, categoria_directory)
+    await use_case.execute(_ListSuministroSource([_record("S1")]))
+    await _soft_delete(repository, "S1")
+    repository.poisoned_numero_suministros = frozenset({"S1"})
+
+    summary = await use_case.execute(_ListSuministroSource([_record("S1")]))
+
+    assert summary.restored == 0
+    assert summary.created == 0
+    assert len(summary.rejected) == 1
+    assert await repository.get_by_numero_suministro("S1") is None
 
 
 async def test_execute_parses_fecha_alta_onto_the_saved_suministro(

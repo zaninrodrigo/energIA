@@ -26,10 +26,16 @@ _LOTE_IDS = {"L1": uuid4(), "L2": uuid4()}
 @dataclass
 class _FakeConsumoRepository:
     """In-memory stand-in for `ConsumoRepository`, keyed by `(suministro_id, fecha_inicio,
-    fecha_fin)` -- the composite natural key."""
+    fecha_fin)` -- the composite natural key.
+
+    `_deleted` models soft-deleted rows (DECISION #9, resurrection) -- mirrors
+    `contexts.clientes.application.test_import_clientes._FakeClienteRepository` exactly.
+    """
 
     _by_key: dict[tuple[UUID, date, date], Consumo] = field(default_factory=dict)
+    _deleted: list[Consumo] = field(default_factory=list)
     saved: list[Consumo] = field(default_factory=list)
+    resurrected: list[Consumo] = field(default_factory=list)
     poisoned_keys: frozenset[tuple[UUID, date, date]] = frozenset()
 
     async def get_by_suministro_and_periodo(
@@ -37,12 +43,34 @@ class _FakeConsumoRepository:
     ) -> Consumo | None:
         return self._by_key.get((suministro_id, fecha_inicio, fecha_fin))
 
+    async def get_most_recently_deleted_by_suministro_and_periodo(
+        self, suministro_id: UUID, fecha_inicio: date, fecha_fin: date
+    ) -> Consumo | None:
+        candidates = [
+            consumo
+            for consumo in self._deleted
+            if (consumo.suministro_id, consumo.fecha_inicio, consumo.fecha_fin)
+            == (suministro_id, fecha_inicio, fecha_fin)
+        ]
+        return candidates[-1] if candidates else None
+
     async def save(self, consumo: Consumo) -> None:
         key = (consumo.suministro_id, consumo.fecha_inicio, consumo.fecha_fin)
         if key in self.poisoned_keys:
             raise ConsumoConflictError(f"conflicto simulado para {key!r}")
         self._by_key[key] = consumo
         self.saved.append(consumo)
+
+    async def resurrect(self, consumo: Consumo) -> None:
+        key = (consumo.suministro_id, consumo.fecha_inicio, consumo.fecha_fin)
+        if key in self.poisoned_keys:
+            raise ConsumoConflictError(f"conflicto simulado para {key!r}")
+        self._deleted = [item for item in self._deleted if item.id != consumo.id]
+        self._by_key[key] = consumo
+        self.resurrected.append(consumo)
+
+    async def soft_delete(self, consumo_id: UUID) -> bool:
+        raise NotImplementedError("not needed by ImportConsumos")
 
     async def list_active(
         self,
@@ -58,6 +86,16 @@ class _FakeConsumoRepository:
         self, *, suministro_id: UUID | None = None, lote_id: UUID | None = None
     ) -> int:
         raise NotImplementedError("not needed by ImportConsumos")
+
+
+async def _soft_delete(
+    repository: _FakeConsumoRepository, suministro_id: UUID, fecha_inicio: date, fecha_fin: date
+) -> Consumo:
+    """Test helper: simulate a soft-delete without a real database -- mirrors
+    `test_import_clientes._soft_delete` exactly."""
+    consumo = repository._by_key.pop((suministro_id, fecha_inicio, fecha_fin))
+    repository._deleted.append(consumo)
+    return consumo
 
 
 @dataclass
@@ -539,6 +577,63 @@ async def test_execute_updates_a_record_whose_data_changed(
     assert updated is not None
     assert updated.kwh == Decimal("400.000")
     assert updated.id == original.id
+
+
+async def test_execute_resurrects_a_soft_deleted_record_recomputing_consumo_promedio_diario(
+    repository: _FakeConsumoRepository,
+    suministro_directory: _FakeSuministroDirectory,
+    lote_directory: _FakeLoteDirectory,
+    lectura_repository: _FakeLecturaRepository,
+) -> None:
+    """DECISION #9: re-importing a soft-deleted `(suministro_id, fecha_inicio, fecha_fin)`
+    revives the original row (same `id`) instead of creating a brand-new identity.
+    `consumo_promedio_diario` gets the exact same treatment as an ordinary update: recomputed
+    from THIS record's own `kwh`/`dias_facturados`, not preserved from the dead row (FIX 1's
+    rule, see `import_consumos.py`'s module docstring) -- also this decision's own #13 interplay
+    point (DELETE + re-import ends up here too)."""
+    use_case = _use_case(repository, suministro_directory, lote_directory, lectura_repository)
+    await use_case.execute(_ListConsumoSource([_record(kwh="310.000")]))  # 310/31 = 10.000
+    dead = await _soft_delete(
+        repository, _SUMINISTRO_IDS["S1"], date(2024, 1, 1), date(2024, 1, 31)
+    )
+
+    summary = await use_case.execute(_ListConsumoSource([_record(kwh="620.000")]))  # 620/31 = 20
+
+    assert summary.created == 0
+    assert summary.updated == 0
+    assert summary.unchanged == 0
+    assert summary.restored == 1
+    assert summary.rejected == []
+    resurrected = await repository.get_by_suministro_and_periodo(
+        _SUMINISTRO_IDS["S1"], date(2024, 1, 1), date(2024, 1, 31)
+    )
+    assert resurrected is not None
+    assert resurrected.id == dead.id
+    assert resurrected.kwh == Decimal("620.000")
+    assert resurrected.consumo_promedio_diario == Decimal("20.000")
+
+
+async def test_execute_rejects_a_record_whose_resurrect_raises_a_conflict(
+    repository: _FakeConsumoRepository,
+    suministro_directory: _FakeSuministroDirectory,
+    lote_directory: _FakeLoteDirectory,
+    lectura_repository: _FakeLecturaRepository,
+) -> None:
+    """A `ConsumoConflictError` from `repository.resurrect()` (e.g. a race against a concurrent
+    insert claiming the same composite natural key) rejects only that record, exactly like
+    `save()`."""
+    use_case = _use_case(repository, suministro_directory, lote_directory, lectura_repository)
+    await use_case.execute(_ListConsumoSource([_record()]))
+    key = (_SUMINISTRO_IDS["S1"], date(2024, 1, 1), date(2024, 1, 31))
+    await _soft_delete(repository, *key)
+    repository.poisoned_keys = frozenset({key})
+
+    summary = await use_case.execute(_ListConsumoSource([_record()]))
+
+    assert summary.restored == 0
+    assert summary.created == 0
+    assert len(summary.rejected) == 1
+    assert await repository.get_by_suministro_and_periodo(*key) is None
 
 
 async def test_execute_upserts_over_a_duplicate_key_within_the_same_payload(

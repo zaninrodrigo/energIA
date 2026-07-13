@@ -17,20 +17,37 @@ from energia.contexts.consumos.domain.ports import UNSET, LoteConflictError, Lot
 
 @dataclass
 class _FakeLoteRepository:
-    """In-memory stand-in for `LoteRepository`, keyed by `codigo_lote`."""
+    """In-memory stand-in for `LoteRepository`, keyed by `codigo_lote`.
+
+    `_deleted` models soft-deleted rows (DECISION #9, resurrection) -- mirrors
+    `contexts.clientes.application.test_import_clientes._FakeClienteRepository` exactly.
+    """
 
     _by_key: dict[str, Lote] = field(default_factory=dict)
+    _deleted: list[Lote] = field(default_factory=list)
     saved: list[Lote] = field(default_factory=list)
+    resurrected: list[Lote] = field(default_factory=list)
     poisoned_keys: frozenset[str] = frozenset()
 
     async def get_by_codigo_lote(self, codigo_lote: str) -> Lote | None:
         return self._by_key.get(codigo_lote)
+
+    async def get_most_recently_deleted_by_codigo_lote(self, codigo_lote: str) -> Lote | None:
+        candidates = [lote for lote in self._deleted if lote.codigo_lote == codigo_lote]
+        return candidates[-1] if candidates else None
 
     async def save(self, lote: Lote) -> None:
         if lote.codigo_lote in self.poisoned_keys:
             raise LoteConflictError(f"conflicto simulado para {lote.codigo_lote!r}")
         self._by_key[lote.codigo_lote] = lote
         self.saved.append(lote)
+
+    async def resurrect(self, lote: Lote) -> None:
+        if lote.codigo_lote in self.poisoned_keys:
+            raise LoteConflictError(f"conflicto simulado para {lote.codigo_lote!r}")
+        self._deleted = [item for item in self._deleted if item.id != lote.id]
+        self._by_key[lote.codigo_lote] = lote
+        self.resurrected.append(lote)
 
     async def list_active(
         self, *, limit: int, offset: int, estado: EstadoLote | None = None
@@ -39,6 +56,14 @@ class _FakeLoteRepository:
 
     async def count_active(self, *, estado: EstadoLote | None = None) -> int:
         raise NotImplementedError("not needed by ImportLotes")
+
+
+async def _soft_delete(repository: _FakeLoteRepository, codigo_lote: str) -> Lote:
+    """Test helper: simulate a soft-delete without a real database -- mirrors
+    `test_import_clientes._soft_delete` exactly."""
+    lote = repository._by_key.pop(codigo_lote)
+    repository._deleted.append(lote)
+    return lote
 
 
 class _ListLoteSource:
@@ -246,6 +271,51 @@ async def test_execute_updating_an_existing_lote_preserves_its_original_fecha_im
     assert updated is not None
     assert updated.fecha_importacion == original_fecha
     assert datetime.now(UTC) - original_fecha > timedelta(seconds=0)
+
+
+async def test_execute_resurrecting_a_lote_preserves_its_estado_and_fecha_importacion(
+    repository: _FakeLoteRepository,
+) -> None:
+    """DECISION #9: a resurrected lote KEEPS the `estado` (and `fecha_importacion`) it had when
+    soft-deleted -- the same RD-010 protection an ordinary update already has (see
+    `test_execute_updating_an_existing_lote_never_resets_its_estado` above)."""
+    use_case = _use_case(repository)
+    await use_case.execute(_ListLoteSource([_record(cantidad_registros=100)]))
+    original = await repository.get_by_codigo_lote("LOTE-2024-01")
+    assert original is not None
+    procesado = original.transition_to(EstadoLote.PROCESANDO).transition_to(EstadoLote.PROCESADO)
+    await repository.save(procesado)
+    dead = await _soft_delete(repository, "LOTE-2024-01")
+
+    summary = await use_case.execute(_ListLoteSource([_record(cantidad_registros=200)]))
+
+    assert summary.created == 0
+    assert summary.updated == 0
+    assert summary.restored == 1
+    resurrected = await repository.get_by_codigo_lote("LOTE-2024-01")
+    assert resurrected is not None
+    assert resurrected.id == dead.id
+    assert resurrected.estado is EstadoLote.PROCESADO
+    assert resurrected.fecha_importacion == dead.fecha_importacion
+    assert resurrected.cantidad_registros == 200
+
+
+async def test_execute_rejects_a_record_whose_resurrect_raises_a_conflict(
+    repository: _FakeLoteRepository,
+) -> None:
+    """A `LoteConflictError` from `repository.resurrect()` (e.g. a race against a concurrent
+    insert claiming the same `codigo_lote`) rejects only that record, exactly like `save()`."""
+    use_case = _use_case(repository)
+    await use_case.execute(_ListLoteSource([_record(codigo_lote="LOTE-9999")]))
+    await _soft_delete(repository, "LOTE-9999")
+    repository.poisoned_keys = frozenset({"LOTE-9999"})
+
+    summary = await use_case.execute(_ListLoteSource([_record(codigo_lote="LOTE-9999")]))
+
+    assert summary.restored == 0
+    assert summary.created == 0
+    assert len(summary.rejected) == 1
+    assert await repository.get_by_codigo_lote("LOTE-9999") is None
 
 
 async def test_execute_returns_a_zeroed_summary_for_an_empty_source(

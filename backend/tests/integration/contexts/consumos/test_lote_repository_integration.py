@@ -93,6 +93,121 @@ async def test_save_never_overwrites_estado_on_an_existing_row(db_session: Async
     assert found.estado is EstadoLote.PENDIENTE
 
 
+async def test_get_most_recently_deleted_by_codigo_lote_picks_the_latest_deleted_at(
+    db_session: AsyncSession,
+) -> None:
+    repository = SqlAlchemyLoteRepository(db_session)
+    older = Lote.create(codigo_lote="LOTE-D01")
+    await repository.save(older)
+    await db_session.execute(
+        text("UPDATE lotes SET deleted_at = now() - interval '2 hours' WHERE id = :id"),
+        {"id": older.id},
+    )
+    newer = Lote.create(codigo_lote="LOTE-D01")
+    await repository.save(newer)
+    await db_session.execute(
+        text("UPDATE lotes SET deleted_at = now() - interval '1 hour' WHERE id = :id"),
+        {"id": newer.id},
+    )
+    await db_session.commit()
+
+    dead = await repository.get_most_recently_deleted_by_codigo_lote("LOTE-D01")
+
+    assert dead is not None
+    assert dead.id == newer.id
+
+
+async def test_resurrect_clears_deleted_at_but_never_writes_estado_or_fecha_importacion(
+    db_session: AsyncSession,
+) -> None:
+    """DECISION #9's Lote-specific rule: `resurrect()` protects `estado`/`fecha_importacion` the
+    exact same structural way `save()` already does (FIX 3) -- even if the `Lote` object passed
+    in carries a different `estado`, the column is never part of the `UPDATE`'s `SET` list."""
+    repository = SqlAlchemyLoteRepository(db_session)
+    original = Lote.create(codigo_lote="LOTE-D02", cantidad_registros=5)
+    await repository.save(original)
+    # Flips `estado` directly via SQL, exactly like `test_reimporting_after_the_lote_
+    # transitioned_to_procesado_never_resets_its_estado` (integration test at the route level):
+    # the processing engine that would do this through `Lote.transition_to()` does not exist yet.
+    await db_session.execute(
+        text("UPDATE lotes SET estado = 'Procesado' WHERE id = :id"), {"id": original.id}
+    )
+    await db_session.execute(
+        text("UPDATE lotes SET deleted_at = now() WHERE id = :id"), {"id": original.id}
+    )
+    await db_session.commit()
+
+    # Deliberately construct a resurrection candidate carrying a DIFFERENT `estado`
+    # (`Pendiente`, what `Lote.create()` always returns) than the dead row's actual stored
+    # `Procesado` -- if `resurrect()` ever started writing `estado`, this would silently revert
+    # it, exactly the RD-010 violation FIX 3 already prevents for `save()`.
+    resurrection_candidate = Lote.create(
+        id=original.id, codigo_lote="LOTE-D02", cantidad_registros=9
+    )
+    await repository.resurrect(resurrection_candidate)
+
+    found = await repository.get_by_codigo_lote("LOTE-D02")
+    assert found is not None
+    assert found.id == original.id
+    assert found.cantidad_registros == 9
+    assert found.estado is EstadoLote.PROCESADO  # untouched, not reverted to Pendiente
+    assert found.fecha_importacion == original.fecha_importacion
+
+
+async def test_resurrect_raises_lote_conflict_error_on_a_natural_key_race(
+    db_session: AsyncSession,
+) -> None:
+    """A dead row's own `codigo_lote` can be claimed by a concurrent active insert before its
+    resurrection commits; the update that clears `deleted_at` back to a duplicate active
+    `codigo_lote` violates `uq_lotes_codigo_lote` -- surfaced as `LoteConflictError`, not an
+    unhandled IntegrityError."""
+    repository = SqlAlchemyLoteRepository(db_session)
+    dead = Lote.create(codigo_lote="LOTE-D03")
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE lotes SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    await repository.save(Lote.create(codigo_lote="LOTE-D03"))
+
+    with pytest.raises(LoteConflictError):
+        await repository.resurrect(Lote.create(id=dead.id, codigo_lote="LOTE-D03"))
+
+
+async def test_resurrect_raises_lote_conflict_error_when_the_row_is_no_longer_dead(
+    db_session: AsyncSession,
+) -> None:
+    """FIX 1 (lost-update race): two concurrent resurrections of the SAME dead row used to both
+    "succeed" with no guard on `deleted_at` in `resurrect()`'s `WHERE` clause -- whichever commit
+    landed last silently won, with no error raised at all. Simulated here by clearing
+    `deleted_at` directly via SQL (standing in for "a concurrent session already resurrected this
+    row first") before calling `resurrect()`: the `deleted_at IS NOT NULL` guard then matches
+    zero rows, and the zero-`rowcount` check raises `LoteConflictError` instead of silently
+    re-applying (and overwriting) whatever the winner wrote."""
+    repository = SqlAlchemyLoteRepository(db_session)
+    dead = Lote.create(codigo_lote="LOTE-D04", cantidad_registros=1)
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE lotes SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    # Simulates the concurrent winner: by the time this resurrect() call runs, the row is no
+    # longer dead.
+    await db_session.execute(
+        text("UPDATE lotes SET deleted_at = NULL WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+
+    with pytest.raises(LoteConflictError):
+        await repository.resurrect(
+            Lote.create(id=dead.id, codigo_lote="LOTE-D04", cantidad_registros=999)
+        )
+
+    found = await repository.get_by_codigo_lote("LOTE-D04")
+    assert found is not None
+    assert found.cantidad_registros == 1
+
+
 async def test_list_active_excludes_soft_deleted_lotes(db_session: AsyncSession) -> None:
     repository = SqlAlchemyLoteRepository(db_session)
     await repository.save(Lote.create(codigo_lote="LOTE-A"))

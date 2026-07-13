@@ -113,6 +113,46 @@ async def test_import_rejects_a_type_broken_record_individually_instead_of_422in
     assert any("direccion" in reason for reason in reasons_by_record["7003"])
 
 
+async def test_import_rejects_a_typo_field_instead_of_silently_dropping_it(
+    clientes_client: AsyncClient,
+) -> None:
+    """A typo'd key (e.g. `numero_clientee` instead of `numero_cliente`) used to be dropped
+    silently by Pydantic's default `extra="ignore"` -- the record then failed only as a *domain*
+    rejection (missing `numero_cliente`), with no hint the key was ever misspelled. `extra="forbid"`
+    (DECISION #11, aligning `ClienteImportItem` with `LoteImportItem`/`ConsumoImportItem`) rejects
+    it structurally instead, naming the offending key. The rest of the batch still goes through."""
+    payload = [
+        {"numero_cliente": "9001", "nombre": "Valid Client"},
+        {"numero_clientee": "9002", "nombre": "Typo Field"},
+    ]
+
+    response = await clientes_client.post("/api/v1/clientes/import", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] == 1
+    assert len(body["rejected"]) == 1
+    assert any("numero_clientee" in reason for reason in body["rejected"][0]["reasons"])
+
+
+async def test_import_rejects_a_previously_silently_ignored_extra_field(
+    clientes_client: AsyncClient,
+) -> None:
+    """Before DECISION #11, a plausible-looking but undeclared field (e.g. `telefono`) was
+    silently dropped by `extra="ignore"` -- the record was created anyway, with no trace the
+    field was ever sent. `extra="forbid"` closes that silent-drop path: the record is now
+    rejected structurally, naming the offending key."""
+    payload = [{"numero_cliente": "9101", "nombre": "Ana Gomez", "telefono": "555-1234"}]
+
+    response = await clientes_client.post("/api/v1/clientes/import", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] == 0
+    assert len(body["rejected"]) == 1
+    assert any("telefono" in reason for reason in body["rejected"][0]["reasons"])
+
+
 async def test_import_upserts_over_a_duplicate_numero_cliente_within_the_same_request(
     clientes_client: AsyncClient,
 ) -> None:
@@ -169,20 +209,16 @@ async def test_get_clientes_honors_limit_and_offset(clientes_client: AsyncClient
     assert body["total"] == 5
 
 
-async def test_reimporting_a_soft_deleted_numero_cliente_creates_a_new_identity(
+async def test_reimporting_a_soft_deleted_numero_cliente_resurrects_the_original_row(
     clientes_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """FIX 4: documents the CURRENT, deliberate semantics for re-importing a soft-deleted
-    `numero_cliente` -- this is NOT a bug, it is today's design, captured here so a future
-    change to it is deliberate, not accidental.
-
-    `uq_clientes_numero_cliente` is a *partial* unique index (`WHERE deleted_at IS NULL`), so
-    soft-deleting a client does not reserve its `numero_cliente` forever: re-importing it
-    creates a brand-new row with a NEW id -- it does not "resurrect" the original row. Any
-    historical FK (e.g. `suministros.cliente_id`) pointing at the old id keeps pointing at the
-    old (still soft-deleted) row, not at the new one. See `contexts/README.md` ("Comportamiento
-    ante soft-delete") and `PROJECT_MASTER_SPEC.md`'s debt list for the open business question
-    this raises.
+    """DECISION #9 (confirmed by business, 2026-07-13 -- see `PROJECT_MASTER_SPEC.md`, resolved
+    items): re-importing a soft-deleted `numero_cliente` RESURRECTS the original row (same `id`,
+    `deleted_at` cleared, fields merged from the re-import), instead of creating a brand-new
+    identity. `uq_clientes_numero_cliente` is a *partial* unique index (`WHERE deleted_at IS
+    NULL`), which is exactly why a dead row can be found and revived by natural key without
+    colliding with anything -- see `contexts/README.md` ("Comportamiento ante soft-delete") for
+    the full rationale.
     """
     await clientes_client.post(
         "/api/v1/clientes/import", json=[{"numero_cliente": "8001", "nombre": "Original"}]
@@ -199,7 +235,98 @@ async def test_reimporting_a_soft_deleted_numero_cliente_creates_a_new_identity(
         "/api/v1/clientes/import", json=[{"numero_cliente": "8001", "nombre": "Reimported"}]
     )
 
-    assert second.json()["created"] == 1  # a brand-new row, not an update of the soft-deleted one
+    second_body = second.json()
+    assert second_body["created"] == 0
+    assert second_body["restored"] == 1
     listing_after = (await clientes_client.get("/api/v1/clientes")).json()
-    new_id = next(c["id"] for c in listing_after["items"] if c["numero_cliente"] == "8001")
-    assert new_id != original_id
+    resurrected = next(c for c in listing_after["items"] if c["numero_cliente"] == "8001")
+    assert resurrected["id"] == original_id  # SAME identity, not a new row
+    assert resurrected["nombre"] == "Reimported"
+
+    row = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM clientes WHERE numero_cliente = '8001'")
+        )
+    ).one()
+    assert row.deleted_at is None
+
+
+async def test_resurrecting_the_most_recently_deleted_of_multiple_dead_rows(
+    clientes_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Two independently dead rows can share the same `numero_cliente` (e.g. one soft-deleted,
+    then a direct-SQL insert creates a fresh active row reusing the natural key, which is later
+    soft-deleted too -- the partial unique index only ever forbids two *active* rows). Only the
+    most recently deleted one is a resurrection candidate; the older dead row stays dead."""
+    await clientes_client.post(
+        "/api/v1/clientes/import", json=[{"numero_cliente": "8002", "nombre": "First"}]
+    )
+    await db_session.execute(
+        text(
+            "UPDATE clientes SET deleted_at = now() - interval '2 hours' "
+            "WHERE numero_cliente = '8002'"
+        )
+    )
+    await db_session.execute(
+        text(
+            "INSERT INTO clientes (id, numero_cliente, nombre, deleted_at) "
+            "VALUES (gen_random_uuid(), '8002', 'Second', now() - interval '1 hour')"
+        )
+    )
+    await db_session.commit()
+    older_dead_id, newer_dead_id = (
+        (
+            await db_session.execute(
+                text(
+                    "SELECT id FROM clientes WHERE numero_cliente = '8002' ORDER BY deleted_at ASC"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    response = await clientes_client.post(
+        "/api/v1/clientes/import", json=[{"numero_cliente": "8002", "nombre": "Resurrected"}]
+    )
+
+    assert response.json()["restored"] == 1
+    listing = (await clientes_client.get("/api/v1/clientes")).json()
+    resurrected = next(c for c in listing["items"] if c["numero_cliente"] == "8002")
+    assert resurrected["id"] == str(newer_dead_id)
+    assert resurrected["id"] != str(older_dead_id)
+    still_dead = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM clientes WHERE id = :id"), {"id": older_dead_id}
+        )
+    ).one()
+    assert still_dead.deleted_at is not None
+
+
+async def test_reimporting_a_resurrected_record_identically_reports_unchanged(
+    clientes_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Once resurrected, the row is active again: a third, identical import finds it through the
+    ordinary active-row lookup, not the dead-row path -- reported as `unchanged`, not `restored`
+    a second time."""
+    await clientes_client.post(
+        "/api/v1/clientes/import", json=[{"numero_cliente": "8003", "nombre": "Original"}]
+    )
+    await db_session.execute(
+        text("UPDATE clientes SET deleted_at = now() WHERE numero_cliente = '8003'")
+    )
+    await db_session.commit()
+    first_resurrection = await clientes_client.post(
+        "/api/v1/clientes/import", json=[{"numero_cliente": "8003", "nombre": "Original"}]
+    )
+    assert first_resurrection.json()["restored"] == 1
+
+    third = await clientes_client.post(
+        "/api/v1/clientes/import", json=[{"numero_cliente": "8003", "nombre": "Original"}]
+    )
+
+    third_body = third.json()
+    assert third_body["created"] == 0
+    assert third_body["updated"] == 0
+    assert third_body["restored"] == 0
+    assert third_body["unchanged"] == 1

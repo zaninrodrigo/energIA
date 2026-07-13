@@ -95,6 +95,7 @@ async def import_suministros(
         created=summary.created,
         updated=summary.updated,
         unchanged=summary.unchanged,
+        restored=summary.restored,
         rejected=[
             *structural_rejections,
             *[

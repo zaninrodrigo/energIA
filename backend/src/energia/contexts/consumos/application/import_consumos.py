@@ -76,11 +76,20 @@ class RejectedRecord:
 
 @dataclass(frozen=True, slots=True)
 class ImportSummary:
-    """Outcome of one `ImportConsumos.execute()` run."""
+    """Outcome of one `ImportConsumos.execute()` run.
+
+    `restored` (DECISION #9, resurrection): a record whose `(suministro_id, fecha_inicio,
+    fecha_fin)` matched no active row but did match a soft-deleted one is revived on that same
+    identity instead of created fresh -- counted here, separately from
+    `created`/`updated`/`unchanged`. This is also DECISION #13's interplay point: `DELETE
+    /api/v1/consumos/{id}` followed by re-importing the same period resurrects that same
+    consumo, rather than creating (or permanently losing) a row.
+    """
 
     created: int = 0
     updated: int = 0
     unchanged: int = 0
+    restored: int = 0
     rejected: list[RejectedRecord] = field(default_factory=list)
 
 
@@ -91,6 +100,14 @@ class ImportConsumos:
     Idempotent by design: each record is looked up by its composite natural key before deciding
     whether to create, update, or leave it alone, so re-running the exact same import reports
     `unchanged` counts instead of duplicate rows or spurious writes.
+
+    DECISION #9 (resurrection): mirrors `contexts.clientes.application.import_clientes.
+    ImportClientes` exactly -- see that class's docstring for the full rationale. A record whose
+    `(suministro_id, fecha_inicio, fecha_fin)` matches no active row falls back to a soft-deleted
+    one (`get_most_recently_deleted_by_suministro_and_periodo`) before ever considering itself
+    brand-new. `consumo_promedio_diario` gets the exact same treatment resurrection as an
+    ordinary update: always taken from `candidate` (already correctly recomputed-or-explicit by
+    `Consumo.create()`), never preserved from the dead row.
     """
 
     def __init__(
@@ -122,8 +139,12 @@ class ImportConsumos:
         `get_by_suministro_and_periodo` lookup sees the first occurrence's already-`save()`d row
         (same transaction, read-your-own-write), so it upserts over it (`updated`/`unchanged`)
         instead of conflicting.
+
+        DECISION #9: a resurrection always writes (even if every field already matches the dead
+        row's stored values -- `deleted_at` itself is changing) and is never folded into
+        `unchanged`.
         """
-        created = updated = unchanged = 0
+        created = updated = unchanged = restored = 0
         rejected: list[RejectedRecord] = []
 
         for record in source.fetch():
@@ -217,6 +238,29 @@ class ImportConsumos:
                 candidate.suministro_id, candidate.fecha_inicio, candidate.fecha_fin
             )
             if existing is None:
+                dead = await self._repository.get_most_recently_deleted_by_suministro_and_periodo(
+                    candidate.suministro_id, candidate.fecha_inicio, candidate.fecha_fin
+                )
+                if dead is not None:
+                    # DECISION #9: revive the most recently soft-deleted row on its own identity
+                    # (`dead.id`), applying the same `lectura_id` UNSET-preserve merge an
+                    # ordinary update does (below). `consumo_promedio_diario` is taken from
+                    # `candidate` as-is, exactly like an update -- see this module's docstring.
+                    merged_lectura_id = (
+                        dead.lectura_id
+                        if isinstance(record.fecha_lectura, UnsetType)
+                        else candidate.lectura_id
+                    )
+                    resurrected_consumo = replace(
+                        candidate, id=dead.id, lectura_id=merged_lectura_id
+                    )
+                    try:
+                        await self._repository.resurrect(resurrected_consumo)
+                    except ConsumoConflictError as error:
+                        rejected.append(RejectedRecord(record=record, reasons=[str(error)]))
+                        continue
+                    restored += 1
+                    continue
                 to_save = candidate
                 is_new = True
             else:
@@ -254,7 +298,11 @@ class ImportConsumos:
                 updated += 1
 
         return ImportSummary(
-            created=created, updated=updated, unchanged=unchanged, rejected=rejected
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            restored=restored,
+            rejected=rejected,
         )
 
 

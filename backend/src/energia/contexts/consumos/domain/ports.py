@@ -119,6 +119,16 @@ class LecturaRepository(Protocol):
         composite natural key, or None."""
         ...  # pragma: no cover — Protocol stub, never executed directly
 
+    async def get_most_recently_deleted_by_suministro_and_fecha(
+        self, suministro_id: UUID, fecha_lectura: date
+    ) -> Lectura | None:
+        """Return the most recently soft-deleted lectura for this composite natural key (the
+        greatest `deleted_at` among dead rows), or None if none is soft-deleted at all. Mirrors
+        `contexts.clientes.domain.ports.ClienteRepository.get_most_recently_deleted_by_
+        numero_cliente` exactly -- see that method's docstring for DECISION #9's full rationale.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
     async def save(self, lectura: Lectura) -> None:
         """Insert or update `lectura`, keyed by its composite natural key `(suministro_id,
         fecha_lectura)`, scoped to non-soft-deleted rows — see `ImportLecturas` for how the
@@ -128,6 +138,16 @@ class LecturaRepository(Protocol):
         Raises `LecturaConflictError` if the write violates a database integrity constraint; the
         underlying write is rolled back to a savepoint first, so the rest of the caller's
         transaction is unaffected.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def resurrect(self, lectura: Lectura) -> None:
+        """Revive a soft-deleted row identified by `lectura.id`: clear `deleted_at` and write
+        every mutable field from `lectura`, already merged onto that same identity by the caller
+        (`ImportLecturas`). Mirrors `ClienteRepository.resurrect()` exactly -- see that method's
+        docstring for why this cannot reuse `save()`'s `ON CONFLICT` upsert.
+
+        Does not commit; raises `LecturaConflictError` on a database integrity conflict.
         """
         ...  # pragma: no cover — Protocol stub, never executed directly
 
@@ -215,6 +235,14 @@ class LoteRepository(Protocol):
         """Return the (non-soft-deleted) lote for this `codigo_lote` natural key, or None."""
         ...  # pragma: no cover — Protocol stub, never executed directly
 
+    async def get_most_recently_deleted_by_codigo_lote(self, codigo_lote: str) -> Lote | None:
+        """Return the most recently soft-deleted lote with this natural key (the greatest
+        `deleted_at` among dead rows), or None if none is soft-deleted at all. Mirrors
+        `contexts.clientes.domain.ports.ClienteRepository.get_most_recently_deleted_by_
+        numero_cliente` exactly -- see that method's docstring for DECISION #9's full rationale.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
     async def save(self, lote: Lote) -> None:
         """Insert or update `lote`, keyed by its natural key `codigo_lote`, scoped to
         non-soft-deleted rows — see `ImportLotes` for how the create-vs-update decision is made.
@@ -223,6 +251,20 @@ class LoteRepository(Protocol):
         Raises `LoteConflictError` if the write violates a database integrity constraint; the
         underlying write is rolled back to a savepoint first, so the rest of the caller's
         transaction is unaffected.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def resurrect(self, lote: Lote) -> None:
+        """Revive a soft-deleted row identified by `lote.id`: clear `deleted_at` and write
+        `nombre`/`cantidad_registros` from `lote`, already merged onto that same identity by the
+        caller (`ImportLotes`). Mirrors `ClienteRepository.resurrect()` for the "update by id, not
+        `ON CONFLICT`" rationale, with one addition of its own: exactly like `save()`, `estado`
+        and `fecha_importacion` are never written by this method either — a resurrected lote
+        keeps the `estado` it had when it was soft-deleted (RD-010's intent extends to
+        resurrection: reviving a row must not silently reset its processing state any more than
+        an ordinary update may).
+
+        Does not commit; raises `LoteConflictError` on a database integrity conflict.
         """
         ...  # pragma: no cover — Protocol stub, never executed directly
 
@@ -321,6 +363,16 @@ class ConsumoRepository(Protocol):
         fecha_fin)` composite natural key, or None."""
         ...  # pragma: no cover — Protocol stub, never executed directly
 
+    async def get_most_recently_deleted_by_suministro_and_periodo(
+        self, suministro_id: UUID, fecha_inicio: date, fecha_fin: date
+    ) -> Consumo | None:
+        """Return the most recently soft-deleted consumo for this composite natural key (the
+        greatest `deleted_at` among dead rows), or None if none is soft-deleted at all. Mirrors
+        `contexts.clientes.domain.ports.ClienteRepository.get_most_recently_deleted_by_
+        numero_cliente` exactly -- see that method's docstring for DECISION #9's full rationale.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
     async def save(self, consumo: Consumo) -> None:
         """Insert or update `consumo`, keyed by its composite natural key `(suministro_id,
         fecha_inicio, fecha_fin)`, scoped to non-soft-deleted rows — see `ImportConsumos` for how
@@ -330,6 +382,34 @@ class ConsumoRepository(Protocol):
         Raises `ConsumoConflictError` if the write violates a database integrity constraint; the
         underlying write is rolled back to a savepoint first, so the rest of the caller's
         transaction is unaffected.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def resurrect(self, consumo: Consumo) -> None:
+        """Revive a soft-deleted row identified by `(consumo.id, consumo.fecha_inicio)` (the
+        composite primary key `consumos` actually has, being partitioned by RANGE on
+        `fecha_inicio` -- see `infrastructure/models.py`'s `ConsumoModel`): clear `deleted_at` and
+        write every mutable field from `consumo`, already merged onto that same identity by the
+        caller (`ImportConsumos`). Mirrors `ClienteRepository.resurrect()` for the "update by
+        identity, not `ON CONFLICT`" rationale.
+
+        Does not commit; raises `ConsumoConflictError` on a database integrity conflict.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def soft_delete(self, consumo_id: UUID) -> bool:
+        """Soft-delete the ACTIVE consumo with this `id` (DECISION #13, the correction path for a
+        wrongly imported billing period): set `deleted_at`, return whether a row was actually
+        found and updated. `False` covers both an unknown id and an already-soft-deleted one --
+        `DeleteConsumo`/the route surface both as the same 404.
+
+        Located by `id` alone, not the full composite primary key `(id, fecha_inicio)`: the HTTP
+        boundary (`DELETE /api/v1/consumos/{id}`) only ever supplies `id`. This assumes `id` is
+        unique in practice even though the schema's actual primary key is composite -- reasonable
+        since `id` is generated via `uuid4()` (domain/consumo.py) and never reused, but not a
+        database-enforced guarantee the way a plain `id`-only primary key would be.
+
+        Does not commit: the caller (route boundary) controls the transaction.
         """
         ...  # pragma: no cover — Protocol stub, never executed directly
 

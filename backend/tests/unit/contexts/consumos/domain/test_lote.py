@@ -221,6 +221,7 @@ def test_allowed_transitions_covers_every_estado() -> None:
         (EstadoLote.PENDIENTE, EstadoLote.PROCESANDO),
         (EstadoLote.PROCESANDO, EstadoLote.PROCESADO),
         (EstadoLote.PROCESANDO, EstadoLote.ERROR),
+        (EstadoLote.ERROR, EstadoLote.PROCESANDO),
     ],
 )
 def test_transition_to_allows_the_documented_transitions(
@@ -249,7 +250,6 @@ def test_transition_to_allows_the_documented_transitions(
         (EstadoLote.PROCESADO, EstadoLote.PROCESADO),
         (EstadoLote.PROCESADO, EstadoLote.ERROR),
         (EstadoLote.ERROR, EstadoLote.PENDIENTE),
-        (EstadoLote.ERROR, EstadoLote.PROCESANDO),
         (EstadoLote.ERROR, EstadoLote.PROCESADO),
         (EstadoLote.ERROR, EstadoLote.ERROR),
     ],
@@ -257,8 +257,11 @@ def test_transition_to_allows_the_documented_transitions(
 def test_transition_to_rejects_every_undocumented_transition(
     origen: EstadoLote, destino: EstadoLote
 ) -> None:
-    """RD-010: "un lote no puede ejecutarse dos veces" -- `Procesado`/`Error` are terminal, and
-    `Pendiente`/`Procesando` may only move forward, never sideways or backward."""
+    """RD-010: "un lote no puede ejecutarse dos veces" -- `Procesado` is terminal (a lote that
+    already succeeded may never be re-run), and `Pendiente`/`Procesando` may only move forward,
+    never sideways or backward. `Error` is no longer terminal (`Error` -> `Procesando` is now
+    allowed, confirmed by business 2026-07-13 -- see the test above), but it still may not jump
+    directly to `Procesado` or back to `Pendiente`."""
     lote = replace(_create(), estado=origen)
 
     with pytest.raises(LoteEstadoTransitionError) as exc_info:

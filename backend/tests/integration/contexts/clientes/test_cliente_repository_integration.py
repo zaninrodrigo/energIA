@@ -94,6 +94,248 @@ async def test_count_active_counts_only_non_deleted_clients(db_session: AsyncSes
     assert await repository.count_active() == 1
 
 
+# --- DECISION #9: resurrection ---------------------------------------------------------------
+
+
+async def test_get_most_recently_deleted_by_numero_cliente_returns_none_when_none_is_dead(
+    db_session: AsyncSession,
+) -> None:
+    repository = SqlAlchemyClienteRepository(db_session)
+    await repository.save(Cliente.create(numero_cliente="600", nombre="Active Only"))
+
+    assert await repository.get_most_recently_deleted_by_numero_cliente("600") is None
+    assert await repository.get_most_recently_deleted_by_numero_cliente("does-not-exist") is None
+
+
+async def test_get_most_recently_deleted_by_numero_cliente_picks_the_latest_deleted_at(
+    db_session: AsyncSession,
+) -> None:
+    """Two independently dead rows can share a `numero_cliente` (the partial unique index only
+    forbids two *active* ones) -- the repository must pick the one with the greatest
+    `deleted_at`, not simply the first/last one physically inserted."""
+    repository = SqlAlchemyClienteRepository(db_session)
+    older = Cliente.create(numero_cliente="601", nombre="Older Dead Row")
+    await repository.save(older)
+    await db_session.execute(
+        text("UPDATE clientes SET deleted_at = now() - interval '2 hours' WHERE id = :id"),
+        {"id": older.id},
+    )
+    newer = Cliente.create(numero_cliente="601", nombre="Newer Dead Row")
+    await repository.save(newer)
+    await db_session.execute(
+        text("UPDATE clientes SET deleted_at = now() - interval '1 hour' WHERE id = :id"),
+        {"id": newer.id},
+    )
+    await db_session.commit()
+
+    dead = await repository.get_most_recently_deleted_by_numero_cliente("601")
+
+    assert dead is not None
+    assert dead.id == newer.id
+
+
+async def test_resurrect_clears_deleted_at_and_writes_every_mutable_field(
+    db_session: AsyncSession,
+) -> None:
+    repository = SqlAlchemyClienteRepository(db_session)
+    original = Cliente.create(numero_cliente="602", nombre="Original")
+    await repository.save(original)
+    await db_session.execute(
+        text("UPDATE clientes SET deleted_at = now() WHERE id = :id"), {"id": original.id}
+    )
+    await db_session.commit()
+
+    resurrected = Cliente.create(
+        id=original.id, numero_cliente="602", nombre="Resurrected", localidad="Formosa"
+    )
+    await repository.resurrect(resurrected)
+
+    found = await repository.get_by_numero_cliente("602")
+    assert found is not None
+    assert found.id == original.id
+    assert found.nombre == "Resurrected"
+    assert found.localidad == "Formosa"
+    row = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM clientes WHERE id = :id"), {"id": original.id}
+        )
+    ).one()
+    assert row.deleted_at is None
+
+
+async def test_resurrect_does_not_commit_the_transaction(
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Mirrors `test_save_does_not_commit_the_transaction`: `resurrect()` only flushes, the
+    caller controls the commit."""
+    async with test_session_factory() as session:
+        repository = SqlAlchemyClienteRepository(session)
+        original = Cliente.create(numero_cliente="603", nombre="Original")
+        await repository.save(original)
+        await session.execute(
+            text("UPDATE clientes SET deleted_at = now() WHERE id = :id"), {"id": original.id}
+        )
+        await session.commit()
+
+        await repository.resurrect(
+            Cliente.create(id=original.id, numero_cliente="603", nombre="Resurrected")
+        )
+        # Deliberately no commit here: closing the session below rolls back the resurrection.
+
+    async with test_session_factory() as verify_session:
+        verify_repository = SqlAlchemyClienteRepository(verify_session)
+        assert await verify_repository.get_by_numero_cliente("603") is None
+        still_dead = await verify_repository.get_most_recently_deleted_by_numero_cliente("603")
+        assert still_dead is not None
+
+
+async def test_resurrect_raises_cliente_conflict_error_on_a_natural_key_race(
+    db_session: AsyncSession,
+) -> None:
+    """A dead row's own `numero_cliente` can be claimed by a concurrent active insert before its
+    resurrection commits; the update that clears `deleted_at` back to a duplicate active
+    `numero_cliente` violates `uq_clientes_numero_cliente` -- surfaced as `ClienteConflictError`,
+    not an unhandled IntegrityError."""
+    repository = SqlAlchemyClienteRepository(db_session)
+    dead = Cliente.create(numero_cliente="604", nombre="Original")
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE clientes SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    await repository.save(
+        Cliente.create(numero_cliente="604", nombre="Someone Else Got Here First")
+    )
+
+    with pytest.raises(ClienteConflictError):
+        await repository.resurrect(
+            Cliente.create(id=dead.id, numero_cliente="604", nombre="Resurrected")
+        )
+
+
+async def test_resurrect_raises_cliente_conflict_error_when_the_row_is_no_longer_dead(
+    db_session: AsyncSession,
+) -> None:
+    """FIX 1 (lost-update race): two concurrent resurrections of the SAME dead row used to both
+    "succeed" with no guard on `deleted_at` in `resurrect()`'s `WHERE` clause -- whichever commit
+    landed last silently won, with no error raised at all. Simulated here by clearing
+    `deleted_at` directly via SQL (standing in for "a concurrent session already resurrected this
+    row first") before calling `resurrect()`: the `deleted_at IS NOT NULL` guard then matches
+    zero rows, and the zero-`rowcount` check raises `ClienteConflictError` -- a per-record
+    rejection -- instead of silently re-applying (and overwriting) whatever the winner wrote."""
+    repository = SqlAlchemyClienteRepository(db_session)
+    dead = Cliente.create(numero_cliente="605", nombre="Original")
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE clientes SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    # Simulates the concurrent winner: by the time this resurrect() call runs, the row is no
+    # longer dead.
+    await db_session.execute(
+        text("UPDATE clientes SET deleted_at = NULL WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+
+    with pytest.raises(ClienteConflictError):
+        await repository.resurrect(
+            Cliente.create(id=dead.id, numero_cliente="605", nombre="Late Resurrection Attempt")
+        )
+
+    # The loser's rejected attempt did not disturb the winner's already-active row.
+    found = await repository.get_by_numero_cliente("605")
+    assert found is not None
+    assert found.nombre == "Original"
+
+
+async def test_concurrent_resurrections_of_the_same_dead_row_one_wins_one_conflicts(
+    test_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Reproduces the reviewer's finding empirically, with two genuinely independent sessions
+    (not the single-session simulation above): two competing sessions both race to resurrect the
+    exact SAME dead row concurrently. Before FIX 1, `resurrect()`'s `UPDATE` carried no
+    `deleted_at IS NOT NULL` guard, so both concurrent `UPDATE`s matched unconditionally and both
+    "succeeded" with no error at all -- whichever committed last silently won (a lost update, not
+    a crash). With the guard in place, Postgres serializes the two `UPDATE`s against the same row
+    (the second blocks on the row lock until the first's transaction ends); once unblocked, the
+    second's `WHERE deleted_at IS NOT NULL` is re-evaluated against the now-committed row (READ
+    COMMITTED) and matches zero rows -- so exactly one of the two concurrent calls raises
+    `ClienteConflictError`, never both, never neither."""
+    async with test_session_factory() as setup_session:
+        setup_repository = SqlAlchemyClienteRepository(setup_session)
+        dead = Cliente.create(numero_cliente="9501", nombre="Original")
+        await setup_repository.save(dead)
+        await setup_session.execute(
+            text("UPDATE clientes SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+        )
+        await setup_session.commit()
+
+    async def _resurrect_once(nombre: str) -> str | None:
+        async with test_session_factory() as session:
+            repository = SqlAlchemyClienteRepository(session)
+            try:
+                await repository.resurrect(
+                    Cliente.create(id=dead.id, numero_cliente="9501", nombre=nombre)
+                )
+            except ClienteConflictError as error:
+                return str(error)
+            await session.commit()
+            return None
+
+    result_a, result_b = await asyncio.gather(
+        _resurrect_once("Winner Attempt"), _resurrect_once("Loser Attempt")
+    )
+
+    outcomes = [result_a, result_b]
+    assert outcomes.count(None) == 1  # exactly one side committed successfully
+    assert sum(1 for outcome in outcomes if outcome is not None) == 1  # the other raised
+    async with test_session_factory() as verify_session:
+        verify_repository = SqlAlchemyClienteRepository(verify_session)
+        found = await verify_repository.get_by_numero_cliente("9501")
+        assert found is not None
+        assert found.nombre in ("Winner Attempt", "Loser Attempt")
+
+
+async def test_get_most_recently_deleted_by_numero_cliente_breaks_deleted_at_ties_by_id_desc(
+    db_session: AsyncSession,
+) -> None:
+    """FIX 2: two dead rows can legitimately share the exact same `deleted_at` (e.g. a bulk
+    soft-delete in one statement) -- reproduced here by setting both to an identical literal
+    timestamp. Without a tie-breaker, `ORDER BY deleted_at DESC` alone leaves which row comes
+    first up to Postgres's unspecified scan order, not guaranteed stable across runs. `id DESC`
+    is an arbitrary-but-stable secondary key that makes the pick deterministic; it carries no
+    business meaning of its own -- this test only pins that the choice is reproducible, not that
+    `id` means anything."""
+    repository = SqlAlchemyClienteRepository(db_session)
+    first = Cliente.create(numero_cliente="606", nombre="First")
+    await repository.save(first)
+    # `save()` upserts by natural key scoped to `deleted_at IS NULL`, so soft-delete `first`
+    # before creating `second` -- otherwise the second `save()` would just update `first`'s row
+    # instead of the two ending up as independently dead rows sharing one `numero_cliente`.
+    await db_session.execute(
+        text(
+            "UPDATE clientes SET deleted_at = TIMESTAMPTZ '2024-01-01 00:00:00+00' WHERE id = :id"
+        ),
+        {"id": first.id},
+    )
+    second = Cliente.create(numero_cliente="606", nombre="Second")
+    await repository.save(second)
+    await db_session.execute(
+        text(
+            "UPDATE clientes SET deleted_at = TIMESTAMPTZ '2024-01-01 00:00:00+00' WHERE id = :id"
+        ),
+        {"id": second.id},
+    )
+    await db_session.commit()
+    greater_id, lesser_id = sorted([first.id, second.id], reverse=True)
+
+    dead = await repository.get_most_recently_deleted_by_numero_cliente("606")
+
+    assert dead is not None
+    assert dead.id == greater_id
+    assert dead.id != lesser_id
+
+
 # --- FIX 1: atomic batch + race-safe upsert + per-record integrity rejection ---------------
 
 

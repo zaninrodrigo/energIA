@@ -155,6 +155,176 @@ async def test_list_active_excludes_soft_deleted_lecturas(
     assert date(2024, 2, 1) not in fechas
 
 
+# --- DECISION #9: resurrection ---------------------------------------------------------------
+
+
+async def test_get_most_recently_deleted_by_suministro_and_fecha_picks_the_latest_deleted_at(
+    db_session: AsyncSession, suministro_id: UUID
+) -> None:
+    repository = SqlAlchemyLecturaRepository(db_session)
+    older = Lectura.create(
+        suministro_id=suministro_id,
+        fecha_lectura="2024-03-01",
+        lectura_anterior="0.000",
+        lectura_actual="1.000",
+        dias_facturados=30,
+    )
+    await repository.save(older)
+    await db_session.execute(
+        text("UPDATE lecturas SET deleted_at = now() - interval '2 hours' WHERE id = :id"),
+        {"id": older.id},
+    )
+    newer = Lectura.create(
+        suministro_id=suministro_id,
+        fecha_lectura="2024-03-01",
+        lectura_anterior="0.000",
+        lectura_actual="2.000",
+        dias_facturados=30,
+    )
+    await repository.save(newer)
+    await db_session.execute(
+        text("UPDATE lecturas SET deleted_at = now() - interval '1 hour' WHERE id = :id"),
+        {"id": newer.id},
+    )
+    await db_session.commit()
+
+    dead = await repository.get_most_recently_deleted_by_suministro_and_fecha(
+        suministro_id, date(2024, 3, 1)
+    )
+
+    assert dead is not None
+    assert dead.id == newer.id
+
+
+async def test_resurrect_clears_deleted_at_and_writes_every_mutable_field(
+    db_session: AsyncSession, suministro_id: UUID
+) -> None:
+    repository = SqlAlchemyLecturaRepository(db_session)
+    original = Lectura.create(
+        suministro_id=suministro_id,
+        fecha_lectura="2024-04-01",
+        lectura_anterior="0.000",
+        lectura_actual="10.000",
+        dias_facturados=30,
+    )
+    await repository.save(original)
+    await db_session.execute(
+        text("UPDATE lecturas SET deleted_at = now() WHERE id = :id"), {"id": original.id}
+    )
+    await db_session.commit()
+
+    resurrected = Lectura.create(
+        id=original.id,
+        suministro_id=suministro_id,
+        fecha_lectura="2024-04-01",
+        lectura_anterior="0.000",
+        lectura_actual="25.000",
+        dias_facturados=30,
+    )
+    await repository.resurrect(resurrected)
+
+    found = await repository.get_by_suministro_and_fecha(suministro_id, date(2024, 4, 1))
+    assert found is not None
+    assert found.id == original.id
+    assert found.lectura_actual == Decimal("25.000")
+    row = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM lecturas WHERE id = :id"), {"id": original.id}
+        )
+    ).one()
+    assert row.deleted_at is None
+
+
+async def test_resurrect_raises_lectura_conflict_error_on_a_natural_key_race(
+    db_session: AsyncSession, suministro_id: UUID
+) -> None:
+    """A dead row's own `(suministro_id, fecha_lectura)` can be claimed by a concurrent active
+    insert before its resurrection commits; the update that clears `deleted_at` back to a
+    duplicate active key violates `uq_lecturas_suministro_fecha` -- surfaced as
+    `LecturaConflictError`, not an unhandled IntegrityError."""
+    repository = SqlAlchemyLecturaRepository(db_session)
+    dead = Lectura.create(
+        suministro_id=suministro_id,
+        fecha_lectura="2024-05-01",
+        lectura_anterior="0.000",
+        lectura_actual="1.000",
+        dias_facturados=30,
+    )
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE lecturas SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    await repository.save(
+        Lectura.create(
+            suministro_id=suministro_id,
+            fecha_lectura="2024-05-01",
+            lectura_anterior="0.000",
+            lectura_actual="2.000",
+            dias_facturados=30,
+        )
+    )
+
+    with pytest.raises(LecturaConflictError):
+        await repository.resurrect(
+            Lectura.create(
+                id=dead.id,
+                suministro_id=suministro_id,
+                fecha_lectura="2024-05-01",
+                lectura_anterior="0.000",
+                lectura_actual="3.000",
+                dias_facturados=30,
+            )
+        )
+
+
+async def test_resurrect_raises_lectura_conflict_error_when_the_row_is_no_longer_dead(
+    db_session: AsyncSession, suministro_id: UUID
+) -> None:
+    """FIX 1 (lost-update race): two concurrent resurrections of the SAME dead row used to both
+    "succeed" with no guard on `deleted_at` in `resurrect()`'s `WHERE` clause -- whichever commit
+    landed last silently won, with no error raised at all. Simulated here by clearing
+    `deleted_at` directly via SQL (standing in for "a concurrent session already resurrected this
+    row first") before calling `resurrect()`: the `deleted_at IS NOT NULL` guard then matches
+    zero rows, and the zero-`rowcount` check raises `LecturaConflictError` instead of silently
+    re-applying (and overwriting) whatever the winner wrote."""
+    repository = SqlAlchemyLecturaRepository(db_session)
+    dead = Lectura.create(
+        suministro_id=suministro_id,
+        fecha_lectura="2024-05-02",
+        lectura_anterior="0.000",
+        lectura_actual="1.000",
+        dias_facturados=30,
+    )
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE lecturas SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    # Simulates the concurrent winner: by the time this resurrect() call runs, the row is no
+    # longer dead.
+    await db_session.execute(
+        text("UPDATE lecturas SET deleted_at = NULL WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+
+    with pytest.raises(LecturaConflictError):
+        await repository.resurrect(
+            Lectura.create(
+                id=dead.id,
+                suministro_id=suministro_id,
+                fecha_lectura="2024-05-02",
+                lectura_anterior="0.000",
+                lectura_actual="999.000",
+                dias_facturados=30,
+            )
+        )
+
+    found = await repository.get_by_suministro_and_fecha(suministro_id, date(2024, 5, 2))
+    assert found is not None
+    assert found.lectura_actual == Decimal("1.000")
+
+
 async def test_list_active_filters_by_suministro_id(db_session: AsyncSession) -> None:
     repository = SqlAlchemyLecturaRepository(db_session)
     suministro_a = await insert_suministro(db_session, numero_suministro="LEC-C")

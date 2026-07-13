@@ -38,11 +38,17 @@ class RejectedRecord:
 
 @dataclass(frozen=True, slots=True)
 class ImportSummary:
-    """Outcome of one `ImportLecturas.execute()` run."""
+    """Outcome of one `ImportLecturas.execute()` run.
+
+    `restored` (DECISION #9, resurrection): a record whose `(suministro_id, fecha_lectura)`
+    matched no active row but did match a soft-deleted one is revived on that same identity
+    instead of created fresh -- counted here, separately from `created`/`updated`/`unchanged`.
+    """
 
     created: int = 0
     updated: int = 0
     unchanged: int = 0
+    restored: int = 0
     rejected: list[RejectedRecord] = field(default_factory=list)
 
 
@@ -53,6 +59,12 @@ class ImportLecturas:
     Idempotent by design: each record is looked up by its composite natural key before deciding
     whether to create, update, or leave it alone, so re-running the exact same import reports
     `unchanged` counts instead of duplicate rows or spurious writes.
+
+    DECISION #9 (resurrection): mirrors `contexts.clientes.application.import_clientes.
+    ImportClientes` exactly -- see that class's docstring for the full rationale. A record whose
+    `(suministro_id, fecha_lectura)` matches no active row falls back to a soft-deleted one
+    (`get_most_recently_deleted_by_suministro_and_fecha`) before ever considering itself
+    brand-new.
     """
 
     def __init__(
@@ -79,8 +91,12 @@ class ImportLecturas:
         `get_by_suministro_and_fecha` lookup sees the first occurrence's already-`save()`d row
         (same transaction, read-your-own-write), so it upserts over it (`updated`/`unchanged`)
         instead of conflicting.
+
+        DECISION #9: a resurrection always writes (even if every field already matches the dead
+        row's stored values -- `deleted_at` itself is changing) and is never folded into
+        `unchanged`.
         """
-        created = updated = unchanged = 0
+        created = updated = unchanged = restored = 0
         rejected: list[RejectedRecord] = []
 
         for record in source.fetch():
@@ -119,6 +135,28 @@ class ImportLecturas:
                 candidate.suministro_id, candidate.fecha_lectura
             )
             if existing is None:
+                dead = await self._repository.get_most_recently_deleted_by_suministro_and_fecha(
+                    candidate.suministro_id, candidate.fecha_lectura
+                )
+                if dead is not None:
+                    # DECISION #9: revive the most recently soft-deleted row on its own identity
+                    # (`dead.id`), re-validated through Lectura.create() so the resurrected
+                    # record honors every invariant too.
+                    resurrected_lectura = Lectura.create(
+                        id=dead.id,
+                        suministro_id=candidate.suministro_id,
+                        fecha_lectura=candidate.fecha_lectura,
+                        lectura_anterior=candidate.lectura_anterior,
+                        lectura_actual=candidate.lectura_actual,
+                        dias_facturados=candidate.dias_facturados,
+                    )
+                    try:
+                        await self._repository.resurrect(resurrected_lectura)
+                    except LecturaConflictError as error:
+                        rejected.append(RejectedRecord(record=record, reasons=[str(error)]))
+                        continue
+                    restored += 1
+                    continue
                 to_save = candidate
                 is_new = True
             elif _differs(existing, candidate):
@@ -149,7 +187,11 @@ class ImportLecturas:
                 updated += 1
 
         return ImportSummary(
-            created=created, updated=updated, unchanged=unchanged, rejected=rejected
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            restored=restored,
+            rejected=rejected,
         )
 
 

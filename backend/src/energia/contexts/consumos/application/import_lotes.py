@@ -66,11 +66,17 @@ class RejectedRecord:
 
 @dataclass(frozen=True, slots=True)
 class ImportSummary:
-    """Outcome of one `ImportLotes.execute()` run."""
+    """Outcome of one `ImportLotes.execute()` run.
+
+    `restored` (DECISION #9, resurrection): a record whose `codigo_lote` matched no active row
+    but did match a soft-deleted one is revived on that same identity instead of created fresh --
+    counted here, separately from `created`/`updated`/`unchanged`.
+    """
 
     created: int = 0
     updated: int = 0
     unchanged: int = 0
+    restored: int = 0
     rejected: list[RejectedRecord] = field(default_factory=list)
 
 
@@ -81,6 +87,13 @@ class ImportLotes:
     deciding whether to create, update, or leave it alone, so re-running the exact same import
     reports `unchanged` counts instead of duplicate rows or spurious writes. Re-running an import
     also never touches an existing lote's `estado` -- see this module's docstring.
+
+    DECISION #9 (resurrection): a record whose `codigo_lote` matches no active row falls back to
+    a soft-deleted one (`get_most_recently_deleted_by_codigo_lote`) before ever considering
+    itself brand-new -- mirrors `contexts.clientes.application.import_clientes.ImportClientes`'s
+    resurrection branch, with the same `estado`/`fecha_importacion`-preservation guarantee an
+    ordinary update already has: a resurrected lote KEEPS the `estado` it had when soft-deleted
+    (`LoteRepository.resurrect()` never writes that column either, exactly like `save()`).
     """
 
     def __init__(self, repository: LoteRepository) -> None:
@@ -101,8 +114,12 @@ class ImportLotes:
         the same payload safe: the second occurrence's `get_by_codigo_lote` lookup sees the first
         occurrence's already-`save()`d row (same transaction, read-your-own-write), so it upserts
         over it (`updated`/`unchanged`) instead of conflicting.
+
+        DECISION #9: a resurrection always writes (even if every field already matches the dead
+        row's stored values -- `deleted_at` itself is changing) and is never folded into
+        `unchanged`.
         """
-        created = updated = unchanged = 0
+        created = updated = unchanged = restored = 0
         rejected: list[RejectedRecord] = []
 
         for record in source.fetch():
@@ -152,6 +169,33 @@ class ImportLotes:
 
             existing = await self._repository.get_by_codigo_lote(candidate.codigo_lote)
             if existing is None:
+                dead = await self._repository.get_most_recently_deleted_by_codigo_lote(
+                    candidate.codigo_lote
+                )
+                if dead is not None:
+                    # DECISION #9: revive the most recently soft-deleted row on its own identity
+                    # (`dead.id`), applying the same UNSET-aware nombre/cantidad_registros merge
+                    # an ordinary update does (below) -- `replace()`, not `Lote.create()` again,
+                    # carries `dead`'s `estado`/`fecha_importacion` forward unchanged, exactly
+                    # like an update (see this module's docstring).
+                    merged_nombre = dead.nombre if record.nombre is UNSET else candidate.nombre
+                    merged_cantidad_registros = (
+                        dead.cantidad_registros
+                        if record.cantidad_registros is UNSET
+                        else candidate.cantidad_registros
+                    )
+                    resurrected_lote = replace(
+                        dead,
+                        nombre=merged_nombre,
+                        cantidad_registros=merged_cantidad_registros,
+                    )
+                    try:
+                        await self._repository.resurrect(resurrected_lote)
+                    except LoteConflictError as error:
+                        rejected.append(RejectedRecord(record=record, reasons=[str(error)]))
+                        continue
+                    restored += 1
+                    continue
                 to_save = candidate
                 is_new = True
             else:
@@ -190,7 +234,11 @@ class ImportLotes:
                 updated += 1
 
         return ImportSummary(
-            created=created, updated=updated, unchanged=unchanged, rejected=rejected
+            created=created,
+            updated=updated,
+            unchanged=unchanged,
+            restored=restored,
+            rejected=rejected,
         )
 
 

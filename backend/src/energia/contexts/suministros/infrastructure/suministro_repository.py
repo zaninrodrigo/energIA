@@ -1,8 +1,9 @@
 """SqlAlchemySuministroRepository: the `SuministroRepository` port implementation (async)."""
 
+from typing import cast
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +30,25 @@ class SqlAlchemySuministroRepository:
         stmt = select(SuministroModel).where(
             SuministroModel.numero_suministro == numero_suministro,
             SuministroModel.deleted_at.is_(None),
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _to_domain(model) if model is not None else None
+
+    async def get_most_recently_deleted_by_numero_suministro(
+        self, numero_suministro: str
+    ) -> Suministro | None:
+        stmt = (
+            select(SuministroModel)
+            .where(
+                SuministroModel.numero_suministro == numero_suministro,
+                SuministroModel.deleted_at.is_not(None),
+            )
+            # `id DESC` is a secondary sort key purely to make the pick deterministic when two
+            # dead rows share the exact same `deleted_at` -- `id` carries no business meaning
+            # here (arbitrary-but-stable), it just guarantees a repeatable choice instead of
+            # leaving ties to Postgres's unspecified scan order.
+            .order_by(SuministroModel.deleted_at.desc(), SuministroModel.id.desc())
+            .limit(1)
         )
         model = (await self._session.execute(stmt)).scalar_one_or_none()
         return _to_domain(model) if model is not None else None
@@ -60,6 +80,48 @@ class SqlAlchemySuministroRepository:
         try:
             async with self._session.begin_nested():
                 await self._session.execute(upsert_stmt)
+        except IntegrityError as error:
+            raise SuministroConflictError(
+                str(error.orig) if error.orig is not None else str(error)
+            ) from error
+
+    async def resurrect(self, suministro: Suministro) -> None:
+        """Revive a soft-deleted row by `suministro.id`, clearing `deleted_at` and writing every
+        mutable field -- mirrors `SqlAlchemyClienteRepository.resurrect()` exactly, see that
+        method's docstring for why a plain `UPDATE ... WHERE id = :id` is used instead of `save()`'s
+        `ON CONFLICT` upsert (a dead row is excluded from `uq_suministros_numero_suministro`'s
+        partial index, so that upsert cannot target it at all).
+
+        The `WHERE` clause also requires `deleted_at IS NOT NULL`, and the affected row count is
+        checked afterwards -- see `SqlAlchemyClienteRepository.resurrect()`'s docstring for why:
+        two concurrent resurrections of the SAME dead row are a lost-update race without this
+        guard, since both `UPDATE`s would otherwise match unconditionally. A zero `rowcount` here
+        means a concurrent resurrection already won, and is raised as `SuministroConflictError`
+        instead of silently re-applying (and overwriting) whatever the winner just wrote.
+        """
+        values = {
+            "numero_suministro": suministro.numero_suministro,
+            "cliente_id": suministro.cliente_id,
+            "categoria_tarifaria_id": suministro.categoria_tarifaria_id,
+            "localidad": suministro.localidad,
+            "barrio": suministro.barrio,
+            "estado": suministro.estado,
+            "fecha_alta": suministro.fecha_alta,
+            "deleted_at": None,
+        }
+        stmt = (
+            update(SuministroModel)
+            .where(SuministroModel.id == suministro.id, SuministroModel.deleted_at.is_not(None))
+            .values(**values)
+        )
+        try:
+            async with self._session.begin_nested():
+                result = cast(CursorResult[None], await self._session.execute(stmt))
+                if result.rowcount == 0:
+                    raise SuministroConflictError(
+                        f"suministro {suministro.id} is no longer soft-deleted -- a concurrent "
+                        "resurrection already claimed it"
+                    )
         except IntegrityError as error:
             raise SuministroConflictError(
                 str(error.orig) if error.orig is not None else str(error)

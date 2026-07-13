@@ -75,11 +75,10 @@ class EstadoLote(StrEnum):
 # to `Procesado`/`Error` (it must actually go through `Procesando` first). `Procesado` is terminal
 # by design -- RD-010 explicitly rules out re-running a lote that already succeeded.
 #
-# `Error` being terminal too (no `Error` -> `Procesando` retry path) is, unlike `Procesado`, an
-# unreviewed assumption this map makes on its own: no canonical document (BUSINESS_ANALYSIS.md,
-# DOMAIN_MODEL.md) actually says whether a failed lote may be retried. Treat "`Error` is terminal"
-# as pending business confirmation before the processing engine is built, not as a settled RD-010
-# consequence -- see PROJECT_MASTER_SPEC.md's pending-decisions list.
+# `Error` -> `Procesando` (retrying a failed lote) was confirmed by business (Rodrigo Zanin,
+# 2026-07-13): a failed lote may be retried by moving back into `Procesando`. This is no longer an
+# unreviewed assumption -- `Error` is the only non-terminal failure state in this map; `Procesado`
+# remains terminal, unaffected by this decision.
 #
 # Nothing calls these transitions yet (the processing engine that would is a future user story),
 # but the invariant belongs in the domain now, not bolted onto that future use case as an
@@ -94,7 +93,7 @@ ALLOWED_TRANSITIONS: dict[EstadoLote, frozenset[EstadoLote]] = {
     EstadoLote.PENDIENTE: frozenset({EstadoLote.PROCESANDO}),
     EstadoLote.PROCESANDO: frozenset({EstadoLote.PROCESADO, EstadoLote.ERROR}),
     EstadoLote.PROCESADO: frozenset(),
-    EstadoLote.ERROR: frozenset(),
+    EstadoLote.ERROR: frozenset({EstadoLote.PROCESANDO}),
 }
 
 

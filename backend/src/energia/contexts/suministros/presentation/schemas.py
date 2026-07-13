@@ -6,7 +6,7 @@ See docs/03-architecture/API_SPEC.md ("Contexto: Gestión de Suministros") for t
 from datetime import date
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class SuministroImportItem(BaseModel):
@@ -17,7 +17,16 @@ class SuministroImportItem(BaseModel):
     (reported per-record in `ImportSummarySchema.rejected`, HTTP 200), not a structural one.
     `numero_cliente` and `categoria_tarifaria` are natural keys (not UUIDs) -- the use case
     resolves them, rejecting the record if either does not exist.
+
+    `model_config = ConfigDict(extra="forbid")` (DECISION #11, aligning with `LoteImportItem`/
+    `ConsumoImportItem` -- see `contexts.consumos.presentation.schemas`): an unrecognized key (a
+    typo like `categoria_tarifariaa`, or any other undeclared field) is rejected as a structural
+    violation (per-record, HTTP 200, naming the offending key in the reason), not silently
+    dropped. This used to default to Pydantic's `extra="ignore"` (undeclared fields dropped with
+    no trace at all).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     numero_suministro: str | None = None
     numero_cliente: str | None = None
@@ -41,6 +50,7 @@ class ImportSummarySchema(BaseModel):
     created: int
     updated: int
     unchanged: int
+    restored: int
     rejected: list[RejectedRecordSchema]
 
 

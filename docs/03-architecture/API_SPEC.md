@@ -2,6 +2,7 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
+| 0.7.0 | 2026-07-13 | En progreso (DECISIÓN #9 — resurrección al reimportar una clave natural soft-deleted, los cinco endpoints de importación ganan `restored`— y DECISIÓN #13 — `DELETE /api/v1/consumos/{id}`, corrección de períodos — documentadas) | Rodrigo Zanin |
 | 0.6.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura`, `Lote de Facturación` y `Consumo`, las tres entidades de §4.3 completas— documentados) | Rodrigo Zanin |
 | 0.5.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura` y `Lote de Facturación`— documentados) | Rodrigo Zanin |
 | 0.4.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos documentados) | Rodrigo Zanin |
@@ -36,7 +37,7 @@ Importa clientes desde un array JSON. Es el adaptador de hoy para el puerto `Cli
 | `barrio` | string \| null | No | Máx. 100 caracteres |
 | `direccion` | object \| null | No | JSON libre (columna `jsonb`); ver ambigüedad documentada en `contexts/README.md` |
 
-Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito: un `numero_cliente` o `nombre` faltante es un rechazo de **dominio** (HTTP 200, reportado en `rejected`), no un error estructural de request.
+Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito: un `numero_cliente` o `nombre` faltante es un rechazo de **dominio** (HTTP 200, reportado en `rejected`), no un error estructural de request — salvo una clave desconocida (un campo mal tipeado, por ejemplo `numero_clientee`, o cualquier otra no declarada arriba), que sí es un rechazo estructural individual: `ClienteImportItem` usa `extra="forbid"` (el estándar de `Lote`, ver la sección `POST /api/v1/lotes/import` más abajo), también HTTP 200 en `rejected`, nombrando la clave ofensora.
 
 **Response 200** — `ImportSummary`:
 
@@ -45,11 +46,14 @@ Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósi
   "created": 3,
   "updated": 0,
   "unchanged": 0,
+  "restored": 0,
   "rejected": [
     { "record": { "numero_cliente": "", "nombre": "Sin numero", "...": null }, "reasons": ["numero_cliente es obligatorio"] }
   ]
 }
 ```
+
+**`restored` (DECISIÓN #9, resurrección — confirmada por negocio, 2026-07-13, ver `PROJECT_MASTER_SPEC.md`, ítems resueltos)**: un registro cuyo `numero_cliente` no matchea ninguna fila activa, pero sí matchea una fila soft-deleted (`deleted_at IS NOT NULL`), **revive esa misma fila** (mismo `id`, `deleted_at` limpiado, campos fusionados con el registro reimportado) en vez de crear una identidad nueva. Se cuenta en `restored`, separado de `created`/`updated`/`unchanged`. Si hay más de una fila soft-deleted con el mismo `numero_cliente`, solo la más recientemente eliminada (mayor `deleted_at`) es candidata a resurrección — las anteriores quedan eliminadas. Ver `contexts/README.md` ("Comportamiento ante soft-delete") para el detalle completo del mecanismo, compartido por los cinco endpoints de importación de esta API.
 
 **Errores**:
 
@@ -99,6 +103,7 @@ Importa suministros desde un array JSON. Mismo patrón que `POST /api/v1/cliente
 - `numero_cliente` faltante o el cliente referenciado no existe (`"cliente inexistente: numero_cliente=..."`).
 - `categoria_tarifaria` faltante o la categoría referenciada no existe (`"categoria tarifaria inexistente: ..."`).
 - El registro viola un invariante de `Suministro` (por ejemplo, `numero_suministro` vacío o `fecha_alta` con formato inválido).
+- Cualquier clave no declarada en el schema (un campo mal tipeado, por ejemplo `categoria_tarifariaa`) — `SuministroImportItem` usa `extra="forbid"` (el estándar de `Lote`, ver la sección `POST /api/v1/lotes/import` más abajo).
 
 **Request body** — array JSON, cada elemento:
 
@@ -112,7 +117,7 @@ Importa suministros desde un array JSON. Mismo patrón que `POST /api/v1/cliente
 | `localidad` | string \| null | No | Máx. 100 caracteres |
 | `barrio` | string \| null | No | Máx. 100 caracteres |
 
-Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito, igual que en Gestión de Clientes: un valor faltante o inválido es un rechazo de **dominio** o de **resolución de referencia** (HTTP 200, reportado en `rejected`), no un error estructural de request.
+Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito, igual que en Gestión de Clientes: un valor faltante o inválido es un rechazo de **dominio** o de **resolución de referencia** (HTTP 200, reportado en `rejected`), no un error estructural de request — salvo una clave desconocida, que sí es un rechazo estructural individual (también HTTP 200, ver arriba).
 
 **Response 200** — `ImportSummary`:
 
@@ -121,6 +126,7 @@ Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósi
   "created": 2,
   "updated": 0,
   "unchanged": 0,
+  "restored": 0,
   "rejected": [
     { "record": { "numero_suministro": "SUM-300", "numero_cliente": "no-existe", "...": null },
       "reasons": ["cliente inexistente: numero_cliente='no-existe'"] },
@@ -129,6 +135,8 @@ Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósi
   ]
 }
 ```
+
+**`restored`**: mismo mecanismo de resurrección que Gestión de Clientes (DECISIÓN #9), aplicado a `numero_suministro` — ver esa sección arriba para el detalle completo.
 
 **Errores**:
 
@@ -166,7 +174,7 @@ Lista paginada de suministros vigentes (excluye soft-deleted, `deleted_at IS NUL
 
 ## Contexto: Gestión de Consumos
 
-Implementado en `backend/src/energia/contexts/consumos/`, para las tres entidades que `DOMAIN_MODEL.md` §4.3 asigna a este contexto: `Lectura` (US-003), `Lote de Facturación` (US-005) y `Consumo` (US-004) — con `Consumo` aterrizado, Épica 1 queda completa (ver `contexts/README.md`, "One package, staged entities"). Cubre la importación de lecturas históricas, la importación de lotes de facturación, la importación de consumos históricos, y la consulta paginada de las tres. Los endpoints de `Lectura` están montados bajo `/api/v1/lecturas`; los de `Lote` bajo `/api/v1/lotes`; los de `Consumo` bajo `/api/v1/consumos`.
+Implementado en `backend/src/energia/contexts/consumos/`, para las tres entidades que `DOMAIN_MODEL.md` §4.3 asigna a este contexto: `Lectura` (US-003), `Lote de Facturación` (US-005) y `Consumo` (US-004) — con `Consumo` aterrizado, Épica 1 queda completa (ver `contexts/README.md`, "One package, staged entities"). Cubre la importación de lecturas históricas, la importación de lotes de facturación, la importación de consumos históricos, la consulta paginada de las tres, y (DECISIÓN #13) la corrección de un consumo mal ingresado por baja lógica. Los endpoints de `Lectura` están montados bajo `/api/v1/lecturas`; los de `Lote` bajo `/api/v1/lotes`; los de `Consumo` bajo `/api/v1/consumos`.
 
 Una lectura pertenece a exactamente un suministro (RD-015, `DOMAIN_MODEL.md` §7.5). El payload de importación referencia al suministro por su **clave natural**, `numero_suministro`, no por UUID: el endpoint la resuelve a UUID antes de intentar guardar el registro; si no existe, el registro se rechaza individualmente (ver más abajo), no la request completa.
 
@@ -182,6 +190,7 @@ Importa lecturas desde un array JSON. Mismo patrón que `POST /api/v1/suministro
 
 - `numero_suministro` faltante o el suministro referenciado no existe (`"suministro inexistente: numero_suministro=..."`).
 - El registro viola un invariante de `Lectura`: `fecha_lectura` con formato inválido, `lectura_anterior`/`lectura_actual` faltante, no numérico, negativo (un medidor físico no retrocede — invariante solo de dominio, no una CHECK de la base) o con más de 3 decimales o más de 9 dígitos enteros (no entra en `numeric(12,3)`), `lectura_actual` menor que `lectura_anterior` (RD-013), o `dias_facturados` faltante, no entero o no mayor que cero (RD-014).
+- Cualquier clave no declarada en el schema (un campo mal tipeado, por ejemplo `dias_facturadoo`) — `LecturaImportItem` usa `extra="forbid"` (el estándar de `Lote`, ver la sección `POST /api/v1/lotes/import` más abajo).
 
 **Request body** — array JSON, cada elemento:
 
@@ -193,7 +202,7 @@ Importa lecturas desde un array JSON. Mismo patrón que `POST /api/v1/suministro
 | `lectura_actual` | number | Sí (ídem) | Ídem `lectura_anterior`; además debe ser ≥ `lectura_anterior` (RD-013) |
 | `dias_facturados` | integer | Sí (ídem) | Debe ser mayor que cero (RD-014) |
 
-Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito, igual que en Gestión de Clientes/Suministros: un valor faltante o inválido es un rechazo de **dominio** o de **resolución de referencia** (HTTP 200, reportado en `rejected`), no un error estructural de request.
+Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito, igual que en Gestión de Clientes/Suministros: un valor faltante o inválido es un rechazo de **dominio** o de **resolución de referencia** (HTTP 200, reportado en `rejected`), no un error estructural de request — salvo una clave desconocida, que sí es un rechazo estructural individual (también HTTP 200, ver arriba).
 
 **Response 200** — `ImportSummary`:
 
@@ -202,6 +211,7 @@ Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósi
   "created": 2,
   "updated": 0,
   "unchanged": 0,
+  "restored": 0,
   "rejected": [
     { "record": { "numero_suministro": "no-existe", "fecha_lectura": "2024-01-15", "...": null },
       "reasons": ["suministro inexistente: numero_suministro='no-existe'"] },
@@ -210,6 +220,8 @@ Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósi
   ]
 }
 ```
+
+**`restored`**: mismo mecanismo de resurrección (DECISIÓN #9), aplicado a la clave natural compuesta `(numero_suministro, fecha_lectura)` — ver "Contexto: Gestión de Clientes" arriba para el detalle completo.
 
 **Errores**:
 
@@ -288,6 +300,7 @@ Antes de esta distinción, un campo simplemente ausente del payload se trataba i
   "created": 2,
   "updated": 0,
   "unchanged": 0,
+  "restored": 0,
   "rejected": [
     { "record": { "codigo_lote": "", "nombre": "Sin codigo" },
       "reasons": ["codigo_lote es obligatorio"] },
@@ -296,6 +309,8 @@ Antes de esta distinción, un campo simplemente ausente del payload se trataba i
   ]
 }
 ```
+
+**`restored`**: mismo mecanismo de resurrección (DECISIÓN #9), aplicado a `codigo_lote` — ver "Contexto: Gestión de Clientes" arriba para el detalle completo. Particularidad de `Lote`: un lote resurrecto **conserva** el `estado` (y `fecha_importacion`) que tenía al momento de eliminarse — la resurrección nunca lo resetea a `Pendiente`, la misma protección de RD-010 que ya aplica a una actualización ordinaria (ver el párrafo sobre `estado` más arriba).
 
 El `record` de cada rechazo solo incluye las claves realmente presentes en el payload original — un campo omitido no aparece (ni como `null` ni con ningún otro valor centinela).
 
@@ -386,6 +401,7 @@ Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósi
   "created": 2,
   "updated": 0,
   "unchanged": 0,
+  "restored": 0,
   "rejected": [
     { "record": { "numero_suministro": "no-existe", "codigo_lote": "LOTE-2024-01", "...": null },
       "reasons": ["suministro inexistente: numero_suministro='no-existe'"] },
@@ -396,17 +412,39 @@ Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósi
 }
 ```
 
+**`restored`**: mismo mecanismo de resurrección (DECISIÓN #9), aplicado a la clave natural compuesta `(numero_suministro, fecha_inicio, fecha_fin)` — ver "Contexto: Gestión de Clientes" arriba para el detalle completo. `consumo_promedio_diario` se recalcula igual en una resurrección que en una actualización ordinaria (nunca preserva el valor de la fila eliminada); ver DECISIÓN #13 más abajo para cómo esto se combina con `DELETE /api/v1/consumos/{id}` como vía de corrección.
+
 **Errores**:
 
 | Código | Causa |
 |---|---|
 | 422 | Body estructuralmente inválido (no es un array JSON, o un campo tiene un tipo incompatible). Distinto del rechazo de dominio/referencia de arriba, que responde 200. |
 
-**Limitación conocida (RD-017, superposición parcial de períodos)**: `uq_consumos_suministro_periodo` (índice único parcial, `WHERE deleted_at IS NULL` — deuda #10 de `PROJECT_MASTER_SPEC.md`, resuelta antes de esta historia) evita importar dos veces **exactamente** el mismo período para un suministro, incluyendo reimportar un período previamente soft-deleted como fila nueva. No impide, en cambio, que se carguen dos períodos que se solapan parcialmente (por ejemplo, 01/03-31/03 y 15/03-15/04 para el mismo suministro): eso requeriría un `EXCLUDE` constraint con rangos de fecha (extensión `btree_gist`, `docs/03-architecture/DATABASE_DESIGN.md` §6.4), que no se agrega en esta historia. Este endpoint no implementa ninguna detección de solapamiento propia.
-
-**Limitación conocida: corrección de períodos.** Esta es una brecha distinta de la de RD-017 (arriba): no es una superposición no detectada, sino la ausencia total de una vía para retractar un período mal ingresado. Si un `fecha_inicio`/`fecha_fin` con un error de tipeo se reimporta ya corregido, la clave natural compuesta `(numero_suministro, fecha_inicio, fecha_fin)` cambia — la reimportación no actualiza la fila original: crea una **segunda** fila, activa, distinta de la primera (que también queda activa, con su período incorrecto). No existe hoy ningún endpoint DELETE ni de baja lógica para `Consumo` en esta API: la única forma de retractar la fila original con el período incorrecto es un soft-delete manual por SQL directo (`UPDATE consumos SET deleted_at = now() WHERE ...`), fuera de la API. Ver `PROJECT_MASTER_SPEC.md`, deuda documental #13.
+**Limitación conocida (RD-017, superposición parcial de períodos)**: `uq_consumos_suministro_periodo` (índice único parcial, `WHERE deleted_at IS NULL` — deuda #10 de `PROJECT_MASTER_SPEC.md`, resuelta antes de esta historia) evita importar dos veces **exactamente** el mismo período para un suministro. No impide, en cambio, que se carguen dos períodos que se solapan parcialmente (por ejemplo, 01/03-31/03 y 15/03-15/04 para el mismo suministro): eso requeriría un `EXCLUDE` constraint con rangos de fecha (extensión `btree_gist`, `docs/03-architecture/DATABASE_DESIGN.md` §6.4), que no se agrega en esta historia. Este endpoint no implementa ninguna detección de solapamiento propia.
 
 **Limitación conocida: redondeo a cero.** `consumo_promedio_diario`/`kwh` son `numeric(12,3)`: un promedio genuinamente distinto de cero puede redondear a `0.000` y volverse indistinguible de un cero real — por ejemplo, `kwh=0.001` con `dias_facturados=365` computa `0.0000027...`, que redondea a `0.000`. Relevante para la detección de anomalías corriente abajo, donde un consumo cero es en sí mismo una señal.
+
+### DELETE /api/v1/consumos/{id}
+
+**DECISIÓN #13 (confirmada por negocio, 2026-07-13 — ver `PROJECT_MASTER_SPEC.md`, ítems resueltos): la vía de corrección de un período mal ingresado.** Da de baja lógica (`deleted_at`) el consumo **activo** con ese `id`, para poder reimportar el período corregido a continuación — combinado con DECISIÓN #9 (resurrección), la reimportación revive esa misma fila (`restored: 1`), no crea una tercera.
+
+**Path param**:
+
+| Parámetro | Tipo | Notas |
+|---|---|---|
+| `id` | UUID | El `id` de un `Consumo` (campo `id` de `ConsumoSchema`, ver `GET /api/v1/consumos` arriba) |
+
+**Localización solo por `id`, no por la clave primaria compuesta**: `consumos.id` no es la primary key completa — la tabla está particionada por `fecha_inicio` (`docker/postgres/init/01_schema.sql`), así que la primary key real es `(id, fecha_inicio)`. Este endpoint solo recibe `id` (el cliente HTTP no conoce `fecha_inicio` de antemano), así que localiza la fila por `id` solo, asumiendo que es único en la práctica — una suposición razonable (`id` se genera vía `uuid4()`, nunca se reutiliza) pero no una garantía a nivel de base de datos, a diferencia de una primary key simple por `id`. Postgres no puede podar particiones con esta búsqueda (no conoce `fecha_inicio`), así que recorre todas — aceptable para un endpoint que borra un registro a la vez, no una operación masiva.
+
+**Response 204** — sin cuerpo. El consumo queda excluido de `GET /api/v1/consumos` inmediatamente después.
+
+**Errores**:
+
+| Código | Causa |
+|---|---|
+| 404 | No existe un consumo **activo** con ese `id` — deliberadamente la misma respuesta tanto si `id` es desconocido como si ya estaba soft-deleted (el llamador no puede, ni necesita, distinguir cuál de los dos casos es). No commitea nada en este camino. |
+
+No existe (todavía) un endpoint equivalente para `Cliente`, `Suministro`, `Lectura` ni `Lote` — evaluar agregarlos queda pendiente para cuando surja la necesidad de negocio (ver `PROJECT_MASTER_SPEC.md`).
 
 ### GET /api/v1/consumos
 

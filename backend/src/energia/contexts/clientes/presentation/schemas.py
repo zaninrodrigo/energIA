@@ -5,7 +5,7 @@ See docs/03-architecture/API_SPEC.md ("Contexto: Gestión de Clientes") for the 
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ClienteImportItem(BaseModel):
@@ -21,7 +21,16 @@ class ClienteImportItem(BaseModel):
     a whole-request 422, precisely because each element is checked on its own instead of the
     whole array being bound to `list[ClienteImportItem]` in one shot. FastAPI/Pydantic still
     return 422 for a malformed *body* (not a JSON array at all).
+
+    `model_config = ConfigDict(extra="forbid")` (DECISION #11, aligning with `LoteImportItem`/
+    `ConsumoImportItem` -- see `contexts.consumos.presentation.schemas`): an unrecognized key (a
+    typo like `numero_clientee`, or any other undeclared field) is rejected as a structural
+    violation (per-record, HTTP 200, naming the offending key in the reason), not silently
+    dropped. This used to default to Pydantic's `extra="ignore"` (undeclared fields dropped with
+    no trace at all).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     numero_cliente: str | None = None
     nombre: str | None = None
@@ -45,6 +54,7 @@ class ImportSummarySchema(BaseModel):
     created: int
     updated: int
     unchanged: int
+    restored: int
     rejected: list[RejectedRecordSchema]
 
 

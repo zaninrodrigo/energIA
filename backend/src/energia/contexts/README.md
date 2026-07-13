@@ -158,69 +158,93 @@ deciding a structured shape is actually wanted) is open; see `docs/03-architectu
 
 ## Comportamiento ante soft-delete
 
-Re-importing a `numero_cliente` whose row is soft-deleted (`deleted_at IS NOT NULL`) creates a
-**brand-new row with a new `id`** — it does not "resurrect" the original row. This follows
-directly from `uq_clientes_numero_cliente` being a *partial* unique index (`WHERE deleted_at IS
-NULL`, `docker/postgres/init/01_schema.sql`): a soft-deleted `numero_cliente` is free to be
-reused because the index no longer constrains it, and `ImportClientes`/`SqlAlchemyClienteRepository.save()`
-never look past `deleted_at IS NULL` rows when deciding create-vs-update (`get_by_numero_cliente`
-filters them out) or when upserting (the natural-key `ON CONFLICT` target is scoped by the same
-`WHERE deleted_at IS NULL` predicate).
+**DECISION #9 (resurrection, confirmed by business — Rodrigo Zanin, 2026-07-13 — see
+`PROJECT_MASTER_SPEC.md`, resolved items):** re-importing a natural key whose row is soft-deleted
+(`deleted_at IS NOT NULL`) **revives that same row** — same `id`, `deleted_at` cleared, fields
+merged from the re-import — instead of creating a brand-new identity. The rationale: a natural
+key (`numero_cliente`, `numero_suministro`, `codigo_lote`, or a composite key like
+`(suministro_id, fecha_lectura)`) denotes a single identity across its *whole* lifecycle,
+soft-delete included, not a fresh one every time it happens to come back. This replaces the
+previous (2026-07-13-and-earlier) documented behavior — "soft-delete re-import creates a new
+identity" — which was this codebase's initial, deliberate-but-unreviewed default until business
+weighed in.
 
-This is today's deliberate, tested behavior (see `test_reimporting_a_soft_deleted_numero_
-cliente_creates_a_new_identity`, `tests/integration/contexts/clientes/
-test_clientes_routes_integration.py`), not a bug — but it has a real consequence: any
-historical FK pointing at the old row (e.g. `suministros.cliente_id`) keeps pointing at the old,
-still-soft-deleted row, never at the new one. Whether the business actually wants resurrection
-instead is an open question — see `PROJECT_MASTER_SPEC.md`'s debt list.
+Mechanically, each import use case (`ImportClientes`, `ImportSuministros`, `ImportLecturas`,
+`ImportLotes`, `ImportConsumos`) now runs a second lookup whenever the first (`get_by_<natural
+key>`, scoped to `deleted_at IS NULL`) finds nothing: `get_most_recently_deleted_by_<natural
+key>` (the same repository, ordered by `deleted_at DESC`, so only the *most recently* deleted row
+is ever a candidate — older dead rows sharing the same key, however they arose, stay dead). A hit
+there resurrects instead of creating: `repository.resurrect(entity)` clears `deleted_at` and
+writes every mutable field on that SAME row, using each entity's normal update-merge (Cliente/
+Suministro/Lectura re-validate through `create()`; Lote applies its `UNSET`-aware `nombre`/
+`cantidad_registros` merge while keeping `estado`/`fecha_importacion` untouched, exactly like an
+ordinary update; Consumo recomputes `consumo_promedio_diario` fresh, exactly like an ordinary
+update). `resurrect()` is a plain `UPDATE ... WHERE id = :id`, not `save()`'s `INSERT ... ON
+CONFLICT` upsert: a dead row is excluded from its natural key's partial unique index (`WHERE
+deleted_at IS NULL`), so that upsert's `ON CONFLICT` target could never match it in the first
+place — inserting the same `id` again would only collide with the primary key instead. Each
+`ImportSummary` gained a `restored` count, separate from `created`/`updated`/`unchanged`, so a
+resurrection is visible in the API response (`docs/03-architecture/API_SPEC.md`).
 
-`suministros` follows the exact same semantics for `numero_suministro`
-(`uq_suministros_numero_suministro` is the same kind of partial unique index), tested by
-`test_reimporting_a_soft_deleted_numero_suministro_creates_a_new_identity`
-(`tests/integration/contexts/suministros/test_suministros_routes_integration.py`) — no new
-resurrection logic was introduced for the second context either.
+A resurrection always writes, even when every field already matches the dead row's stored
+values — `deleted_at` itself is what's changing — so it is never folded into `unchanged`. Once
+resurrected, the row is active again: a further identical re-import finds it through the
+ordinary active-row lookup, not the dead-row path, and reports `unchanged` like any other
+already-current row.
 
-`consumos` follows the same semantics for `Lectura`, keyed by the *composite* natural key
-`(suministro_id, fecha_lectura)` instead of a single column: `uq_lecturas_suministro_fecha`
-(`docker/postgres/init/01_schema.sql`) is a partial unique index over that pair (`WHERE
-deleted_at IS NULL`), added as part of US-003 — `lecturas` had no natural-key unique index at
-all before this slice, so re-importing the same historical reading would otherwise have
-duplicated it on every re-run instead of upserting. Tested by
-`test_reimporting_a_soft_deleted_key_creates_a_new_identity`
-(`tests/integration/contexts/consumos/test_lecturas_routes_integration.py`).
+Because resurrection keeps the *same* `id`, any historical FK pointing at it (e.g.
+`suministros.cliente_id`) now keeps resolving correctly across a soft-delete/resurrection cycle —
+tested by `test_resurrecting_a_suministro_does_not_disturb_a_historical_fk_to_its_cliente`
+(`tests/integration/contexts/suministros/test_suministros_routes_integration.py`). This is the
+direct benefit over the old "new identity" behavior, where a historical FK kept pointing at the
+old, permanently soft-deleted row.
 
-`Lote` (US-005) follows the same semantics too, keyed by its single natural key `codigo_lote`:
-`uq_lotes_codigo_lote` (`docker/postgres/init/01_schema.sql`) was already a partial unique index
-(`WHERE deleted_at IS NULL`) before this slice — unlike `lecturas`, no schema change was needed
-here. Tested by `test_reimporting_a_soft_deleted_codigo_lote_creates_a_new_identity`
-(`tests/integration/contexts/consumos/test_lotes_routes_integration.py`).
+Tested per context: `test_reimporting_a_soft_deleted_numero_cliente_resurrects_the_original_row`
+(`tests/integration/contexts/clientes/test_clientes_routes_integration.py`, plus multiple-dead-
+rows and resurrected-then-unchanged variants alongside it),
+`test_reimporting_a_soft_deleted_numero_suministro_resurrects_the_original_row`
+(`tests/integration/contexts/suministros/test_suministros_routes_integration.py`),
+`test_reimporting_a_soft_deleted_key_resurrects_the_original_row`
+(`tests/integration/contexts/consumos/test_lecturas_routes_integration.py`),
+`test_reimporting_a_soft_deleted_codigo_lote_resurrects_the_original_row` plus
+`test_resurrecting_a_lote_that_transitioned_to_procesado_keeps_that_estado`
+(`tests/integration/contexts/consumos/test_lotes_routes_integration.py`), and
+`test_reimporting_a_soft_deleted_consumo_resurrects_the_original_row`
+(`tests/integration/contexts/consumos/test_consumos_routes_integration.py`) — each mirrored by
+unit tests against the in-memory fakes and by repository-level integration tests for
+`get_most_recently_deleted_by_<natural key>`/`resurrect()`, covering two independent races, both
+degrading to a per-record rejection rather than corrupting anything: (1) the natural-key race —
+a dead row's own natural key gets claimed by a concurrent active insert before its resurrection
+commits, caught by the natural key's own partial unique index and surfaced as
+`<Entity>ConflictError`; and (2) the same-dead-row race — two concurrent resurrections of the
+SAME dead row, where neither `UPDATE` would otherwise conflict with anything (same row, same
+natural key), so without an explicit guard both silently "succeed" and whichever commits last
+wins with no error at all (a lost-update, not a corruption of the partial unique index, but a
+silent one nonetheless). `resurrect()`'s `WHERE` clause requires `deleted_at IS NOT NULL` in
+addition to matching identity, and checks `result.rowcount`: a concurrent resurrection that
+already cleared this row's `deleted_at` makes the loser's `UPDATE` match zero rows, raised as
+`<Entity>ConflictError` — the same per-record-rejection outcome as race (1), not a silent
+overwrite. `get_most_recently_deleted_by_<natural key>` also breaks `deleted_at` ties
+deterministically (`ORDER BY deleted_at DESC, id DESC` — `id` is arbitrary-but-stable, carrying no
+business meaning of its own) so which dead row is picked never depends on Postgres's unspecified
+scan order when two dead rows share the exact same `deleted_at`.
 
-`Consumo` (US-004) follows the same semantics too, keyed by the *composite* natural key
-`(suministro_id, fecha_inicio, fecha_fin)` — but, unlike `lecturas`, `uq_consumos_suministro_periodo`
-was **not** already a partial unique index before this slice: it was a plain `CONSTRAINT ...
-UNIQUE`, the one natural-key index in the whole schema that broke this convention (debt #10,
-`PROJECT_MASTER_SPEC.md`). It was converted to a partial unique index (`WHERE deleted_at IS
-NULL`) as a prerequisite of this slice, on the partitioned `consumos` table — PostgreSQL requires
-every unique index of a partitioned table to include the partitioning column (`fecha_inicio`,
-already part of this natural key), so no additional column had to be added to satisfy that rule.
-Tested by `test_reimporting_a_soft_deleted_consumo_creates_a_new_identity`
-(`tests/integration/contexts/consumos/test_consumos_routes_integration.py`) and, at the
-repository level, `test_save_upserts_by_suministro_and_periodo_even_with_a_different_fresh_id`
-(`tests/integration/contexts/consumos/test_consumo_repository_integration.py`).
-
-**Known FK race with a soft-deleted `cliente`**: `fk_suministros_cliente`
+**FK race with a soft-deleted `cliente` — now healable, not just narrow.** `fk_suministros_cliente`
 (`docker/postgres/init/01_schema.sql`) is an ordinary foreign key against `clientes.id` — it does
 not, and cannot, check `deleted_at`. If a `cliente` were soft-deleted *between* `ClienteDirectory`
 resolving its `id` and `ImportSuministros`' `INSERT`/`UPDATE` of the `suministro` row, the new or
-updated `suministro` would end up referencing a now soft-deleted `cliente`, the same way a
-historical FK can already point at one (see above). This is currently unreachable in practice —
-the API exposes no endpoint to delete/deactivate a `cliente` at all — but it must be revisited
-once a `cliente` deactivation feature ships, since that endpoint would make the race a real,
-if narrow, concurrency window.
+updated `suministro` would end up referencing a now soft-deleted `cliente`. This is currently
+unreachable in practice — the API exposes no endpoint to delete/deactivate a `cliente` at all —
+but the resurrection this section describes changes what happens if it ever is reached: a stale
+reference like that is no longer permanent. Re-importing the same `numero_cliente` resurrects the
+SAME `cliente` row (same `id`), so the `suministro`'s FK — which was always pointing at that `id`
+— starts resolving to an active row again instead of staying orphaned forever. Still worth
+revisiting once a `cliente` deactivation feature ships (the race itself is unchanged, only its
+consequence is now recoverable), but no longer the one-way data-integrity hazard it used to be.
 
 The identical race exists between `SuministroDirectory` and `ImportLecturas`' write, against
 `fk_lecturas_suministro` instead: also currently unreachable (no endpoint deletes/deactivates a
-`suministro` either), for the same reason.
+`suministro` either), and now equally healable by re-importing the `suministro`.
 
 ## One package, staged entities
 
@@ -268,8 +292,10 @@ invisible way, silently defaulting the real field instead of surfacing any error
 for keeping `estado` out of the payload at all: accepting it from an import payload would let a
 single crafted request fabricate an already-`Procesado` lote that never actually went through the
 pipeline that state represents, exactly the kind of shortcut RD-010 exists to close.
-`clientes`/`suministros`/`lecturas`' own import DTOs still use `extra="ignore"` — aligning them
-the same way is a separate, not-yet-made decision (see `PROJECT_MASTER_SPEC.md`, pending items).
+`clientes`/`suministros`/`lecturas`' own import DTOs (`ClienteImportItem`, `SuministroImportItem`,
+`LecturaImportItem`) were aligned to the same `extra="forbid"` (decision confirmed by business,
+2026-07-13 -- see `PROJECT_MASTER_SPEC.md`, resolved items): an unrecognized key in any of the
+three payloads is now rejected the same way, per-record, naming the offending key.
 
 This has a direct consequence for `ImportLotes`' update path, worth calling out because it is the
 one place in this codebase where the update-merge logic deliberately does **not** re-validate

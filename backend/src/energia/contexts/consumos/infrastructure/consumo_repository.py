@@ -1,9 +1,10 @@
 """SqlAlchemyConsumoRepository: the `ConsumoRepository` port implementation (async), US-004."""
 
 from datetime import date
+from typing import cast
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,6 +37,27 @@ class SqlAlchemyConsumoRepository:
             ConsumoModel.fecha_inicio == fecha_inicio,
             ConsumoModel.fecha_fin == fecha_fin,
             ConsumoModel.deleted_at.is_(None),
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _to_domain(model) if model is not None else None
+
+    async def get_most_recently_deleted_by_suministro_and_periodo(
+        self, suministro_id: UUID, fecha_inicio: date, fecha_fin: date
+    ) -> Consumo | None:
+        stmt = (
+            select(ConsumoModel)
+            .where(
+                ConsumoModel.suministro_id == suministro_id,
+                ConsumoModel.fecha_inicio == fecha_inicio,
+                ConsumoModel.fecha_fin == fecha_fin,
+                ConsumoModel.deleted_at.is_not(None),
+            )
+            # `id DESC` is a secondary sort key purely to make the pick deterministic when two
+            # dead rows share the exact same `deleted_at` -- `id` carries no business meaning
+            # here (arbitrary-but-stable), it just guarantees a repeatable choice instead of
+            # leaving ties to Postgres's unspecified scan order.
+            .order_by(ConsumoModel.deleted_at.desc(), ConsumoModel.id.desc())
+            .limit(1)
         )
         model = (await self._session.execute(stmt)).scalar_one_or_none()
         return _to_domain(model) if model is not None else None
@@ -82,6 +104,83 @@ class SqlAlchemyConsumoRepository:
             raise ConsumoConflictError(
                 str(error.orig) if error.orig is not None else str(error)
             ) from error
+
+    async def resurrect(self, consumo: Consumo) -> None:
+        """Revive a soft-deleted row by `(consumo.id, consumo.fecha_inicio)`, clearing
+        `deleted_at` and writing every mutable field -- mirrors
+        `SqlAlchemyClienteRepository.resurrect()` for the "update by identity, not `ON CONFLICT`"
+        rationale (a dead row is excluded from `uq_consumos_suministro_periodo`'s partial index,
+        so `save()`'s upsert cannot target it at all).
+
+        `fecha_inicio` is included in the `WHERE` alongside `id` (unlike `resurrect()` on the
+        other, non-partitioned repositories): `consumos` is partitioned by RANGE on
+        `fecha_inicio`, and the caller (`ImportConsumos`) already knows it -- it is part of the
+        composite natural key `(suministro_id, fecha_inicio, fecha_fin)` a dead row was looked up
+        by in the first place. Including it lets Postgres prune to a single partition instead of
+        scanning every one of them (contrast `soft_delete()` below, which only ever has `id`).
+
+        The `WHERE` clause also requires `deleted_at IS NOT NULL`, and the affected row count is
+        checked afterwards -- see `SqlAlchemyClienteRepository.resurrect()`'s docstring for why:
+        two concurrent resurrections of the SAME dead row are a lost-update race without this
+        guard, since both `UPDATE`s would otherwise match unconditionally. A zero `rowcount` here
+        means a concurrent resurrection already won, and is raised as `ConsumoConflictError`
+        instead of silently re-applying (and overwriting) whatever the winner just wrote.
+        """
+        values = {
+            "suministro_id": consumo.suministro_id,
+            "lote_id": consumo.lote_id,
+            "lectura_id": consumo.lectura_id,
+            "fecha_inicio": consumo.fecha_inicio,
+            "fecha_fin": consumo.fecha_fin,
+            "dias_facturados": consumo.dias_facturados,
+            "kwh": consumo.kwh,
+            "consumo_promedio_diario": consumo.consumo_promedio_diario,
+            "deleted_at": None,
+        }
+        stmt = (
+            update(ConsumoModel)
+            .where(
+                ConsumoModel.id == consumo.id,
+                ConsumoModel.fecha_inicio == consumo.fecha_inicio,
+                ConsumoModel.deleted_at.is_not(None),
+            )
+            .values(**values)
+        )
+        try:
+            async with self._session.begin_nested():
+                result = cast(CursorResult[None], await self._session.execute(stmt))
+                if result.rowcount == 0:
+                    raise ConsumoConflictError(
+                        f"consumo {consumo.id} is no longer soft-deleted -- a concurrent "
+                        "resurrection already claimed it"
+                    )
+        except IntegrityError as error:
+            raise ConsumoConflictError(
+                str(error.orig) if error.orig is not None else str(error)
+            ) from error
+
+    async def soft_delete(self, consumo_id: UUID) -> bool:
+        """DECISION #13: soft-delete the ACTIVE consumo with this `id` alone -- see
+        `ConsumoRepository.soft_delete()`'s docstring (domain/ports.py) for the composite-PK/
+        partition-pruning trade-off this accepts (no `fecha_inicio` is known at this HTTP
+        boundary, so Postgres must scan every partition instead of pruning to one -- acceptable
+        for a one-record-at-a-time correction endpoint, not a bulk operation).
+
+        Does not commit. Not wrapped in its own `SAVEPOINT` unlike `save()`/`resurrect()`: there
+        is no `ON CONFLICT`/integrity-violation path to translate here, just a plain conditional
+        `UPDATE` that either matches a row or does not.
+        """
+        stmt = (
+            update(ConsumoModel)
+            .where(ConsumoModel.id == consumo_id, ConsumoModel.deleted_at.is_(None))
+            .values(deleted_at=func.now())
+        )
+        # `session.execute()` is statically typed as `Result[Any]`, but a Core UPDATE statement
+        # always actually returns a `CursorResult` (the subclass that carries `rowcount`) at
+        # runtime -- the same gap `SQLAlchemy`'s own typing has for every DML statement, not
+        # something specific to this repository.
+        result = cast(CursorResult[None], await self._session.execute(stmt))
+        return result.rowcount > 0
 
     async def list_active(
         self,

@@ -1,6 +1,8 @@
 """SqlAlchemyLoteRepository: the `LoteRepository` port implementation (async)."""
 
-from sqlalchemy import func, select
+from typing import cast
+
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +30,23 @@ class SqlAlchemyLoteRepository:
         stmt = select(LoteModel).where(
             LoteModel.codigo_lote == codigo_lote,
             LoteModel.deleted_at.is_(None),
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _to_domain(model) if model is not None else None
+
+    async def get_most_recently_deleted_by_codigo_lote(self, codigo_lote: str) -> Lote | None:
+        stmt = (
+            select(LoteModel)
+            .where(
+                LoteModel.codigo_lote == codigo_lote,
+                LoteModel.deleted_at.is_not(None),
+            )
+            # `id DESC` is a secondary sort key purely to make the pick deterministic when two
+            # dead rows share the exact same `deleted_at` -- `id` carries no business meaning
+            # here (arbitrary-but-stable), it just guarantees a repeatable choice instead of
+            # leaving ties to Postgres's unspecified scan order.
+            .order_by(LoteModel.deleted_at.desc(), LoteModel.id.desc())
+            .limit(1)
         )
         model = (await self._session.execute(stmt)).scalar_one_or_none()
         return _to_domain(model) if model is not None else None
@@ -76,6 +95,48 @@ class SqlAlchemyLoteRepository:
         try:
             async with self._session.begin_nested():
                 await self._session.execute(upsert_stmt)
+        except IntegrityError as error:
+            raise LoteConflictError(
+                str(error.orig) if error.orig is not None else str(error)
+            ) from error
+
+    async def resurrect(self, lote: Lote) -> None:
+        """Revive a soft-deleted row by `lote.id`, clearing `deleted_at` and writing `nombre`/
+        `cantidad_registros` -- mirrors `SqlAlchemyClienteRepository.resurrect()` for the "update
+        by id, not `ON CONFLICT`" rationale (a dead row is excluded from
+        `uq_lotes_codigo_lote`'s partial index, so `save()`'s upsert cannot target it at all).
+
+        `estado`/`fecha_importacion` are deliberately excluded from the `SET` here too -- exactly
+        `save()`'s own exclusion (see that method's docstring): a resurrection must not reset the
+        `estado` a lote had when it was soft-deleted, the same RD-010 intent that already
+        protects an ordinary update.
+
+        The `WHERE` clause also requires `deleted_at IS NOT NULL`, and the affected row count is
+        checked afterwards -- see `SqlAlchemyClienteRepository.resurrect()`'s docstring for why:
+        two concurrent resurrections of the SAME dead row are a lost-update race without this
+        guard, since both `UPDATE`s would otherwise match unconditionally. A zero `rowcount` here
+        means a concurrent resurrection already won, and is raised as `LoteConflictError` instead
+        of silently re-applying (and overwriting) whatever the winner just wrote.
+        """
+        values = {
+            "codigo_lote": lote.codigo_lote,
+            "nombre": lote.nombre,
+            "cantidad_registros": lote.cantidad_registros,
+            "deleted_at": None,
+        }
+        stmt = (
+            update(LoteModel)
+            .where(LoteModel.id == lote.id, LoteModel.deleted_at.is_not(None))
+            .values(**values)
+        )
+        try:
+            async with self._session.begin_nested():
+                result = cast(CursorResult[None], await self._session.execute(stmt))
+                if result.rowcount == 0:
+                    raise LoteConflictError(
+                        f"lote {lote.id} is no longer soft-deleted -- a concurrent "
+                        "resurrection already claimed it"
+                    )
         except IntegrityError as error:
             raise LoteConflictError(
                 str(error.orig) if error.orig is not None else str(error)

@@ -8,10 +8,11 @@ import dataclasses
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from energia.contexts.consumos.application.delete_consumo import DeleteConsumo
 from energia.contexts.consumos.application.import_consumos import ImportConsumos
 from energia.contexts.consumos.application.import_lecturas import ImportLecturas
 from energia.contexts.consumos.application.import_lotes import ImportLotes
@@ -112,6 +113,7 @@ async def import_lecturas(
         created=summary.created,
         updated=summary.updated,
         unchanged=summary.unchanged,
+        restored=summary.restored,
         rejected=[
             *structural_rejections,
             *[
@@ -227,6 +229,7 @@ async def import_lotes(
         created=summary.created,
         updated=summary.updated,
         unchanged=summary.unchanged,
+        restored=summary.restored,
         rejected=[
             *structural_rejections,
             *[
@@ -359,6 +362,7 @@ async def import_consumos(
         created=summary.created,
         updated=summary.updated,
         unchanged=summary.unchanged,
+        restored=summary.restored,
         rejected=[
             *structural_rejections,
             *[
@@ -439,3 +443,29 @@ async def list_consumos(
         limit=limit,
         offset=offset,
     )
+
+
+@consumos_router.delete("/{consumo_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_consumo(
+    consumo_id: UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    """DECISION #13: soft-delete the ACTIVE consumo with this `id` -- the correction path for a
+    wrongly imported billing period. `numero_suministro`/`fecha_inicio`/`fecha_fin`/`kwh`/etc.
+    that were mistyped on import cannot be edited in place; this endpoint retracts the bad record
+    so a corrected re-import (`POST /api/v1/consumos/import`) can take its place -- and, thanks to
+    DECISION #9 (resurrection), that re-import lands back on this SAME `id` (`restored: 1`), not
+    a new one, so any FK already pointing at it (there are none for `Consumo` today, but the
+    principle matches every other entity in this codebase) would keep resolving correctly.
+
+    `204 No Content` on success. `404 Not Found` when there is no ACTIVE consumo with this `id` --
+    deliberately the same status whether `id` is simply unknown or already soft-deleted (the
+    caller cannot tell, and does not need to, which one it is): both mean "there is nothing left
+    here to delete". Commits only on the success path; the 404 path leaves the session untouched
+    (nothing to commit).
+    """
+    use_case = DeleteConsumo(SqlAlchemyConsumoRepository(session))
+    deleted = await use_case.execute(consumo_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="consumo no encontrado")
+    await session.commit()

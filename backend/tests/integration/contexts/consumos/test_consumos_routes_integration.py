@@ -8,7 +8,7 @@ paginated list endpoint (with both natural-key filters). Never touches `energia`
 tests/integration/conftest.py for the isolation strategy.
 """
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import AsyncClient
@@ -553,16 +553,18 @@ async def test_import_upserts_over_a_duplicate_key_within_the_same_payload(
     assert listing["items"][0]["kwh"] == "200.000"
 
 
-# -- soft-delete re-import: new identity ----------------------------------------------------------
+# -- DECISION #9: soft-delete re-import resurrects the original row --------------------------
 
 
-async def test_reimporting_a_soft_deleted_consumo_creates_a_new_identity(
+async def test_reimporting_a_soft_deleted_consumo_resurrects_the_original_row(
     consumos_client: AsyncClient, db_session: AsyncSession, consumo_fk_ids: tuple[str, str]
 ) -> None:
-    """Same deliberate semantics as clientes/suministros/lecturas/lotes (`contexts/README.md`),
-    now also true for `Consumo` thanks to debt #10 being paid: `uq_consumos_suministro_periodo` is
-    a partial unique index (`WHERE deleted_at IS NULL`), so re-importing a soft-deleted period
-    creates a brand-new row instead of colliding with the soft-deleted one."""
+    """DECISION #9 (confirmed by business, 2026-07-13): same resurrection semantics as
+    clientes/suministros/lecturas/lotes (`contexts/README.md`), now also true for `Consumo`
+    thanks to debt #10 being paid: `uq_consumos_suministro_periodo` is a partial unique index
+    (`WHERE deleted_at IS NULL`), which is exactly why the dead row can be found and revived
+    without colliding with anything -- re-importing a soft-deleted period revives the original
+    row (same `id`) instead of creating a brand-new identity."""
     numero_suministro, codigo_lote = consumo_fk_ids
     payload = [
         {
@@ -583,12 +585,17 @@ async def test_reimporting_a_soft_deleted_consumo_creates_a_new_identity(
     )
     await db_session.commit()
 
-    second = await consumos_client.post("/api/v1/consumos/import", json=payload)
+    reimport_payload = [{**payload[0], "kwh": 620.0}]  # 620/31 = 20.000
+    second = await consumos_client.post("/api/v1/consumos/import", json=reimport_payload)
 
-    assert second.json()["created"] == 1
+    second_body = second.json()
+    assert second_body["created"] == 0
+    assert second_body["restored"] == 1
     listing_after = (await consumos_client.get("/api/v1/consumos")).json()
-    new_id = listing_after["items"][0]["id"]
-    assert new_id != original_id
+    resurrected = listing_after["items"][0]
+    assert resurrected["id"] == original_id  # SAME identity, not a new row
+    assert resurrected["kwh"] == "620.000"
+    assert resurrected["consumo_promedio_diario"] == "20.000"
 
 
 # -- partition routing ------------------------------------------------------------------------
@@ -738,3 +745,110 @@ async def test_get_consumos_honors_limit_and_offset(
     assert body["offset"] == 1
     assert len(body["items"]) == 2
     assert body["total"] == 5
+
+
+# -- DECISION #13: DELETE /api/v1/consumos/{id} -- soft-delete correction path -----------------
+
+
+async def test_delete_consumo_returns_204_soft_deletes_and_get_excludes_it(
+    consumos_client: AsyncClient, db_session: AsyncSession, consumo_fk_ids: tuple[str, str]
+) -> None:
+    numero_suministro, codigo_lote = consumo_fk_ids
+    await consumos_client.post(
+        "/api/v1/consumos/import",
+        json=[
+            {
+                "numero_suministro": numero_suministro,
+                "codigo_lote": codigo_lote,
+                "fecha_inicio": "2024-01-01",
+                "fecha_fin": "2024-01-31",
+                "dias_facturados": 31,
+                "kwh": 100.0,
+            }
+        ],
+    )
+    listing = (await consumos_client.get("/api/v1/consumos")).json()
+    consumo_id = listing["items"][0]["id"]
+
+    response = await consumos_client.delete(f"/api/v1/consumos/{consumo_id}")
+
+    assert response.status_code == 204
+    row = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM consumos WHERE id = :id"), {"id": consumo_id}
+        )
+    ).one()
+    assert row.deleted_at is not None
+    listing_after = (await consumos_client.get("/api/v1/consumos")).json()
+    assert listing_after["total"] == 0
+
+
+async def test_delete_consumo_twice_returns_404_the_second_time(
+    consumos_client: AsyncClient, consumo_fk_ids: tuple[str, str]
+) -> None:
+    numero_suministro, codigo_lote = consumo_fk_ids
+    await consumos_client.post(
+        "/api/v1/consumos/import",
+        json=[
+            {
+                "numero_suministro": numero_suministro,
+                "codigo_lote": codigo_lote,
+                "fecha_inicio": "2024-02-01",
+                "fecha_fin": "2024-02-29",
+                "dias_facturados": 29,
+                "kwh": 50.0,
+            }
+        ],
+    )
+    listing = (await consumos_client.get("/api/v1/consumos")).json()
+    consumo_id = listing["items"][0]["id"]
+    first = await consumos_client.delete(f"/api/v1/consumos/{consumo_id}")
+    assert first.status_code == 204
+
+    second = await consumos_client.delete(f"/api/v1/consumos/{consumo_id}")
+
+    assert second.status_code == 404
+
+
+async def test_delete_consumo_with_an_unknown_id_returns_404(
+    consumos_client: AsyncClient,
+) -> None:
+    response = await consumos_client.delete(f"/api/v1/consumos/{uuid4()}")
+
+    assert response.status_code == 404
+
+
+async def test_delete_then_reimporting_the_same_period_resurrects_the_same_consumo(
+    consumos_client: AsyncClient, consumo_fk_ids: tuple[str, str]
+) -> None:
+    """DECISION #13's interplay with DECISION #9: DELETE is the correction path for a wrongly
+    imported period, and re-importing the corrected data lands back on the SAME identity
+    (`restored: 1`), not a duplicate -- closing the correction loop end-to-end."""
+    numero_suministro, codigo_lote = consumo_fk_ids
+    payload = [
+        {
+            "numero_suministro": numero_suministro,
+            "codigo_lote": codigo_lote,
+            "fecha_inicio": "2024-03-01",
+            "fecha_fin": "2024-03-31",
+            "dias_facturados": 31,
+            "kwh": 999.0,  # the "wrong" value that motivates the correction
+        }
+    ]
+    await consumos_client.post("/api/v1/consumos/import", json=payload)
+    listing = (await consumos_client.get("/api/v1/consumos")).json()
+    original_id = listing["items"][0]["id"]
+
+    delete_response = await consumos_client.delete(f"/api/v1/consumos/{original_id}")
+    assert delete_response.status_code == 204
+
+    corrected_payload = [{**payload[0], "kwh": 310.0}]
+    reimport = await consumos_client.post("/api/v1/consumos/import", json=corrected_payload)
+
+    reimport_body = reimport.json()
+    assert reimport_body["created"] == 0
+    assert reimport_body["restored"] == 1
+    listing_after = (await consumos_client.get("/api/v1/consumos")).json()
+    resurrected = listing_after["items"][0]
+    assert resurrected["id"] == original_id
+    assert resurrected["kwh"] == "310.000"

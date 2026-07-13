@@ -68,6 +68,16 @@ class SuministroRepository(Protocol):
         """Return the (non-soft-deleted) suministro with this natural key, or None."""
         ...  # pragma: no cover — Protocol stub, never executed directly
 
+    async def get_most_recently_deleted_by_numero_suministro(
+        self, numero_suministro: str
+    ) -> Suministro | None:
+        """Return the most recently soft-deleted suministro with this natural key (the greatest
+        `deleted_at` among dead rows), or None if none is soft-deleted at all. Mirrors
+        `contexts.clientes.domain.ports.ClienteRepository.get_most_recently_deleted_by_
+        numero_cliente` exactly -- see that method's docstring for DECISION #9's full rationale.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
     async def save(self, suministro: Suministro) -> None:
         """Insert or update `suministro`, keyed by its natural key (`numero_suministro`, scoped
         to non-soft-deleted rows — see `ImportSuministros` for how the create-vs-update decision
@@ -77,6 +87,16 @@ class SuministroRepository(Protocol):
         Raises `SuministroConflictError` if the write violates a database integrity constraint;
         the underlying write is rolled back to a savepoint first, so the rest of the caller's
         transaction is unaffected.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def resurrect(self, suministro: Suministro) -> None:
+        """Revive a soft-deleted row identified by `suministro.id`: clear `deleted_at` and write
+        every mutable field from `suministro`, already merged onto that same identity by the
+        caller (`ImportSuministros`). Mirrors `ClienteRepository.resurrect()` exactly -- see that
+        method's docstring for why this cannot reuse `save()`'s `ON CONFLICT` upsert.
+
+        Does not commit; raises `SuministroConflictError` on a database integrity conflict.
         """
         ...  # pragma: no cover — Protocol stub, never executed directly
 

@@ -1,6 +1,8 @@
 """SqlAlchemyClienteRepository: the `ClienteRepository` port implementation (async)."""
 
-from sqlalchemy import func, select
+from typing import cast
+
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +27,25 @@ class SqlAlchemyClienteRepository:
         stmt = select(ClienteModel).where(
             ClienteModel.numero_cliente == numero_cliente,
             ClienteModel.deleted_at.is_(None),
+        )
+        model = (await self._session.execute(stmt)).scalar_one_or_none()
+        return _to_domain(model) if model is not None else None
+
+    async def get_most_recently_deleted_by_numero_cliente(
+        self, numero_cliente: str
+    ) -> Cliente | None:
+        stmt = (
+            select(ClienteModel)
+            .where(
+                ClienteModel.numero_cliente == numero_cliente,
+                ClienteModel.deleted_at.is_not(None),
+            )
+            # `id DESC` is a secondary sort key purely to make the pick deterministic when two
+            # dead rows share the exact same `deleted_at` -- `id` carries no business meaning
+            # here (arbitrary-but-stable), it just guarantees a repeatable choice instead of
+            # leaving ties to Postgres's unspecified scan order.
+            .order_by(ClienteModel.deleted_at.desc(), ClienteModel.id.desc())
+            .limit(1)
         )
         model = (await self._session.execute(stmt)).scalar_one_or_none()
         return _to_domain(model) if model is not None else None
@@ -80,6 +101,58 @@ class SqlAlchemyClienteRepository:
         try:
             async with self._session.begin_nested():
                 await self._session.execute(upsert_stmt)
+        except IntegrityError as error:
+            raise ClienteConflictError(
+                str(error.orig) if error.orig is not None else str(error)
+            ) from error
+
+    async def resurrect(self, cliente: Cliente) -> None:
+        """Revive a soft-deleted row by `cliente.id`, clearing `deleted_at` and writing every
+        mutable field from `cliente` -- see `ClienteRepository.resurrect()`'s docstring
+        (domain/ports.py) for why this cannot reuse `save()`'s `ON CONFLICT` upsert: a dead row
+        (`deleted_at IS NOT NULL`) is excluded from `uq_clientes_numero_cliente`'s partial index,
+        so an `INSERT ... ON CONFLICT (numero_cliente) WHERE deleted_at IS NULL` cannot target it
+        -- inserting the same `id` again would instead collide with the primary key, a different,
+        unhandled constraint. A plain `UPDATE ... WHERE id = :id` sidesteps that entirely.
+
+        Same atomicity guarantees as `save()`: does not commit, wrapped in its own `SAVEPOINT`. If
+        a concurrent transaction claims this `numero_cliente` for an active row before this one
+        commits, `uq_clientes_numero_cliente` still catches it (this row's `deleted_at` is being
+        set to `NULL` by this very statement) -- surfaces as `ClienteConflictError`, degrading to
+        a per-record rejection instead of corrupting the partial unique index's guarantee.
+
+        The `WHERE` clause also requires `deleted_at IS NOT NULL` (in addition to matching `id`),
+        and the affected row count is checked afterwards: two concurrent resurrections of the
+        SAME dead row are otherwise a lost-update race -- with no such guard, both `UPDATE`s
+        match unconditionally, both "succeed", and whichever commits last silently wins with no
+        error raised at all. Requiring the row to still be dead means the loser's `UPDATE`
+        matches zero rows (the winner already cleared `deleted_at` first), which is detected via
+        `result.rowcount == 0` and raised as `ClienteConflictError` -- the same per-record
+        rejection outcome as the natural-key race above, not a silent overwrite.
+        """
+        values = {
+            "numero_cliente": cliente.numero_cliente,
+            "nombre": cliente.nombre,
+            "estado": cliente.estado.value,
+            "documento": cliente.documento,
+            "localidad": cliente.localidad,
+            "barrio": cliente.barrio,
+            "direccion": cliente.direccion,
+            "deleted_at": None,
+        }
+        stmt = (
+            update(ClienteModel)
+            .where(ClienteModel.id == cliente.id, ClienteModel.deleted_at.is_not(None))
+            .values(**values)
+        )
+        try:
+            async with self._session.begin_nested():
+                result = cast(CursorResult[None], await self._session.execute(stmt))
+                if result.rowcount == 0:
+                    raise ClienteConflictError(
+                        f"cliente {cliente.id} is no longer soft-deleted -- a concurrent "
+                        "resurrection already claimed it"
+                    )
         except IntegrityError as error:
             raise ClienteConflictError(
                 str(error.orig) if error.orig is not None else str(error)

@@ -201,6 +201,169 @@ async def test_count_active_counts_only_non_deleted_suministros(
     assert await repository.count_active() == 1
 
 
+# --- DECISION #9: resurrection ---------------------------------------------------------------
+
+
+async def test_get_most_recently_deleted_by_numero_suministro_picks_the_latest_deleted_at(
+    db_session: AsyncSession, cliente_id: UUID, categoria_tarifaria_id: UUID
+) -> None:
+    repository = SqlAlchemySuministroRepository(db_session)
+    older = Suministro.create(
+        numero_suministro="S700",
+        cliente_id=cliente_id,
+        categoria_tarifaria_id=categoria_tarifaria_id,
+        fecha_alta="2024-01-01",
+    )
+    await repository.save(older)
+    await db_session.execute(
+        text("UPDATE suministros SET deleted_at = now() - interval '2 hours' WHERE id = :id"),
+        {"id": older.id},
+    )
+    newer = Suministro.create(
+        numero_suministro="S700",
+        cliente_id=cliente_id,
+        categoria_tarifaria_id=categoria_tarifaria_id,
+        fecha_alta="2024-01-01",
+    )
+    await repository.save(newer)
+    await db_session.execute(
+        text("UPDATE suministros SET deleted_at = now() - interval '1 hour' WHERE id = :id"),
+        {"id": newer.id},
+    )
+    await db_session.commit()
+
+    dead = await repository.get_most_recently_deleted_by_numero_suministro("S700")
+
+    assert dead is not None
+    assert dead.id == newer.id
+
+
+async def test_resurrect_clears_deleted_at_and_writes_every_mutable_field(
+    db_session: AsyncSession, cliente_id: UUID, categoria_tarifaria_id: UUID
+) -> None:
+    repository = SqlAlchemySuministroRepository(db_session)
+    original = Suministro.create(
+        numero_suministro="S701",
+        cliente_id=cliente_id,
+        categoria_tarifaria_id=categoria_tarifaria_id,
+        fecha_alta="2024-01-01",
+    )
+    await repository.save(original)
+    await db_session.execute(
+        text("UPDATE suministros SET deleted_at = now() WHERE id = :id"), {"id": original.id}
+    )
+    await db_session.commit()
+
+    resurrected = Suministro.create(
+        id=original.id,
+        numero_suministro="S701",
+        cliente_id=cliente_id,
+        categoria_tarifaria_id=categoria_tarifaria_id,
+        fecha_alta="2024-01-01",
+        localidad="Formosa",
+    )
+    await repository.resurrect(resurrected)
+
+    found = await repository.get_by_numero_suministro("S701")
+    assert found is not None
+    assert found.id == original.id
+    assert found.localidad == "Formosa"
+    row = (
+        await db_session.execute(
+            text("SELECT deleted_at FROM suministros WHERE id = :id"), {"id": original.id}
+        )
+    ).one()
+    assert row.deleted_at is None
+
+
+async def test_resurrect_raises_suministro_conflict_error_on_a_natural_key_race(
+    db_session: AsyncSession, cliente_id: UUID, categoria_tarifaria_id: UUID
+) -> None:
+    """A dead row's own `numero_suministro` can be claimed by a concurrent active insert before
+    its resurrection commits; the update that clears `deleted_at` back to a duplicate active
+    `numero_suministro` violates `uq_suministros_numero_suministro` -- surfaced as
+    `SuministroConflictError`, not an unhandled IntegrityError. Mirrors
+    `test_resurrect_raises_cliente_conflict_error_on_a_natural_key_race` exactly."""
+    repository = SqlAlchemySuministroRepository(db_session)
+    dead = Suministro.create(
+        numero_suministro="S702",
+        cliente_id=cliente_id,
+        categoria_tarifaria_id=categoria_tarifaria_id,
+        fecha_alta="2024-01-01",
+    )
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE suministros SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    await repository.save(
+        Suministro.create(
+            numero_suministro="S702",
+            cliente_id=cliente_id,
+            categoria_tarifaria_id=categoria_tarifaria_id,
+            fecha_alta="2024-01-01",
+        )
+    )
+
+    with pytest.raises(SuministroConflictError):
+        await repository.resurrect(
+            Suministro.create(
+                id=dead.id,
+                numero_suministro="S702",
+                cliente_id=cliente_id,
+                categoria_tarifaria_id=categoria_tarifaria_id,
+                fecha_alta="2024-01-01",
+            )
+        )
+
+
+async def test_resurrect_raises_suministro_conflict_error_when_the_row_is_no_longer_dead(
+    db_session: AsyncSession, cliente_id: UUID, categoria_tarifaria_id: UUID
+) -> None:
+    """FIX 1 (lost-update race): two concurrent resurrections of the SAME dead row used to both
+    "succeed" with no guard on `deleted_at` in `resurrect()`'s `WHERE` clause -- whichever commit
+    landed last silently won, with no error raised at all. Simulated here by clearing
+    `deleted_at` directly via SQL (standing in for "a concurrent session already resurrected this
+    row first") before calling `resurrect()`: the `deleted_at IS NOT NULL` guard then matches
+    zero rows, and the zero-`rowcount` check raises `SuministroConflictError` instead of silently
+    re-applying (and overwriting) whatever the winner wrote. Mirrors
+    `test_resurrect_raises_cliente_conflict_error_when_the_row_is_no_longer_dead` exactly."""
+    repository = SqlAlchemySuministroRepository(db_session)
+    dead = Suministro.create(
+        numero_suministro="S703",
+        cliente_id=cliente_id,
+        categoria_tarifaria_id=categoria_tarifaria_id,
+        fecha_alta="2024-01-01",
+    )
+    await repository.save(dead)
+    await db_session.execute(
+        text("UPDATE suministros SET deleted_at = now() WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+    # Simulates the concurrent winner: by the time this resurrect() call runs, the row is no
+    # longer dead.
+    await db_session.execute(
+        text("UPDATE suministros SET deleted_at = NULL WHERE id = :id"), {"id": dead.id}
+    )
+    await db_session.commit()
+
+    with pytest.raises(SuministroConflictError):
+        await repository.resurrect(
+            Suministro.create(
+                id=dead.id,
+                numero_suministro="S703",
+                cliente_id=cliente_id,
+                categoria_tarifaria_id=categoria_tarifaria_id,
+                fecha_alta="2024-01-01",
+                localidad="Late Resurrection Attempt",
+            )
+        )
+
+    found = await repository.get_by_numero_suministro("S703")
+    assert found is not None
+    assert found.localidad is None
+
+
 async def test_save_does_not_commit_the_transaction(
     test_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
