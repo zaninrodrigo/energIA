@@ -7,10 +7,27 @@ import_lecturas.py) be unit-tested with plain in-memory fakes, and what lets a b
 plug in later without touching this layer at all. Mirrors `contexts/suministros/domain/ports.py`
 exactly.
 
-`Lote`'s ports (bottom of this file) follow the same shape as `Lectura`'s, minus a source/
+`Lote`'s ports (middle of this file) follow the same shape as `Lectura`'s, minus a source/
 directory port for any foreign key: `lotes` references no other table, so `ImportLotes` (US-005)
 needs only a `LoteSource` and a `LoteRepository`, no cross-context (or same-context) resolution
 step at all.
+
+`Consumo`'s ports (bottom of this file, US-004) need *two* resolution steps `ImportConsumos` must
+run before `Consumo.create()` can even be attempted: `numero_suministro` -> `suministro_id` (the
+existing `SuministroDirectory` above, a cross-context lookup, reused unchanged) and `codigo_lote`
+-> `lote_id` (the new `LoteDirectory` below). `LoteDirectory` is a *same-context* lookup --
+`Lote` lives in this same `consumos` package -- so, per `contexts/README.md`'s "cross-context
+directory-port pattern" ("when a directory port is *not* needed"), it is implemented with an
+ordinary ORM query (`SqlAlchemyLoteDirectory`, infrastructure/lote_directory.py) against
+`LoteModel` (already mapped in infrastructure/models.py), the same way `CategoriaTarifariaDirectory`
+is for `suministros`/`CategoriaTarifaria` -- not a `sqlalchemy.text(...)` raw query like
+`SuministroDirectory`. It is still its own small port (not folded into `LoteRepository`) purely so
+`ImportConsumos` stays unit-testable against a plain fake, exactly `contexts/README.md`'s stated
+reason for `CategoriaTarifariaDirectory`'s own separation from `SuministroRepository`.
+
+A third resolution, `fecha_lectura` -> `lectura_id`, needs no new port at all: it is resolved via
+the existing `LecturaRepository.get_by_suministro_and_fecha` (also same-context), reused directly
+by `ImportConsumos` the same way `ImportLecturas` itself uses it.
 """
 
 from collections.abc import Iterable
@@ -19,34 +36,34 @@ from datetime import date
 from typing import Protocol
 from uuid import UUID
 
+from energia.contexts.consumos.domain.consumo import Consumo
 from energia.contexts.consumos.domain.lectura import Lectura
 from energia.contexts.consumos.domain.lote import EstadoLote, Lote
 
+# Re-exported for backward compatibility: every existing call site
+# (`application/import_lotes.py`, `presentation/routes.py`) imports these two names from
+# `domain.ports`, not from `domain.sentinels` directly -- see `sentinels.py`'s module docstring
+# for why the sentinel itself now lives there instead of here.
+from energia.contexts.consumos.domain.sentinels import UNSET, UnsetType
 
-class UnsetType:
-    """Sentinel type for a `LoteSourceRecord` field genuinely *absent* from the source payload --
-    see that dataclass's docstring for why this must be distinguishable from an explicit `None`.
-    A dedicated, public type (not a bare `object()`, and not name-mangled private) so it is
-    nameable both in type hints and in `isinstance()` checks: callers narrow with
-    `isinstance(value, UnsetType)` rather than `value is UNSET` -- mypy narrows a `Union` type on
-    `isinstance()` but not on an identity (`is`) check against an arbitrary object instance, only
-    against `None`/literals/enum members. Still only ever one instance in practice (the singleton
-    `UNSET` below); `isinstance()` is used here purely for mypy's benefit, not because more than
-    one instance could ever meaningfully exist.
-    """
-
-    def __repr__(self) -> str:
-        return "UNSET"
-
-    def __deepcopy__(self, memo: dict[int, object]) -> "UnsetType":
-        # `dataclasses.asdict()` (used by `presentation/routes.py` to echo a rejected record back
-        # in the HTTP response body) deep-copies every field value by default; without this, the
-        # singleton identity `value is UNSET` checks (still used where only a boolean "was this
-        # provided" comparison is needed, not narrowing) would not survive that copy.
-        return self
-
-
-UNSET = UnsetType()
+__all__ = [
+    "UNSET",
+    "UnsetType",
+    "LecturaSourceRecord",
+    "LecturaSource",
+    "LecturaConflictError",
+    "LecturaRepository",
+    "SuministroDirectory",
+    "LoteSourceRecord",
+    "LoteSource",
+    "LoteConflictError",
+    "LoteRepository",
+    "LoteDirectory",
+    "ConsumoSourceRecord",
+    "ConsumoSource",
+    "ConsumoConflictError",
+    "ConsumoRepository",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,4 +237,118 @@ class LoteRepository(Protocol):
     async def count_active(self, *, estado: EstadoLote | None = None) -> int:
         """Count non-soft-deleted lotes (for pagination metadata), optionally filtered to a
         single `estado`."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+class LoteDirectory(Protocol):
+    """Same-context lookup port (see this module's docstring, and `contexts/README.md`'s "when a
+    directory port is *not* needed"): resolves a `codigo_lote` natural key to that lote's `id`,
+    via an ordinary ORM query -- `Lote` and `Consumo` both belong to `consumos`, so there is no
+    cross-context boundary to route around here, unlike `SuministroDirectory`.
+    """
+
+    async def resolve(self, codigo_lote: str) -> UUID | None:
+        """Return the `id` of the (non-soft-deleted) lote with this natural key, or None. "Active"
+        means non-soft-deleted only (`deleted_at IS NULL`), the same meaning `SuministroDirectory`
+        uses -- not filtered by `Lote.estado` (`Pendiente`/`Procesando`/`Procesado`/`Error`): a
+        `Consumo` may reference a lote in any processing state, the same way the `fk_consumos_lote`
+        foreign key itself places no restriction on `estado`.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumoSourceRecord:
+    """One raw, not-yet-validated consumo record as it arrives from a `ConsumoSource`.
+
+    `numero_suministro`/`codigo_lote` are natural keys, not UUIDs: resolving them to
+    `suministro_id`/`lote_id` is `ImportConsumos`' job, via `SuministroDirectory`/`LoteDirectory`
+    below. Turning the rest of the record into a valid `Consumo` (or rejecting it) is
+    `Consumo.create()`'s job, called once per record inside `ImportConsumos` -- exactly
+    `LecturaSourceRecord`'s shape, extended with a second natural-key reference.
+
+    `consumo_promedio_diario`/`fecha_lectura` are three-state fields (FIX 1's pattern,
+    `LoteSourceRecord` above), not two: each can be `UNSET` (genuinely absent from the payload),
+    `None` (explicitly sent as `null`), or an actual value -- `Consumo.create()` and
+    `ImportConsumos` treat those three states differently, both on create and on update. See
+    `domain/consumo.py`'s
+    module docstring for `consumo_promedio_diario`'s full rationale (it is the first field in this
+    codebase where `create()` itself, not just the update-merge step, needs the distinction: an
+    omitted value is *computed* -- DOMAIN_MODEL.md §7.6's `calcularPromedioDiario()` -- while an
+    explicit `null` is *stored as null*, skipping computation). `fecha_lectura` mirrors the same
+    three states for consistency, resolved by `ImportConsumos` via `LecturaRepository` instead of
+    validated inside `Consumo.create()`: `UNSET` leaves `lectura_id` alone on an update (or unset on
+    a create), an explicit `null` clears it, and a given date is resolved to a `lectura_id` or the
+    whole record is rejected ("lectura inexistente") if it does not resolve.
+    """
+
+    numero_suministro: str | None
+    codigo_lote: str | None
+    fecha_inicio: str | None
+    fecha_fin: str | None
+    dias_facturados: int | str | None = None
+    kwh: float | int | str | None = None
+    consumo_promedio_diario: float | int | str | None | UnsetType = UNSET
+    fecha_lectura: str | None | UnsetType = UNSET
+
+
+class ConsumoSource(Protocol):
+    """Port for `ImportConsumos`'s input: "where do the consumo records to import come from".
+    Mirrors `LecturaSource`/`LoteSource` exactly -- see `LecturaSource`'s docstring for the
+    adapters this enables now (`JsonConsumoSource`, the HTTP payload) and later (a file adapter,
+    the eventual Oracle ETL adapter per ADR-004).
+    """
+
+    def fetch(self) -> Iterable[ConsumoSourceRecord]:
+        """Yield every consumo record to import, in no particular required order."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+class ConsumoConflictError(Exception):
+    """Raised by `ConsumoRepository.save()` when persisting `consumo` violates a database-level
+    integrity constraint despite already passing every `Consumo.create()` invariant. Mirrors
+    `LecturaConflictError`/`LoteConflictError` exactly -- see `LecturaConflictError`'s docstring.
+    """
+
+
+class ConsumoRepository(Protocol):
+    """Port for Consumo persistence — the application layer's only view of storage."""
+
+    async def get_by_suministro_and_periodo(
+        self, suministro_id: UUID, fecha_inicio: date, fecha_fin: date
+    ) -> Consumo | None:
+        """Return the (non-soft-deleted) consumo for this `(suministro_id, fecha_inicio,
+        fecha_fin)` composite natural key, or None."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def save(self, consumo: Consumo) -> None:
+        """Insert or update `consumo`, keyed by its composite natural key `(suministro_id,
+        fecha_inicio, fecha_fin)`, scoped to non-soft-deleted rows — see `ImportConsumos` for how
+        the create-vs-update decision is made. Does not commit: the caller (route boundary)
+        controls the transaction.
+
+        Raises `ConsumoConflictError` if the write violates a database integrity constraint; the
+        underlying write is rolled back to a savepoint first, so the rest of the caller's
+        transaction is unaffected.
+        """
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def list_active(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        suministro_id: UUID | None = None,
+        lote_id: UUID | None = None,
+    ) -> list[Consumo]:
+        """Return non-soft-deleted consumos ordered by `(fecha_inicio desc, id)` — most recent
+        period first, see `presentation/routes.py`'s `list_consumos` for why — page
+        (limit/offset), optionally filtered to a single `suministro_id` and/or `lote_id`."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def count_active(
+        self, *, suministro_id: UUID | None = None, lote_id: UUID | None = None
+    ) -> int:
+        """Count non-soft-deleted consumos (for pagination metadata), optionally filtered to a
+        single `suministro_id` and/or `lote_id`."""
         ...  # pragma: no cover — Protocol stub, never executed directly

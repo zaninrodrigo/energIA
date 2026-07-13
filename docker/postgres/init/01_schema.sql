@@ -364,13 +364,7 @@ CREATE TABLE consumos (
     -- Análogo a RD-014 (Lectura), aplicado al período de Consumo.
     CONSTRAINT ck_consumos_dias_facturados_positivo CHECK (dias_facturados > 0),
     -- Integridad temporal del período; no tiene un RD-xxx propio asociado.
-    CONSTRAINT ck_consumos_periodo_valido CHECK (fecha_fin >= fecha_inicio),
-    -- Clave natural para cargas históricas idempotentes (RD-017: períodos no
-    -- deberían superponerse). Nota: esta UNIQUE evita duplicar EXACTAMENTE el
-    -- mismo período, pero no impide solapamientos parciales entre períodos
-    -- distintos -- eso requeriría un EXCLUDE constraint con btree_gist, que no
-    -- se agrega hoy para no introducir una extensión no pedida por la misión.
-    CONSTRAINT uq_consumos_suministro_periodo UNIQUE (suministro_id, fecha_inicio, fecha_fin)
+    CONSTRAINT ck_consumos_periodo_valido CHECK (fecha_fin >= fecha_inicio)
 ) PARTITION BY RANGE (fecha_inicio);
 
 CREATE TABLE consumos_2022 PARTITION OF consumos
@@ -386,6 +380,25 @@ CREATE TABLE consumos_2026 PARTITION OF consumos
 -- Partición de resguardo: cualquier fecha_inicio fuera de 2022-2026 (datos más
 -- viejos que 2022, o de años futuros) cae acá en vez de rechazar el INSERT.
 CREATE TABLE consumos_default PARTITION OF consumos DEFAULT;
+
+-- Clave natural para cargas históricas idempotentes (RD-017: períodos no
+-- deberían superponerse). Índice único PARCIAL (WHERE deleted_at IS NULL), no
+-- una CONSTRAINT ... UNIQUE simple -- deuda #10 (PROJECT_MASTER_SPEC.md), pagada
+-- antes de US-004: sin la cláusula parcial, reimportar el mismo
+-- (suministro_id, fecha_inicio, fecha_fin) tras un soft-delete chocaba contra
+-- la fila soft-deleted en lugar de crear una nueva, rompiendo la idempotencia
+-- de importación que sí tienen clientes/suministros/lecturas
+-- (uq_clientes_numero_cliente, uq_suministros_numero_suministro,
+-- uq_lecturas_suministro_fecha son los tres precedentes, todos parciales).
+-- `fecha_inicio` (la columna de particionado) va incluida en el índice porque
+-- PostgreSQL lo exige para todo índice único de una tabla particionada.
+-- Nota: este índice evita duplicar EXACTAMENTE el mismo período, pero no
+-- impide solapamientos parciales entre períodos distintos para el mismo
+-- suministro -- eso requeriría un EXCLUDE constraint con btree_gist, que no se
+-- agrega hoy para no introducir una extensión no pedida por la misión (ver
+-- DATABASE_DESIGN.md §6.4).
+CREATE UNIQUE INDEX uq_consumos_suministro_periodo
+    ON consumos (suministro_id, fecha_inicio, fecha_fin) WHERE deleted_at IS NULL;
 
 -- Los triggers de fila definidos sobre la tabla particionada se clonan
 -- automáticamente a cada partición (comportamiento estándar de PostgreSQL

@@ -12,7 +12,7 @@ later remains possible without a redesign (ADR-006).
 |---|---|---|
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
-| `consumos` | Gestión de Consumos | **Implemented** (US-003 `Lectura`, US-005 `Lote de Facturación`) |
+| `consumos` | Gestión de Consumos | **Implemented, all 3 entities** (US-003 `Lectura`, US-005 `Lote de Facturación`, US-004 `Consumo` — Épica 1 complete) |
 | `intelligence_engine` | Motor de Inteligencia Energética | Not started |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
@@ -98,6 +98,16 @@ categoria_tarifaria_directory.py`) against a `CategoriaTarifariaModel` mapped in
 own `infrastructure/models.py`, the same way `SuministroRepository` queries `suministros`. It is
 still its own small port (not folded into `SuministroRepository`) purely so `ImportSuministros`
 stays unit-testable against a plain fake — not because of any cross-context concern.
+
+`ImportConsumos` (US-004) follows the exact same same-context rule for `codigo_lote` ->
+`lote_id`: `Lote` and `Consumo` both belong to `consumos`, so `LoteDirectory`
+(`consumos/domain/ports.py`) / `SqlAlchemyLoteDirectory`
+(`consumos/infrastructure/lote_directory.py`) is an ordinary ORM query against `LoteModel`
+(already mapped in this context's own `infrastructure/models.py`), not a raw-SQL cross-context
+lookup like `SuministroDirectory`. `ImportConsumos` needs *both* kinds of resolution at once:
+`numero_suministro` -> `suministro_id` via the cross-context `SuministroDirectory`, and
+`codigo_lote` -> `lote_id` via the same-context `LoteDirectory` — the first entity in this
+codebase that resolves one natural key of each kind before a single `create()` call.
 
 Future contexts needing another context's data (e.g. `inspections` resolving a `resultado_ia_id`)
 should follow the same rule: if the referenced entity belongs to a *different* bounded context,
@@ -185,6 +195,19 @@ duplicated it on every re-run instead of upserting. Tested by
 here. Tested by `test_reimporting_a_soft_deleted_codigo_lote_creates_a_new_identity`
 (`tests/integration/contexts/consumos/test_lotes_routes_integration.py`).
 
+`Consumo` (US-004) follows the same semantics too, keyed by the *composite* natural key
+`(suministro_id, fecha_inicio, fecha_fin)` — but, unlike `lecturas`, `uq_consumos_suministro_periodo`
+was **not** already a partial unique index before this slice: it was a plain `CONSTRAINT ...
+UNIQUE`, the one natural-key index in the whole schema that broke this convention (debt #10,
+`PROJECT_MASTER_SPEC.md`). It was converted to a partial unique index (`WHERE deleted_at IS
+NULL`) as a prerequisite of this slice, on the partitioned `consumos` table — PostgreSQL requires
+every unique index of a partitioned table to include the partitioning column (`fecha_inicio`,
+already part of this natural key), so no additional column had to be added to satisfy that rule.
+Tested by `test_reimporting_a_soft_deleted_consumo_creates_a_new_identity`
+(`tests/integration/contexts/consumos/test_consumos_routes_integration.py`) and, at the
+repository level, `test_save_upserts_by_suministro_and_periodo_even_with_a_different_fresh_id`
+(`tests/integration/contexts/consumos/test_consumo_repository_integration.py`).
+
 **Known FK race with a soft-deleted `cliente`**: `fk_suministros_cliente`
 (`docker/postgres/init/01_schema.sql`) is an ordinary foreign key against `clientes.id` — it does
 not, and cannot, check `deleted_at`. If a `cliente` were soft-deleted *between* `ClienteDirectory`
@@ -204,13 +227,14 @@ The identical race exists between `SuministroDirectory` and `ImportLecturas`' wr
 `DOMAIN_MODEL.md` §4.3 ("Gestión de Consumos") lists three entities: Lectura, Consumo, and Lote
 de Facturación. US-003 implemented `Lectura`; US-005 added `Lote de Facturación` to the same
 package (not a new one) — deliberately *before* `Consumo`, even though `Consumo` is listed first
-in some places: `consumos.lote_id` is `NOT NULL`, so the FK dependency dictates the implementation
-order regardless of documentation order. `Consumo` still has no domain entity, table-facing
-repository, or endpoint, and will be added to this same `consumos` package once its own user
-story lands, following the same four Clean Architecture layers already established here. This
-mirrors how `categoria_tarifaria` was folded into the `suministros` package instead of getting its
-own (`contexts/README.md`, "Internal shape of a context"): the package boundary is the *bounded
-context* §4 defines, not a 1:1 mapping to entities or user stories.
+in some places: `consumos.lote_id` is `NOT NULL`, so the FK dependency dictated the
+implementation order regardless of documentation order. US-004 then added `Consumo` itself to
+this same package, following the same four Clean Architecture layers already established here —
+with `Lote`/`Lectura` already in place, both FK dependencies (`lote_id NOT NULL`, `lectura_id`
+nullable) were resolvable, and Épica 1 (the three US-001/002/003/005/004 user stories) is now
+complete. This mirrors how `categoria_tarifaria` was folded into the `suministros` package
+instead of getting its own (`contexts/README.md`, "Internal shape of a context"): the package
+boundary is the *bounded context* §4 defines, not a 1:1 mapping to entities or user stories.
 
 ## `Lote`: no cross-context (or same-context) foreign key to resolve
 
@@ -284,6 +308,50 @@ own `DEFAULT 0`, so an *explicit* `null` (as opposed to omission) is rejected ou
 per-record violation, on both create and update, instead of being silently treated the same as an
 omission. See `docs/03-architecture/API_SPEC.md` ("Campos omitidos vs. `null` explícito") for the
 full table of the three states (`UNSET`/`null`/value) and their effect.
+
+## `Consumo`: `UNSET` reaches into `create()` itself, not just the update-merge step
+
+`Consumo.create()` (`domain/consumo.py`, US-004) is the first `create()` in this codebase whose
+own parameter list needs the three-state `UNSET`/`None`/value distinction, for
+`consumo_promedio_diario` — every earlier entity's `create()` (`Lote`, `Lectura`, `Suministro`,
+`Cliente`) only ever sees a two-state `None`-or-value; `ImportLotes` collapses `LoteSourceRecord`'s
+`UNSET` fields to `None` *before* calling `Lote.create()` (see the section above), and does the
+`UNSET`-vs-value comparison entirely in its own update-merge step, comparing the raw source record
+against the already-built candidate.
+
+That collapsing pattern does not work for `consumo_promedio_diario`, because DOMAIN_MODEL.md
+§7.6 lists `calcularPromedioDiario()` as a domain method: when the field is genuinely omitted,
+`Consumo.create()` must *compute* the derived average (`kwh / dias_facturados`, quantized to
+`numeric(12,3)`) — not just apply some static default the way `Lote.cantidad_registros` defaults
+to `0`. An explicit `null`, by contrast, must *skip* computation and store `null` outright. Both
+of those are meaningfully different outcomes that only `create()` itself can produce (it is the
+one place that already has `kwh` and `dias_facturados` validated and in hand), so `UNSET` had to
+become a real parameter default `Consumo.create()` understands, imported from the new
+`domain/sentinels.py` module (see that module's docstring for why the sentinel moved out of
+`domain/ports.py` — `Consumo` importing it from there would have been a circular import, since
+`domain/ports.py` itself imports `Consumo` for `ConsumoRepository`'s signatures).
+
+`ImportConsumos`'s own update-merge step does NOT need a second `UNSET` check for
+`consumo_promedio_diario` (FIX 1 — an earlier version of this code mistakenly added one anyway,
+comparing the raw `ConsumoSourceRecord.consumo_promedio_diario` against `UNSET` to preserve
+`existing`'s already-stored value on omission, the same treatment `ImportLotes` gives its own
+opaque fields). That was wrong for a *derived* field: `candidate.consumo_promedio_diario` is
+already correct in every one of the three states by the time `Consumo.create()` returns it —
+recomputed from *this* record's own `kwh`/`dias_facturados` when omitted, `None` when explicit
+`null`, the given value when explicit — so the merge step takes it from `candidate` as-is, never
+`existing`'s. Preserving `existing`'s value on omission (as `ImportLotes` correctly does for
+`nombre`/`cantidad_registros`, which have no derived inputs of their own to recompute from) left
+a stale average on the row whenever `kwh`/`dias_facturados` changed without repeating
+`consumo_promedio_diario` too — reproduced case: `kwh` 100 -> 295, `dias_facturados` 31, omitted
+`consumo_promedio_diario` froze at 3.226 instead of recomputing to 9.516. See
+`application/import_consumos.py`'s module docstring and `domain/consumo.py`'s for the full
+contrast. `fecha_lectura`/`lectura_id` follows the same three-state contract for consistency, but
+does not need `create()`'s own awareness of `UNSET`, and DOES need the update-merge's
+preserve-on-omission treatment (like `Lote`'s opaque fields, unlike `consumo_promedio_diario`):
+`ImportConsumos` resolves `fecha_lectura` to a `lectura_id` (or `None`) entirely in the
+application layer before ever calling `create()`, the same way `SuministroDirectory`/
+`LoteDirectory` resolutions already do, and there is no "recompute from inputs" fallback for a
+foreign-key reference the way there is for a numeric average.
 
 ## No empty ceremony
 

@@ -1,4 +1,5 @@
-"""SQLAlchemy ORM mapping for `lecturas` and `lotes` (docker/postgres/init/01_schema.sql).
+"""SQLAlchemy ORM mapping for `lecturas`, `lotes` and `consumos`
+(docker/postgres/init/01_schema.sql).
 
 This is the only place in the `consumos` context allowed to import SQLAlchemy (ADR-001): the
 domain and application layers never see these models, only `Lectura`/`Lote` (domain/lectura.py,
@@ -60,6 +61,30 @@ class LoteModel(Base):
     # is the domain-side closed set; this model stores/reads its `.value` -- see
     # `lote_repository.py`'s `_to_domain`/`save()`.
     estado: Mapped[str] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column()
+    updated_at: Mapped[datetime | None] = mapped_column(default=None)
+    deleted_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), default=None)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), default=None)
+
+
+class ConsumoModel(Base):
+    __tablename__ = "consumos"
+
+    # Composite PK `(id, fecha_inicio)`, not a plain `(id)`: `consumos` is partitioned by RANGE on
+    # `fecha_inicio`, and PostgreSQL requires every unique index of a partitioned table to include
+    # the partitioning column -- see DATABASE_DESIGN.md §6.2 for the full trade-off writeup.
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    suministro_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    lote_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True))
+    lectura_id: Mapped[uuid.UUID | None] = mapped_column(PG_UUID(as_uuid=True), default=None)
+    fecha_inicio: Mapped[date] = mapped_column(primary_key=True)
+    fecha_fin: Mapped[date] = mapped_column()
+    dias_facturados: Mapped[int] = mapped_column()
+    # Explicit `Numeric(12, 3)`, matching `consumos.kwh`/`consumo_promedio_diario numeric(12,3)`
+    # exactly -- same rationale as `LecturaModel.lectura_anterior`/`lectura_actual` above.
+    kwh: Mapped[Decimal] = mapped_column(Numeric(12, 3))
+    consumo_promedio_diario: Mapped[Decimal | None] = mapped_column(Numeric(12, 3), default=None)
     created_at: Mapped[datetime] = mapped_column()
     updated_at: Mapped[datetime | None] = mapped_column(default=None)
     deleted_at: Mapped[datetime | None] = mapped_column(default=None)

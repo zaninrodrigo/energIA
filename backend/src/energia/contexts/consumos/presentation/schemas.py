@@ -129,3 +129,62 @@ class LotesPageSchema(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class ConsumoImportItem(BaseModel):
+    """One entry of the `POST /api/v1/consumos/import` JSON array request body.
+
+    Fields are optional at the schema level, mirroring `LecturaImportItem`/`LoteImportItem`: a
+    missing/invalid value is a *domain* rejection (reported per-record in
+    `ImportSummarySchema.rejected`, HTTP 200), not a structural one -- except an unrecognized key,
+    which `model_config = ConfigDict(extra="forbid")` (the `Lote` standard -- see that schema's
+    docstring) does reject structurally, naming the offending key.
+
+    `numero_suministro`/`codigo_lote` are natural keys, not UUIDs: `ImportConsumos` resolves both,
+    rejecting the record if either does not exist. `consumo_promedio_diario`/`fecha_lectura` are
+    the two `UNSET`-aware optional fields (see `domain/ports.py`'s `ConsumoSourceRecord`
+    docstring): `routes.import_consumos` checks `model_fields_set` (not these attributes
+    themselves) to tell "genuinely absent" apart from "explicitly sent as null" before building
+    the `ConsumoSourceRecord`, the same way `LoteImportItem`'s `nombre`/`cantidad_registros`
+    already do (FIX 1).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    numero_suministro: str | None = None
+    codigo_lote: str | None = None
+    fecha_inicio: str | None = None
+    fecha_fin: str | None = None
+    dias_facturados: int | None = None
+    kwh: float | None = None
+    consumo_promedio_diario: float | None = None
+    fecha_lectura: str | None = None
+
+    @field_validator("dias_facturados", "kwh", "consumo_promedio_diario", mode="before")
+    @classmethod
+    def _reject_bool(cls, value: object) -> object:
+        """`bool` is a subclass of `int` in Python -- would otherwise lax-coerce a JSON
+        `true`/`false` into `1`/`0` (or `1.0`/`0.0`) before these fields' own validation gets a
+        chance to object. Mirrors `LecturaImportItem`'s identical guard."""
+        if isinstance(value, bool):
+            raise ValueError("no puede ser un booleano")
+        return value
+
+
+class ConsumoSchema(BaseModel):
+    id: str
+    suministro_id: str
+    lote_id: str
+    lectura_id: str | None
+    fecha_inicio: date
+    fecha_fin: date
+    dias_facturados: int
+    kwh: Decimal
+    consumo_promedio_diario: Decimal | None
+
+
+class ConsumosPageSchema(BaseModel):
+    items: list[ConsumoSchema]
+    total: int
+    limit: int
+    offset: int

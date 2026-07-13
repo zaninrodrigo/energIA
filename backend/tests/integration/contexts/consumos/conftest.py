@@ -68,6 +68,13 @@ async def lotes_client(lecturas_client: AsyncClient) -> AsyncClient:
     return lecturas_client
 
 
+@pytest.fixture
+async def consumos_client(lecturas_client: AsyncClient) -> AsyncClient:
+    """Alias of `lecturas_client` for readability in Consumo-focused tests -- same app/client
+    (every context's router, `energia_test`-backed session)."""
+    return lecturas_client
+
+
 async def insert_cliente(
     session: AsyncSession, *, numero_cliente: str, nombre: str = "Cliente de prueba"
 ) -> UUID:
@@ -145,3 +152,28 @@ async def insert_suministro(
 async def suministro_id(db_session: AsyncSession) -> UUID:
     """A freshly inserted suministro, ready to be referenced by a `Lectura`."""
     return await insert_suministro(db_session, numero_suministro="SUM-9999")
+
+
+async def insert_lote(
+    session: AsyncSession, *, codigo_lote: str, estado: str = "Pendiente"
+) -> UUID:
+    """Insert a minimal lote row directly via raw SQL -- `Consumo`'s own tests (which need a
+    `lote_id` FK, `fk_consumos_lote`) set up this dependency the same way
+    `insert_suministro`/`insert_cliente` do, bypassing `ImportLotes`/`Lote.create()` entirely.
+    """
+    lote_id = uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO lotes (id, codigo_lote, fecha_importacion, cantidad_registros, estado) "
+            "VALUES (:id, :codigo_lote, now(), 0, :estado)"
+        ),
+        {"id": lote_id, "codigo_lote": codigo_lote, "estado": estado},
+    )
+    await session.commit()
+    return lote_id
+
+
+@pytest.fixture
+async def lote_id(db_session: AsyncSession) -> UUID:
+    """A freshly inserted lote, ready to be referenced by a `Consumo`."""
+    return await insert_lote(db_session, codigo_lote="LOTE-9999")

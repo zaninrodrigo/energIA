@@ -111,7 +111,7 @@ El esquema tiene **34 restricciones `CHECK`** (contadas por `grep -c "CONSTRAINT
 | RD-014 | `lecturas.dias_facturados` | `CHECK (dias_facturados > 0)` |
 | RD-050 | `lecturas.lectura_anterior`/`lectura_actual` | Sin `CHECK` — enforced solo en dominio (`Lectura.create()`, ver `backend/src/energia/contexts/consumos/domain/lectura.py`), deliberado: no se agregó una restricción SQL equivalente |
 | RD-016 | `consumos.kwh` | `CHECK (kwh >= 0)` |
-| RD-017 (parcial) | `consumos` | `UNIQUE (suministro_id, fecha_inicio, fecha_fin)` — evita duplicar el mismo período exacto; no bloquea solapamientos parciales (requeriría `EXCLUDE` con `btree_gist`, no agregado, ver §6.4) |
+| RD-017 (parcial) | `consumos` | Índice único parcial `uq_consumos_suministro_periodo (suministro_id, fecha_inicio, fecha_fin) WHERE deleted_at IS NULL` — evita duplicar el mismo período exacto (y permite reimportar uno soft-deleted como fila nueva); no bloquea solapamientos parciales (requeriría `EXCLUDE` con `btree_gist`, no agregado, ver §6.4) |
 | RD-018 | `consumos.lectura_id` | `FOREIGN KEY` (nullable, ver §3.1) |
 | RD-020/021/022 | `resultados_ia.suministro_id/lote_id/modelo_ia_id` | `FOREIGN KEY` NOT NULL |
 | RD-023 | `resultados_ia` | `UNIQUE (suministro_id, lote_id)` |
@@ -162,7 +162,7 @@ Los triggers de fila (`trg_consumos_set_updated_at`) se definen una sola vez sob
 
 ### 6.4 Limitación conocida: solapamiento de períodos (RD-017)
 
-`UNIQUE (suministro_id, fecha_inicio, fecha_fin)` evita cargar dos veces el mismo período exacto (idempotencia de carga), pero **no impide** que se carguen dos períodos que se solapan parcialmente (por ejemplo, 01/03-31/03 y 15/03-15/04 para el mismo suministro). Prevenir eso a nivel de base de datos requeriría un `EXCLUDE` constraint con rangos de fecha (extensión `btree_gist`). No se agrega en esta versión porque introduciría una extensión no pedida por el alcance actual; queda como mejora futura si la calidad de los datos históricos a recibir lo justifica.
+El índice único parcial `uq_consumos_suministro_periodo (suministro_id, fecha_inicio, fecha_fin) WHERE deleted_at IS NULL` evita cargar dos veces el mismo período exacto (idempotencia de carga, incluyendo la reimportación de un período previamente soft-deleted como fila nueva — deuda #10 de `PROJECT_MASTER_SPEC.md`, resuelta antes de US-004), pero **no impide** que se carguen dos períodos que se solapan parcialmente (por ejemplo, 01/03-31/03 y 15/03-15/04 para el mismo suministro). Prevenir eso a nivel de base de datos requeriría un `EXCLUDE` constraint con rangos de fecha (extensión `btree_gist`). No se agrega en esta versión porque introduciría una extensión no pedida por el alcance actual; queda como mejora futura si la calidad de los datos históricos a recibir lo justifica. `ImportConsumos` (US-004) no implementa detección de solapamiento parcial por esta misma razón — ver `docs/03-architecture/API_SPEC.md` ("Contexto: Gestión de Consumos").
 
 ---
 
@@ -209,7 +209,7 @@ Los índices sobre `consumos` (tabla particionada) se declaran una sola vez sobr
 ## 10. Principios generales (heredados del borrador, sin cambios)
 
 - Todo registro es auditable: `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by` en las 24 tablas.
-- Soft delete: ningún `DELETE` físico. Las claves naturales (`numero_cliente`, `numero_suministro`, `codigo_lote`, `numero_orden`) usan índices únicos parciales `WHERE deleted_at IS NULL`, para poder reutilizar el valor de negocio si el registro original fue soft-deleted. `lecturas` no tenía índice de este tipo en el borrador original; se agregó `uq_lecturas_suministro_fecha` (US-003) sobre la clave natural *compuesta* `(suministro_id, fecha_lectura)` — sin él, reimportar el mismo histórico duplicaba filas en lugar de actualizar/no-hacer-nada.
+- Soft delete: ningún `DELETE` físico. Las claves naturales (`numero_cliente`, `numero_suministro`, `codigo_lote`, `numero_orden`) usan índices únicos parciales `WHERE deleted_at IS NULL`, para poder reutilizar el valor de negocio si el registro original fue soft-deleted. `lecturas` no tenía índice de este tipo en el borrador original; se agregó `uq_lecturas_suministro_fecha` (US-003) sobre la clave natural *compuesta* `(suministro_id, fecha_lectura)` — sin él, reimportar el mismo histórico duplicaba filas en lugar de actualizar/no-hacer-nada. `consumos` tampoco lo tenía: `uq_consumos_suministro_periodo` nació como `CONSTRAINT ... UNIQUE` simple (sin `WHERE deleted_at IS NULL`), la única clave natural de las 24 tablas que rompía esta convención — deuda #10 de `PROJECT_MASTER_SPEC.md`, convertida a índice único parcial antes de implementar US-004.
 - `created_by`/`updated_by` son `UUID` sin FK: la tabla de usuarios todavía no existe (ver deuda "matriz de roles y permisos diferida" en `PROJECT_MASTER_SPEC.md`).
 
 ---

@@ -2,6 +2,7 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
+| 0.6.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura`, `Lote de Facturación` y `Consumo`, las tres entidades de §4.3 completas— documentados) | Rodrigo Zanin |
 | 0.5.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura` y `Lote de Facturación`— documentados) | Rodrigo Zanin |
 | 0.4.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos documentados) | Rodrigo Zanin |
 
@@ -165,7 +166,7 @@ Lista paginada de suministros vigentes (excluye soft-deleted, `deleted_at IS NUL
 
 ## Contexto: Gestión de Consumos
 
-Implementado en `backend/src/energia/contexts/consumos/`, hoy para dos entidades: `Lectura` (US-003) y `Lote de Facturación` (US-005) — `Consumo` (`DOMAIN_MODEL.md` §4.3) todavía no tiene endpoints propios; se agrega a este mismo contexto cuando su historia de usuario aterrice (ver `contexts/README.md`, "One package, staged entities"). Cubre la importación de lecturas históricas, la importación de lotes de facturación, y la consulta paginada de ambas. Los endpoints de `Lectura` están montados bajo `/api/v1/lecturas`; los de `Lote` bajo `/api/v1/lotes`.
+Implementado en `backend/src/energia/contexts/consumos/`, para las tres entidades que `DOMAIN_MODEL.md` §4.3 asigna a este contexto: `Lectura` (US-003), `Lote de Facturación` (US-005) y `Consumo` (US-004) — con `Consumo` aterrizado, Épica 1 queda completa (ver `contexts/README.md`, "One package, staged entities"). Cubre la importación de lecturas históricas, la importación de lotes de facturación, la importación de consumos históricos, y la consulta paginada de las tres. Los endpoints de `Lectura` están montados bajo `/api/v1/lecturas`; los de `Lote` bajo `/api/v1/lotes`; los de `Consumo` bajo `/api/v1/consumos`.
 
 Una lectura pertenece a exactamente un suministro (RD-015, `DOMAIN_MODEL.md` §7.5). El payload de importación referencia al suministro por su **clave natural**, `numero_suministro`, no por UUID: el endpoint la resuelve a UUID antes de intentar guardar el registro; si no existe, el registro se rechaza individualmente (ver más abajo), no la request completa.
 
@@ -333,12 +334,116 @@ Lista paginada de lotes vigentes (excluye soft-deleted, `deleted_at IS NULL`), o
 }
 ```
 
+### POST /api/v1/consumos/import
+
+Importa consumos históricos desde un array JSON (US-004: "quiero importar los consumos históricos, para entrenar el modelo de IA"). Mismo patrón que los demás endpoints de importación: es el adaptador de hoy para el puerto `ConsumoSource` (ver `domain/ports.py`); un adaptador de archivo o el ETL de Oracle (ADR-004) pueden implementar el mismo puerto más adelante sin tocar dominio ni aplicación.
+
+**Dos resoluciones de clave natural, no una.** A diferencia de `Lectura` (solo `numero_suministro`) o `Lote` (ninguna), un `Consumo` referencia tanto un suministro (`numero_suministro` → `suministro_id`, vía `SuministroDirectory`) como un lote de facturación (`codigo_lote` → `lote_id`, vía el nuevo puerto `LoteDirectory` — resolución *dentro del mismo contexto*, implementada con una consulta ORM ordinaria contra `LoteModel`, no SQL directo, ya que `Lote` vive en este mismo `consumos`; ver `contexts/README.md`, "cross-context directory-port pattern" → "when a directory port is *not* needed"). Ambas deben resolver para que el registro se intente validar.
+
+**Tercera resolución, opcional: `fecha_lectura` → `lectura_id`.** Si el payload incluye `fecha_lectura`, se busca la lectura de ese suministro para esa fecha (vía `LecturaRepository.get_by_suministro_and_fecha`, reutilizado directamente — no hace falta un puerto nuevo); si no existe, el registro se rechaza (`"lectura inexistente: ..."`). Si `fecha_lectura` se omite, `lectura_id` queda `null` — el comentario de `docker/postgres/init/01_schema.sql` sobre `consumos.lectura_id` es explícito: los archivos históricos a recibir pueden no traer el detalle de lectura por período, y esto no es un error (RD-018 se satisface cuando la lectura *es* resoluble, no exige que siempre lo sea).
+
+**`consumo_promedio_diario`: computado vs. dado (DOMAIN_MODEL.md §7.6).** El dominio lista `calcularPromedioDiario()` como método del agregado — por eso, si el campo se omite, `Consumo.create()` lo **calcula** (`kwh / dias_facturados`, cuantizado a `numeric(12,3)`) en vez de dejarlo vacío; si se envía un valor concreto, se valida igual que `kwh` (mismos guardas de NaN/Infinito/negativo/precisión) y se guarda tal cual, sin cruzarlo contra el valor derivado.
+
+**Idempotencia**: cada registro se busca por su clave natural compuesta `(numero_suministro, fecha_inicio, fecha_fin)` (resuelto a `suministro_id`) antes de decidir si crear, actualizar o no hacer nada. Reimportar el mismo payload no duplica filas: reporta `updated`/`unchanged` en lugar de `created`. Un mismo período repetido *dentro* del mismo payload se procesa de forma secuencial: la segunda ocurrencia actualiza sobre la primera, en lugar de entrar en conflicto.
+
+**Rechazo individual**: un registro se rechaza de forma individual, sin abortar el resto del lote, en cualquiera de estos casos:
+
+- `numero_suministro` faltante o el suministro referenciado no existe (`"suministro inexistente: ..."`).
+- `codigo_lote` faltante o el lote referenciado no existe (`"lote inexistente: ..."`).
+- `fecha_lectura` con formato inválido, o dada pero sin ninguna lectura que resuelva para ese suministro y esa fecha (`"lectura inexistente: ..."`).
+- El registro viola un invariante de `Consumo`: `fecha_inicio`/`fecha_fin` faltante o con formato inválido, `fecha_fin` anterior a `fecha_inicio`; `dias_facturados` faltante, no entero, no mayor que cero, booleano, o mayor a `2147483647` (el máximo de `integer` en Postgres); `kwh` faltante, no numérico, NaN, infinito, negativo (RD-016), booleano, con más de 3 decimales o más de 9 dígitos enteros (no entra en `numeric(12,3)`); `consumo_promedio_diario` dado con cualquiera de esos mismos problemas.
+- Cualquier clave no declarada en el schema (`estado`, o un campo mal tipeado) — `ConsumoImportItem` usa `extra="forbid"` (el estándar de `Lote`, ver esa sección arriba).
+
+**Campos omitidos vs. `null` explícito**: `consumo_promedio_diario` y `fecha_lectura` distinguen tres estados en cada importación, pero con efectos distintos entre sí sobre un período existente — `consumo_promedio_diario` es un campo *derivado* (sus insumos, `kwh`/`dias_facturados`, son siempre obligatorios y ya vienen validados en cada importación), mientras que `fecha_lectura`/`lectura_id` sigue el mismo patrón de `Lote.nombre`/`cantidad_registros` (un campo *opaco*, sin insumos propios de los que recalcular):
+
+| Estado del campo en el payload | Efecto sobre un período nuevo | Efecto sobre un período existente |
+|---|---|---|
+| Omitido (la clave no aparece) | `consumo_promedio_diario`: se **calcula** (`kwh / dias_facturados`). `fecha_lectura`: `lectura_id` queda `null` | `consumo_promedio_diario`: se **recalcula siempre** a partir del `kwh`/`dias_facturados` de *este* registro — nunca preserva el valor ya almacenado (ver nota debajo). `fecha_lectura`: **preserva** el `lectura_id` ya almacenado — no lo pisa |
+| `null` explícito | `consumo_promedio_diario`: se guarda `null` (no se calcula). `fecha_lectura`: `lectura_id` queda `null` | `consumo_promedio_diario`: se pisa a `null`. `fecha_lectura`: se pisa a `null` (limpia la asociación ya almacenada) |
+| Valor concreto | `consumo_promedio_diario`: se valida y guarda tal cual. `fecha_lectura`: se resuelve a `lectura_id` (o se rechaza el registro si no resuelve) | Actualiza ese campo si difiere del almacenado |
+
+**Por qué `consumo_promedio_diario` recalcula en lugar de preservar al omitirse**: a diferencia de `Lote.nombre`/`cantidad_registros` (campos opacos, sin más respaldo que un default de dominio si se omiten — por eso *deben* preservar lo ya almacenado, o lo pisarían con ese default), `consumo_promedio_diario` siempre tiene sus dos insumos (`kwh`, `dias_facturados`) presentes y validados en cada importación, así que recalcular es siempre seguro y siempre coherente con el resto de la fila. Antes de esta corrección, omitir `consumo_promedio_diario` en una reimportación preservaba el promedio ya almacenado incluso cuando `kwh`/`dias_facturados` habían cambiado, dejando un promedio obsoleto que contradecía al resto de la fila — caso reproducido: `kwh` 100 → 295 (mismo `dias_facturados`, 31), `consumo_promedio_diario` omitido en la reimportación devolvía 3.226 (el promedio de la importación anterior) en lugar de recalcular a 9.516.
+
+**Request body** — array JSON, cada elemento:
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `numero_suministro` | string | Sí (validado a nivel de dominio, no de schema) | Clave natural de `Suministro`; resuelta a `suministro_id` (UUID) por `SuministroDirectory` |
+| `codigo_lote` | string | Sí (ídem) | Clave natural de `Lote`; resuelta a `lote_id` (UUID) por `LoteDirectory` |
+| `fecha_inicio` | string (fecha ISO 8601) | Sí (ídem) | Junto a `numero_suministro`/`suministro_id` y `fecha_fin`, forma la clave natural compuesta |
+| `fecha_fin` | string (fecha ISO 8601) | Sí (ídem) | Debe ser ≥ `fecha_inicio` |
+| `dias_facturados` | integer | Sí (ídem) | Debe ser mayor que cero |
+| `kwh` | number | Sí (ídem) | `numeric(12,3)`: máx. 9 dígitos enteros, 3 decimales; no negativo (RD-016) |
+| `consumo_promedio_diario` | number \| null | No (`UNSET` por defecto) | Ver "Campos omitidos vs. `null` explícito" arriba |
+| `fecha_lectura` | string (fecha ISO 8601) \| null | No (`UNSET` por defecto) | Ver "Campos omitidos vs. `null` explícito" arriba |
+
+Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito: un valor faltante o inválido es un rechazo de **dominio** o de **resolución de referencia** (HTTP 200, reportado en `rejected`), no un error estructural de request — salvo una clave desconocida, que sí es un rechazo estructural individual (también HTTP 200, ver `Lote` arriba).
+
+**Response 200** — `ImportSummary`:
+
+```json
+{
+  "created": 2,
+  "updated": 0,
+  "unchanged": 0,
+  "rejected": [
+    { "record": { "numero_suministro": "no-existe", "codigo_lote": "LOTE-2024-01", "...": null },
+      "reasons": ["suministro inexistente: numero_suministro='no-existe'"] },
+    { "record": { "numero_suministro": "SUM-100", "codigo_lote": "LOTE-2024-01",
+        "fecha_inicio": "2024-05-31", "fecha_fin": "2024-05-01", "...": null },
+      "reasons": ["fecha_fin no puede ser anterior a fecha_inicio (2024-05-01 < 2024-05-31)"] }
+  ]
+}
+```
+
+**Errores**:
+
+| Código | Causa |
+|---|---|
+| 422 | Body estructuralmente inválido (no es un array JSON, o un campo tiene un tipo incompatible). Distinto del rechazo de dominio/referencia de arriba, que responde 200. |
+
+**Limitación conocida (RD-017, superposición parcial de períodos)**: `uq_consumos_suministro_periodo` (índice único parcial, `WHERE deleted_at IS NULL` — deuda #10 de `PROJECT_MASTER_SPEC.md`, resuelta antes de esta historia) evita importar dos veces **exactamente** el mismo período para un suministro, incluyendo reimportar un período previamente soft-deleted como fila nueva. No impide, en cambio, que se carguen dos períodos que se solapan parcialmente (por ejemplo, 01/03-31/03 y 15/03-15/04 para el mismo suministro): eso requeriría un `EXCLUDE` constraint con rangos de fecha (extensión `btree_gist`, `docs/03-architecture/DATABASE_DESIGN.md` §6.4), que no se agrega en esta historia. Este endpoint no implementa ninguna detección de solapamiento propia.
+
+**Limitación conocida: corrección de períodos.** Esta es una brecha distinta de la de RD-017 (arriba): no es una superposición no detectada, sino la ausencia total de una vía para retractar un período mal ingresado. Si un `fecha_inicio`/`fecha_fin` con un error de tipeo se reimporta ya corregido, la clave natural compuesta `(numero_suministro, fecha_inicio, fecha_fin)` cambia — la reimportación no actualiza la fila original: crea una **segunda** fila, activa, distinta de la primera (que también queda activa, con su período incorrecto). No existe hoy ningún endpoint DELETE ni de baja lógica para `Consumo` en esta API: la única forma de retractar la fila original con el período incorrecto es un soft-delete manual por SQL directo (`UPDATE consumos SET deleted_at = now() WHERE ...`), fuera de la API. Ver `PROJECT_MASTER_SPEC.md`, deuda documental #13.
+
+**Limitación conocida: redondeo a cero.** `consumo_promedio_diario`/`kwh` son `numeric(12,3)`: un promedio genuinamente distinto de cero puede redondear a `0.000` y volverse indistinguible de un cero real — por ejemplo, `kwh=0.001` con `dias_facturados=365` computa `0.0000027...`, que redondea a `0.000`. Relevante para la detección de anomalías corriente abajo, donde un consumo cero es en sí mismo una señal.
+
+### GET /api/v1/consumos
+
+Lista paginada de consumos vigentes (excluye soft-deleted, `deleted_at IS NULL`), ordenada por `(fecha_inicio desc, id)` — el período de facturación más reciente primero, lo que "disponer del histórico completo para entrenar el modelo de IA" (US-004) necesita al navegar sin filtro. `id` es solo el desempate cuando dos consumos comparten la misma `fecha_inicio`.
+
+**Query params**:
+
+| Parámetro | Tipo | Default | Notas |
+|---|---|---|---|
+| `limit` | integer | 50 | Rango 1-200 |
+| `offset` | integer | 0 | ≥ 0 |
+| `numero_suministro` | string \| null | (ninguno) | Filtra a los consumos de ese suministro. Se resuelve a `suministro_id` con `SuministroDirectory`; si no resuelve, devuelve una página vacía (`total: 0`), no un error. |
+| `codigo_lote` | string \| null | (ninguno) | Filtra a los consumos de ese lote. Se resuelve a `lote_id` con `LoteDirectory`; misma semántica de página vacía si no resuelve. |
+
+**Response 200** — `ConsumosPage`:
+
+```json
+{
+  "items": [
+    { "id": "...", "suministro_id": "...", "lote_id": "...", "lectura_id": null,
+      "fecha_inicio": "2024-01-01", "fecha_fin": "2024-01-31", "dias_facturados": 31,
+      "kwh": "310.500", "consumo_promedio_diario": "10.016" }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`suministro_id`/`lote_id`/`lectura_id` se exponen como UUID, no como sus claves naturales — misma decisión documentada para `cliente_id`/`categoria_tarifaria_id` en Gestión de Suministros, y pendiente por la misma razón.
+
 ## Contenido pendiente (otros contextos)
 
 - Convenciones generales de la API (formato de URLs, versionado, paginación, filtros y ordenamiento).
 - Formato estándar de request/response (JSON, envoltorios de éxito y error).
 - Autenticación y autorización (JWT, roles, scopes) y su relación con SECURITY_SPEC.md.
-- Endpoints por contexto delimitado restante: Motor de Inteligencia Energética, Inspecciones, Integración con RRHH. Dentro de Gestión de Consumos, también queda pendiente `Consumo`. (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos/Lectura/Lote: ver secciones propias arriba.)
+- Endpoints por contexto delimitado restante: Motor de Inteligencia Energética, Inspecciones, Integración con RRHH. Gestión de Consumos ya no tiene pendientes propios: `Lectura`, `Lote de Facturación` y `Consumo` (§4.3, completo) tienen endpoints. (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos: ver secciones propias arriba.)
 - Modelos de datos (schemas Pydantic) de entrada y salida por endpoint.
 - Catálogo de códigos de error y formato estándar de mensajes de error.
 - Estrategia de versionado de la API y política de compatibilidad hacia atrás.
