@@ -59,6 +59,15 @@ async def lecturas_client(
     await truncate_all_tables(test_session_factory)
 
 
+@pytest.fixture
+async def lotes_client(lecturas_client: AsyncClient) -> AsyncClient:
+    """Alias of `lecturas_client` for readability in Lote-focused tests -- same app/client
+    (every context's router, `energia_test`-backed session), `Lote` needs no FK seeding helper
+    unlike `Lectura` (`lotes` references no other table), so no separate fixture body is needed.
+    """
+    return lecturas_client
+
+
 async def insert_cliente(
     session: AsyncSession, *, numero_cliente: str, nombre: str = "Cliente de prueba"
 ) -> UUID:

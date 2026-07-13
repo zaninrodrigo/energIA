@@ -267,6 +267,31 @@ def test_create_rejects_a_dias_facturados_of_an_unsupported_type() -> None:
     assert any("dias_facturados" in reason for reason in exc_info.value.errors)
 
 
+def test_create_accepts_a_dias_facturados_at_the_postgres_integer_max() -> None:
+    """`lecturas.dias_facturados` is a plain Postgres `integer` (docker/postgres/init/
+    01_schema.sql) -- 2_147_483_647 is the largest value that column can hold."""
+    lectura = _create(dias_facturados=2_147_483_647)
+
+    assert lectura.dias_facturados == 2_147_483_647
+
+
+def test_create_rejects_a_dias_facturados_one_past_the_postgres_integer_max() -> None:
+    with pytest.raises(LecturaValidationError) as exc_info:
+        _create(dias_facturados=2_147_483_648)
+
+    assert any("dias_facturados" in reason for reason in exc_info.value.errors)
+
+
+def test_create_rejects_the_reproduced_out_of_range_dias_facturados() -> None:
+    """Same gap `Lote.cantidad_registros` had (the reviewer flagged both as the identical
+    pattern): an unbounded Python int passes every prior check and would otherwise die at the
+    database as an opaque `DBAPIError` instead of a per-record rejection."""
+    with pytest.raises(LecturaValidationError) as exc_info:
+        _create(dias_facturados=99999999999)
+
+    assert any("dias_facturados" in reason for reason in exc_info.value.errors)
+
+
 def test_create_accumulates_every_violated_invariant_in_one_error() -> None:
     with pytest.raises(LecturaValidationError) as exc_info:
         _create(

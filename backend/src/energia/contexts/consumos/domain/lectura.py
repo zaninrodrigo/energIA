@@ -37,6 +37,15 @@ _NUMERIC_DECIMAL_PLACES = 3
 _NUMERIC_MAX_INTEGER_DIGITS = _NUMERIC_MAX_DIGITS - _NUMERIC_DECIMAL_PLACES
 _NUMERIC_MAX_VALUE = Decimal(10) ** _NUMERIC_MAX_INTEGER_DIGITS
 
+# `lecturas.dias_facturados` is a plain Postgres `integer` (docker/postgres/init/01_schema.sql),
+# not a `bigint` -- 2_147_483_647 is the largest value that column can hold. Same gap
+# `Lote.cantidad_registros` had (`domain/lote.py`): a larger value (e.g. a big-int JSON literal
+# like `99999999999`) passes every check above and every Pydantic/domain type check today, since
+# Python `int`s are arbitrary-precision, and only fails once the write actually reaches the
+# database, as an opaque `DBAPIError` -- a 500 for the whole batch instead of a per-record
+# rejection. Bounded here so it is caught before it ever reaches the repository.
+_DIAS_FACTURADOS_MAX = 2_147_483_647
+
 
 class LecturaValidationError(ValueError):
     """Raised by `Lectura.create()` when one or more invariants are violated.
@@ -245,6 +254,10 @@ def _parse_dias_facturados(value: int | str | None, errors: list[str]) -> int | 
     if dias <= 0:
         # RD-014: "Los días facturados deben ser mayores que cero."
         errors.append(f"dias_facturados debe ser mayor que cero: {dias}")
+        return None
+
+    if dias > _DIAS_FACTURADOS_MAX:
+        errors.append(f"dias_facturados no puede superar {_DIAS_FACTURADOS_MAX}: {dias}")
         return None
 
     return dias

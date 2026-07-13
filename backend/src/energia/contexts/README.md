@@ -12,7 +12,7 @@ later remains possible without a redesign (ADR-006).
 |---|---|---|
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
-| `consumos` | Gestión de Consumos | **Implemented** (US-003, `Lectura` only) |
+| `consumos` | Gestión de Consumos | **Implemented** (US-003 `Lectura`, US-005 `Lote de Facturación`) |
 | `intelligence_engine` | Motor de Inteligencia Energética | Not started |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
@@ -179,6 +179,12 @@ duplicated it on every re-run instead of upserting. Tested by
 `test_reimporting_a_soft_deleted_key_creates_a_new_identity`
 (`tests/integration/contexts/consumos/test_lecturas_routes_integration.py`).
 
+`Lote` (US-005) follows the same semantics too, keyed by its single natural key `codigo_lote`:
+`uq_lotes_codigo_lote` (`docker/postgres/init/01_schema.sql`) was already a partial unique index
+(`WHERE deleted_at IS NULL`) before this slice — unlike `lecturas`, no schema change was needed
+here. Tested by `test_reimporting_a_soft_deleted_codigo_lote_creates_a_new_identity`
+(`tests/integration/contexts/consumos/test_lotes_routes_integration.py`).
+
 **Known FK race with a soft-deleted `cliente`**: `fk_suministros_cliente`
 (`docker/postgres/init/01_schema.sql`) is an ordinary foreign key against `clientes.id` — it does
 not, and cannot, check `deleted_at`. If a `cliente` were soft-deleted *between* `ClienteDirectory`
@@ -196,13 +202,88 @@ The identical race exists between `SuministroDirectory` and `ImportLecturas`' wr
 ## One package, staged entities
 
 `DOMAIN_MODEL.md` §4.3 ("Gestión de Consumos") lists three entities: Lectura, Consumo, and Lote
-de Facturación. US-003 only implements `Lectura` — `Consumo` and `Lote de Facturación` have no
-domain entity, table-facing repository, or endpoint yet, and will be added to this same
-`consumos` package (not a new one) as their own user stories land, each following the same four
-Clean Architecture layers already established here. This mirrors how `categoria_tarifaria` was
-folded into the `suministros` package instead of getting its own (`contexts/README.md`,
-"Internal shape of a context"): the package boundary is the *bounded context* §4 defines, not a
-1:1 mapping to entities or user stories.
+de Facturación. US-003 implemented `Lectura`; US-005 added `Lote de Facturación` to the same
+package (not a new one) — deliberately *before* `Consumo`, even though `Consumo` is listed first
+in some places: `consumos.lote_id` is `NOT NULL`, so the FK dependency dictates the implementation
+order regardless of documentation order. `Consumo` still has no domain entity, table-facing
+repository, or endpoint, and will be added to this same `consumos` package once its own user
+story lands, following the same four Clean Architecture layers already established here. This
+mirrors how `categoria_tarifaria` was folded into the `suministros` package instead of getting its
+own (`contexts/README.md`, "Internal shape of a context"): the package boundary is the *bounded
+context* §4 defines, not a 1:1 mapping to entities or user stories.
+
+## `Lote`: no cross-context (or same-context) foreign key to resolve
+
+Unlike every import use case before it, `ImportLotes` (`application/import_lotes.py`, US-005) has
+no directory-port resolution step at all: `lotes` references no other table (it is the other way
+around — `consumos`, `feature_vectors`, `predicciones` and `resultados_ia` all reference `lotes`),
+so there is no natural key to resolve to a UUID before `Lote.create()` can be attempted. This is
+the first entity in the codebase for which that whole pattern (source port + directory port
+resolution, see "Source-port pattern for imports" / "Cross-context directory-port pattern" above)
+simply does not apply — `ImportLotes` only needs a `LoteSource` and a `LoteRepository`.
+
+## `Lote.estado` is never accepted from the import payload
+
+`Lote` models its `estado` (`domain/lote.py`'s `EstadoLote`) as a real four-value enum
+(`Pendiente`/`Procesando`/`Procesado`/`Error`, DOMAIN_MODEL.md §7.4 "Estados"), with an
+`ALLOWED_TRANSITIONS` map and a `Lote.transition_to()` method enforcing RD-010 ("un lote no puede
+ejecutarse dos veces": no transition back to `Pendiente`, no skipping `Procesando`). Nothing calls
+`transition_to()` yet — the processing engine that would is a future user story — but the
+invariant lives in the domain now, not bolted on later as an afterthought.
+
+`Lote.create()` has **no `estado` parameter at all**, not even an optional one defaulting to
+`Pendiente`: every freshly created `Lote` is unconditionally born `Pendiente`, by construction.
+`LoteImportItem` (`presentation/schemas.py`) mirrors the same omission at the HTTP boundary — if a
+caller sends `estado` in the import payload anyway, it is rejected as a per-record structural
+violation (`model_config = ConfigDict(extra="forbid")`, HTTP 200, reported in `rejected` and
+naming `estado` as the offending key), not a 422 for the whole batch, and not silently dropped
+either: `LoteImportItem` used to default to Pydantic's `extra="ignore"`, which had the exact same
+effect on `estado` (no way to fabricate a `Procesado` lote through the payload) but also meant a
+*typo'd* field name (e.g. `canditad_registros` instead of `cantidad_registros`) vanished the same
+invisible way, silently defaulting the real field instead of surfacing any error. The reasoning
+for keeping `estado` out of the payload at all: accepting it from an import payload would let a
+single crafted request fabricate an already-`Procesado` lote that never actually went through the
+pipeline that state represents, exactly the kind of shortcut RD-010 exists to close.
+`clientes`/`suministros`/`lecturas`' own import DTOs still use `extra="ignore"` — aligning them
+the same way is a separate, not-yet-made decision (see `PROJECT_MASTER_SPEC.md`, pending items).
+
+This has a direct consequence for `ImportLotes`' update path, worth calling out because it is the
+one place in this codebase where the update-merge logic deliberately does **not** re-validate
+through `create()` the way `ImportLecturas`/`ImportSuministros` do: `Lote.create()` cannot express
+"keep the existing `estado`", so routing the merge through it would silently reset a `Procesado`
+lote back to `Pendiente` on every re-import. `ImportLotes` uses `dataclasses.replace()` on the
+*existing* row instead, overriding only `nombre`/`cantidad_registros` — see that module's
+docstring for the full rationale. The guarantee is reinforced structurally one layer down too:
+`SqlAlchemyLoteRepository.save()`'s `ON CONFLICT DO UPDATE SET` deliberately excludes `estado` (and
+`fecha_importacion`) from the columns it writes on an update, so even a stale in-memory `Lote` —
+one read before a concurrent transaction changed `estado`, a lost-update race — cannot revert it;
+see `infrastructure/lote_repository.py`'s `save()` docstring. Tested end-to-end in
+`tests/integration/contexts/consumos/test_lotes_routes_integration.py`
+(`test_reimporting_after_the_lote_transitioned_to_procesado_never_resets_its_estado`): import a
+lote, flip its `estado` to `Procesado` directly via SQL (simulating what the future processing
+engine would do), re-import the same `codigo_lote` with different `nombre`/`cantidad_registros` —
+the response reports `updated`, the fields change, and `estado` stays `Procesado`. The race itself
+is reproduced directly against the repository in
+`tests/integration/contexts/consumos/test_lote_repository_integration.py`
+(`test_save_never_reverts_a_concurrently_updated_estado`).
+
+## `Lote` re-import: omitted fields vs. an explicit `null`
+
+`ImportLotes` (`application/import_lotes.py`) treats a `nombre`/`cantidad_registros` field that is
+genuinely *absent* from the source record differently from one explicitly sent as `null` —
+`LoteSourceRecord` (`domain/ports.py`) represents "absent" as the `UNSET` sentinel, not `None`, so
+the distinction survives from the HTTP payload (via `LoteImportItem.model_fields_set`, checked in
+`presentation/routes.py`) all the way into the merge decision. On an update, a field left `UNSET`
+preserves whatever `existing` already has stored; an explicit value (including an explicit `null`
+for `nombre`) overwrites it. Before this existed, an omitted field defaulted through
+`Lote.create()` exactly like an explicit `null` would, so re-importing an existing `codigo_lote`
+with only some fields repeated (a common partial-update payload shape) silently wiped the fields
+left out — `nombre` to `null`, `cantidad_registros` to `0` — instead of leaving them alone.
+`cantidad_registros` has one more wrinkle `nombre` does not: it is a `NOT NULL` column with its
+own `DEFAULT 0`, so an *explicit* `null` (as opposed to omission) is rejected outright as a
+per-record violation, on both create and update, instead of being silently treated the same as an
+omission. See `docs/03-architecture/API_SPEC.md` ("Campos omitidos vs. `null` explícito") for the
+full table of the three states (`UNSET`/`null`/value) and their effect.
 
 ## No empty ceremony
 

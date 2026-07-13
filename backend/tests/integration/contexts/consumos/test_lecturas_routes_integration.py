@@ -292,6 +292,41 @@ async def test_import_rejects_a_boolean_dias_facturados_individually(
     assert any("dias_facturados" in reason for reason in body["rejected"][0]["reasons"])
 
 
+async def test_import_rejects_an_out_of_range_dias_facturados_instead_of_500ing_the_batch(
+    lecturas_client: AsyncClient,
+) -> None:
+    """Same reproduced gap `lotes.cantidad_registros` had (the reviewer flagged both as the
+    identical pattern): a plain JSON big-int literal like `99999999999` passes Pydantic and
+    previously passed `Lectura.create()` too, only to die at the database as an opaque
+    `DBAPIError` -- a 500 for the whole batch, not a per-record rejection."""
+    await _seed_cliente(lecturas_client, "7601")
+    await _seed_suministro(lecturas_client, numero_suministro="SUM-7601", numero_cliente="7601")
+    payload = [
+        {
+            "numero_suministro": "SUM-7601",
+            "fecha_lectura": "2024-01-01",
+            "lectura_anterior": 0.0,
+            "lectura_actual": 10.0,
+            "dias_facturados": 30,
+        },
+        {
+            "numero_suministro": "SUM-7601",
+            "fecha_lectura": "2024-01-02",
+            "lectura_anterior": 0.0,
+            "lectura_actual": 10.0,
+            "dias_facturados": 99999999999,
+        },
+    ]
+
+    response = await lecturas_client.post("/api/v1/lecturas/import", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["created"] == 1
+    assert len(body["rejected"]) == 1
+    assert any("dias_facturados" in reason for reason in body["rejected"][0]["reasons"])
+
+
 async def test_import_rejects_a_boolean_lectura_anterior_individually(
     lecturas_client: AsyncClient,
 ) -> None:

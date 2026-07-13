@@ -2,6 +2,7 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
+| 0.5.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura` y `Lote de Facturación`— documentados) | Rodrigo Zanin |
 | 0.4.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos documentados) | Rodrigo Zanin |
 
 ## Propósito
@@ -164,7 +165,7 @@ Lista paginada de suministros vigentes (excluye soft-deleted, `deleted_at IS NUL
 
 ## Contexto: Gestión de Consumos
 
-Implementado en `backend/src/energia/contexts/consumos/` (US-003), hoy solo para la entidad `Lectura` — `Consumo` y `Lote de Facturación` (`DOMAIN_MODEL.md` §4.3) todavía no tienen endpoints propios; se agregan a este mismo contexto cuando sus historias de usuario aterricen (ver `contexts/README.md`, "One package, staged entities"). Cubre la importación de lecturas históricas y su consulta paginada. Ambos endpoints están montados bajo el prefijo `/api/v1/lecturas`.
+Implementado en `backend/src/energia/contexts/consumos/`, hoy para dos entidades: `Lectura` (US-003) y `Lote de Facturación` (US-005) — `Consumo` (`DOMAIN_MODEL.md` §4.3) todavía no tiene endpoints propios; se agrega a este mismo contexto cuando su historia de usuario aterrice (ver `contexts/README.md`, "One package, staged entities"). Cubre la importación de lecturas históricas, la importación de lotes de facturación, y la consulta paginada de ambas. Los endpoints de `Lectura` están montados bajo `/api/v1/lecturas`; los de `Lote` bajo `/api/v1/lotes`.
 
 Una lectura pertenece a exactamente un suministro (RD-015, `DOMAIN_MODEL.md` §7.5). El payload de importación referencia al suministro por su **clave natural**, `numero_suministro`, no por UUID: el endpoint la resuelve a UUID antes de intentar guardar el registro; si no existe, el registro se rechaza individualmente (ver más abajo), no la request completa.
 
@@ -245,12 +246,99 @@ Lista paginada de lecturas vigentes (excluye soft-deleted, `deleted_at IS NULL`)
 
 `suministro_id` se expone como UUID, no como `numero_suministro` — misma decisión documentada para `cliente_id`/`categoria_tarifaria_id` en Gestión de Suministros arriba, y pendiente por la misma razón.
 
+### POST /api/v1/lotes/import
+
+Importa lotes de facturación desde un array JSON. Mismo patrón que los demás endpoints de importación: es el adaptador de hoy para el puerto `LoteSource` (ver `domain/ports.py`); un adaptador de archivo o el ETL de Oracle (ADR-004) pueden implementar el mismo puerto más adelante sin tocar dominio ni aplicación. A diferencia de `Lectura`/`Suministro`, `Lote` no referencia ninguna otra tabla — no hay clave natural que resolver antes de validar el registro.
+
+**Idempotencia**: cada registro se busca por su clave natural (`codigo_lote`) antes de decidir si crear, actualizar o no hacer nada (RD-010, `DOMAIN_MODEL.md` §7.4: "un lote no puede ejecutarse dos veces"). Reimportar el mismo payload no duplica filas: reporta `updated`/`unchanged` en lugar de `created`.
+
+**El campo `estado` no existe en este payload, deliberadamente.** Un lote importado nace siempre en `Pendiente`: las transiciones de estado (`Pendiente` → `Procesando` → `Procesado`/`Error`) son responsabilidad del futuro motor de procesamiento, un caso de uso que todavía no existe. Si el payload pudiera fijar `estado` libremente, una request maliciosa podría fabricar un lote ya `Procesado` sin que jamás haya pasado por el pipeline que ese estado representa — exactamente lo que RD-010 busca evitar. Si un caller envía `estado` de todos modos, el registro se **rechaza individualmente** (HTTP 200, reportado en `rejected`, nombrando `estado` como la clave ofensora) — no se ignora en silencio, y no es un error 422 del batch completo: cualquier clave no reconocida en el payload (`estado`, o un campo mal tipeado como `canditad_registros`) se rechaza así, exactamente igual. Reimportar un lote que ya transicionó a `Procesando`/`Procesado`/`Error` (por ejemplo, vía SQL directo hoy, o vía el motor de procesamiento el día que exista) **nunca** resetea su `estado` a nivel de aplicación (`ImportLotes`) ni a nivel de repositorio (`SqlAlchemyLoteRepository.save()` nunca escribe la columna `estado` en una actualización, por diseño) — solo actualiza `nombre`/`cantidad_registros` si cambiaron.
+
+**Rechazo individual**: un registro se rechaza de forma individual, sin abortar el resto del lote, si viola un invariante de `Lote` o el contrato del payload:
+
+- `codigo_lote` faltante o vacío.
+- `cantidad_registros` no entero, negativo, mayor a `2147483647` (el máximo de `integer` en Postgres — ver la nota de la tabla más abajo), o enviado explícitamente como `null` (ver "Campos omitidos vs. `null` explícito").
+- Cualquier clave no declarada en el schema (`estado`, o un campo mal tipeado).
+
+**Campos omitidos vs. `null` explícito (reimportación parcial)**: `nombre` y `cantidad_registros` distinguen tres estados en cada reimportación, no dos:
+
+| Estado del campo en el payload | Efecto sobre un `codigo_lote` nuevo | Efecto sobre un `codigo_lote` existente |
+|---|---|---|
+| Omitido (la clave no aparece) | Aplica el default documentado (`nombre` → `null`, `cantidad_registros` → `0`) | **Preserva** el valor ya almacenado — no lo pisa |
+| `null` explícito | `nombre`: queda `null`. `cantidad_registros`: **rechazo individual** (la columna es `NOT NULL DEFAULT 0`; un `null` explícito no es un valor válido, a diferencia de omitir el campo) | `nombre`: se pisa a `null`. `cantidad_registros`: **rechazo individual**, el valor almacenado no se toca |
+| Valor concreto | Se usa ese valor | Actualiza ese campo si difiere del almacenado |
+
+Antes de esta distinción, un campo simplemente ausente del payload se trataba igual que un `null` explícito, así que reimportar un `codigo_lote` existente enviando solo los campos que cambiaron borraba (`nombre` → `null`, `cantidad_registros` → `0`) los campos no repetidos en cada request. Esa reimportación parcial ahora preserva lo ya almacenado.
+
+**Request body** — array JSON, cada elemento:
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `codigo_lote` | string | Sí (validado a nivel de dominio, no de schema) | Máx. 50 caracteres (`lotes.codigo_lote`, varchar(50)); clave natural (`uq_lotes_codigo_lote`, índice único parcial) |
+| `nombre` | string \| null | No | Máx. 150 caracteres |
+| `cantidad_registros` | integer | No (default `0`) | Debe ser ≥ 0 y ≤ `2147483647` (`ck_lotes_cantidad_registros_no_negativa`; el límite superior es el máximo de `integer` en Postgres — `lotes.cantidad_registros` no es `bigint`) |
+
+`codigo_lote` es obligatorio; `nombre`/`cantidad_registros` son opcionales *a nivel de schema* (permiten `null` u omitirse) a propósito, igual que en el resto de los contextos — pero, a diferencia del resto, distinguen explícitamente "omitido" de "`null` explícito" (ver arriba). Un valor inválido (o un `cantidad_registros` explícitamente `null`) es un rechazo de **dominio** (HTTP 200, reportado en `rejected`), no un error estructural de request. Ninguna clave fuera de `codigo_lote`/`nombre`/`cantidad_registros` está permitida — una clave extra (incluido `estado`) es un rechazo estructural individual, también HTTP 200 en `rejected`.
+
+**Response 200** — `ImportSummary`:
+
+```json
+{
+  "created": 2,
+  "updated": 0,
+  "unchanged": 0,
+  "rejected": [
+    { "record": { "codigo_lote": "", "nombre": "Sin codigo" },
+      "reasons": ["codigo_lote es obligatorio"] },
+    { "record": { "codigo_lote": "LOTE-2024-03", "cantidad_registros": -5 },
+      "reasons": ["cantidad_registros no puede ser negativo: -5"] }
+  ]
+}
+```
+
+El `record` de cada rechazo solo incluye las claves realmente presentes en el payload original — un campo omitido no aparece (ni como `null` ni con ningún otro valor centinela).
+
+**Errores**:
+
+| Código | Causa |
+|---|---|
+| 422 | Body estructuralmente inválido a nivel del array completo (no es un array JSON). Un elemento individualmente inválido (tipo incompatible, clave desconocida) no produce 422: se rechaza solo ese registro, HTTP 200, ver arriba. |
+
+### GET /api/v1/lotes
+
+Lista paginada de lotes vigentes (excluye soft-deleted, `deleted_at IS NULL`), ordenada por `(fecha_importacion desc, id)` — el lote importado más recientemente primero.
+
+**Por qué ese orden**: a diferencia de `codigo_lote` (un identificador de negocio sin orden cronológico inherente), `fecha_importacion` es exactamente lo que "procesar automáticamente cada período" (US-005) necesita: saber qué lotes llegaron y en qué orden, sin que quien consulta tenga que ordenar del lado del cliente. `id` es solo el desempate cuando dos lotes comparten la misma `fecha_importacion`.
+
+**Query params**:
+
+| Parámetro | Tipo | Default | Notas |
+|---|---|---|---|
+| `limit` | integer | 50 | Rango 1-200 |
+| `offset` | integer | 0 | ≥ 0 |
+| `estado` | string \| null | (ninguno) | Filtra por `EstadoLote` (`"Pendiente"` \| `"Procesando"` \| `"Procesado"` \| `"Error"`). Un valor que no pertenece al enum responde **422** (no una página vacía): es un error de contrato, no un filtro que simplemente no matchea nada. |
+
+**Response 200** — `LotesPage`:
+
+```json
+{
+  "items": [
+    { "id": "...", "codigo_lote": "LOTE-2024-01", "nombre": "Enero 2024",
+      "fecha_importacion": "2026-07-13T13:29:21.924547Z", "cantidad_registros": 175,
+      "estado": "Procesado" }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
 ## Contenido pendiente (otros contextos)
 
 - Convenciones generales de la API (formato de URLs, versionado, paginación, filtros y ordenamiento).
 - Formato estándar de request/response (JSON, envoltorios de éxito y error).
 - Autenticación y autorización (JWT, roles, scopes) y su relación con SECURITY_SPEC.md.
-- Endpoints por contexto delimitado restante: Facturación por Lotes, Motor de Inteligencia Energética, Inspecciones, Integración con RRHH. Dentro de Gestión de Consumos, también quedan pendientes `Consumo` y `Lote de Facturación`. (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos/Lectura: ver secciones propias arriba.)
+- Endpoints por contexto delimitado restante: Motor de Inteligencia Energética, Inspecciones, Integración con RRHH. Dentro de Gestión de Consumos, también queda pendiente `Consumo`. (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos/Lectura/Lote: ver secciones propias arriba.)
 - Modelos de datos (schemas Pydantic) de entrada y salida por endpoint.
 - Catálogo de códigos de error y formato estándar de mensajes de error.
 - Estrategia de versionado de la API y política de compatibilidad hacia atrás.
