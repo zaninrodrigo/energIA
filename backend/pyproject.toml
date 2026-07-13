@@ -40,6 +40,11 @@ markers = [
 [tool.coverage.run]
 source = ["energia"]
 branch = true
+# Without this, coverage.py's default tracer under-reports lines that resume after an awaited
+# call (e.g. the line right after `await session.execute(...)`), because greenlet-based context
+# switches (SQLAlchemy's async driver glue) confuse the plain sys.settrace tracer -- see
+# nedbat/coveragepy#1082. `cliente_directory.py` showed a false 82% before this was added.
+concurrency = ["greenlet"]
 
 [tool.coverage.report]
 fail_under = 90

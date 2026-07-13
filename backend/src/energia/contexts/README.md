@@ -11,16 +11,19 @@ later remains possible without a redesign (ADR-006).
 | Package (code identifier) | Bounded context (`DOMAIN_MODEL.md` §4, canonical name) | Status |
 |---|---|---|
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
-| `supplies` | Gestión de Suministros | Not started |
+| `suministros` | Gestión de Suministros | **Implemented** (US-002) |
 | `consumption` | Gestión de Consumos | Not started |
 | `intelligence_engine` | Motor de Inteligencia Energética | Not started |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
 | `dashboard` | Dashboard Ejecutivo | Not started |
 
-`clientes` is the first context implemented and sets the two conventions below. Package names
-for contexts not yet started are placeholders (English, one option among several); the
-`clientes` naming convention takes precedence once a context actually lands — see below.
+`clientes` is the first context implemented and sets the two conventions below. `suministros`
+(§4.2) is the second — note it is the Spanish domain noun itself (per the naming convention),
+superseding the `supplies` placeholder this table used before that context shipped. Package
+names for contexts not yet started are still placeholders (English, one option among several);
+the `clientes`/`suministros` naming convention takes precedence once each context actually
+lands — see below.
 
 ## Naming convention: Spanish domain nouns, English technical parts
 
@@ -56,6 +59,50 @@ case, and everything above it, does not change.
 The same shape applies to persistence: `ClienteRepository` (`domain/ports.py`) is the only
 storage port the application layer sees; `SqlAlchemyClienteRepository`
 (`infrastructure/cliente_repository.py`) is today's only implementation.
+
+## Cross-context directory-port pattern
+
+`suministros` (US-002) establishes the pattern every future use case that needs data owned by
+*another* bounded context should follow, driven by a constraint ADR-006 (modular monolith) makes
+explicit: module boundaries are enforced by discipline and code review, not by the runtime (a
+network boundary would enforce them "for free", but this project deliberately does not pay that
+operational cost — see ADR-006's accepted trade-offs). Concretely: `ImportSuministros`
+(`suministros/application/import_suministros.py`) needs to resolve a `numero_cliente` natural
+key to the `cliente_id` UUID `suministros.cliente_id`'s foreign key requires, but `Cliente` and
+its table belong to `clientes`, a different bounded context (`DOMAIN_MODEL.md` §4.1 vs §4.2) —
+importing `contexts.clientes.infrastructure.cliente_repository.SqlAlchemyClienteRepository` (or
+anything else from `contexts.clientes`) directly would violate ADR-001's module boundaries, even
+though both contexts share the exact same physical database.
+
+The resolution is a **directory port** — `ClienteDirectory`
+(`suministros/domain/ports.py`), a `Protocol` with a single `resolve(natural_key) -> id | None`
+method. Its implementation, `SqlDirectClienteDirectory`
+(`suministros/infrastructure/cliente_directory.py`), runs a direct, explicit SQL query
+(`sqlalchemy.text(...)`, not the ORM) against the `clientes` table — the sanctioned
+modular-monolith shortcut ADR-006 allows precisely because both contexts share one database:
+same connection, same transaction, no network call, but still routed through an explicit,
+narrow interface instead of reaching into `clientes`' own domain/application/infrastructure code.
+Deliberately raw SQL rather than a duplicate ORM mapping of `clientes`' table: a shadow model
+would double the places that table's shape is declared and invite `suministros` to depend on
+`clientes`' column set evolving in lockstep, exactly the coupling the port exists to prevent.
+
+**When a directory port is *not* needed**: not every entity referenced by another context's
+import needs one. `categoria_tarifaria` is also a natural-key reference `ImportSuministros` must
+resolve to a UUID, but `CategoriaTarifaria` belongs to the *same* bounded context as `Suministro`
+(`DOMAIN_MODEL.md` §4.2, "Gestión de Suministros") — so its resolution port,
+`CategoriaTarifariaDirectory`, is implemented with an ordinary ORM query
+(`SqlAlchemyCategoriaTarifariaDirectory`, `suministros/infrastructure/
+categoria_tarifaria_directory.py`) against a `CategoriaTarifariaModel` mapped in this context's
+own `infrastructure/models.py`, the same way `SuministroRepository` queries `suministros`. It is
+still its own small port (not folded into `SuministroRepository`) purely so `ImportSuministros`
+stays unit-testable against a plain fake — not because of any cross-context concern.
+
+Future contexts needing another context's data (e.g. `lecturas`/`consumos` resolving a
+`suministro_id`, `inspections` resolving a `resultado_ia_id`) should follow the same rule: if the
+referenced entity belongs to a *different* bounded context, define a `<Entity>Directory` port
+resolved by a direct SQL query in infrastructure; if it belongs to the *same* context, an
+ordinary same-context repository/ORM query is enough — no port-naming ceremony required beyond
+what unit-testability already asks for.
 
 ## Internal shape of a context
 
@@ -105,15 +152,31 @@ filters them out) or when upserting (the natural-key `ON CONFLICT` target is sco
 This is today's deliberate, tested behavior (see `test_reimporting_a_soft_deleted_numero_
 cliente_creates_a_new_identity`, `tests/integration/contexts/clientes/
 test_clientes_routes_integration.py`), not a bug — but it has a real consequence: any
-historical FK pointing at the old row (e.g. a future `suministros.cliente_id`) keeps pointing
-at the old, still-soft-deleted row, never at the new one. Whether the business actually wants
-resurrection instead is an open question — see `PROJECT_MASTER_SPEC.md`'s debt list.
+historical FK pointing at the old row (e.g. `suministros.cliente_id`) keeps pointing at the old,
+still-soft-deleted row, never at the new one. Whether the business actually wants resurrection
+instead is an open question — see `PROJECT_MASTER_SPEC.md`'s debt list.
+
+`suministros` follows the exact same semantics for `numero_suministro`
+(`uq_suministros_numero_suministro` is the same kind of partial unique index), tested by
+`test_reimporting_a_soft_deleted_numero_suministro_creates_a_new_identity`
+(`tests/integration/contexts/suministros/test_suministros_routes_integration.py`) — no new
+resurrection logic was introduced for the second context either.
+
+**Known FK race with a soft-deleted `cliente`**: `fk_suministros_cliente`
+(`docker/postgres/init/01_schema.sql`) is an ordinary foreign key against `clientes.id` — it does
+not, and cannot, check `deleted_at`. If a `cliente` were soft-deleted *between* `ClienteDirectory`
+resolving its `id` and `ImportSuministros`' `INSERT`/`UPDATE` of the `suministro` row, the new or
+updated `suministro` would end up referencing a now soft-deleted `cliente`, the same way a
+historical FK can already point at one (see above). This is currently unreachable in practice —
+the API exposes no endpoint to delete/deactivate a `cliente` at all — but it must be revisited
+once a `cliente` deactivation feature ships, since that endpoint would make the race a real,
+if narrow, concurrency window.
 
 ## No empty ceremony
 
-Only `clientes` exists so far (see `## Internal shape of a context` above for what it looks
-like in practice). The other 6 packages are not created yet: a context package is created only
-when its first real feature lands — domain entities, a use case, a repository, whatever comes
-first for that context. Scaffolding four empty layer folders ahead of any actual code would be
-ceremony without a behavior behind it, which is exactly what ADR-001's accepted trade-offs warn
-against for a single-developer team.
+Only `clientes` and `suministros` exist so far (see `## Internal shape of a context` above for
+what it looks like in practice). The other 5 packages are not created yet: a context package is
+created only when its first real feature lands — domain entities, a use case, a repository,
+whatever comes first for that context. Scaffolding four empty layer folders ahead of any actual
+code would be ceremony without a behavior behind it, which is exactly what ADR-001's accepted
+trade-offs warn against for a single-developer team.

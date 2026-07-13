@@ -119,8 +119,28 @@ def test_session_factory(test_engine: AsyncEngine) -> async_sessionmaker[AsyncSe
     return async_sessionmaker(test_engine, expire_on_commit=False)
 
 
+# Tables seeded once per test session by `docker/postgres/init/04_seed.sql` (replayed by
+# `_apply_init_scripts` above, not per test): reference/catalog data, not per-test application
+# data. `truncate_all_tables` must never wipe these -- otherwise the first test in the session
+# that triggers a truncate (any test using `db_session` or a context's HTTP client fixture)
+# silently deletes this seed data for the rest of the session, since `_test_database` only
+# (re)applies the init scripts once, session-scoped. Grow this set if a future seed script adds
+# another catalog table.
+#
+# WARNING: being excluded from truncation cuts both ways -- these rows are shared, mutable state
+# across every test in the session, not just protected from deletion. A test that *mutates* a
+# row in one of these tables (e.g. soft-deleting a `categoria_tarifaria` or otherwise updating
+# one in place) leaks that change into every other test that runs afterward in the same session,
+# since nothing here ever resets them back to their seeded values. Any test that needs to mutate
+# a seeded reference row must restore it (in the test itself or a fixture teardown) before it
+# finishes -- or, better, must not be written that way at all; assert against a copy/fake instead
+# of mutating the shared seed.
+_SEEDED_REFERENCE_TABLES = {"categorias_tarifarias"}
+
+
 async def truncate_all_tables(session_factory: async_sessionmaker[AsyncSession]) -> None:
-    """Truncate every table in the `public` schema of `energia_test`.
+    """Truncate every table in the `public` schema of `energia_test`, except
+    `_SEEDED_REFERENCE_TABLES`.
 
     Generic on purpose (queries `pg_tables` instead of a hardcoded table list) so every future
     context's integration tests get cleanup between tests for free, without editing this file
@@ -132,7 +152,7 @@ async def truncate_all_tables(session_factory: async_sessionmaker[AsyncSession])
         result = await session.execute(
             text("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
         )
-        tables = [row[0] for row in result]
+        tables = [row[0] for row in result if row[0] not in _SEEDED_REFERENCE_TABLES]
         if not tables:
             return
         quoted_tables = ", ".join(f'"{name}"' for name in tables)
