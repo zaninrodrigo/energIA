@@ -2,7 +2,7 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
-| 0.3.0 | 2026-07-13 | En progreso (Gestión de Clientes y Gestión de Suministros documentados) | Rodrigo Zanin |
+| 0.4.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos documentados) | Rodrigo Zanin |
 
 ## Propósito
 
@@ -162,12 +162,95 @@ Lista paginada de suministros vigentes (excluye soft-deleted, `deleted_at IS NUL
 
 `cliente_id` y `categoria_tarifaria_id` se exponen como UUID, no como sus claves naturales (`numero_cliente`/`nombre`): resolver el UUID de vuelta a la clave natural del cliente/categoría (por ejemplo, para mostrarlos en el frontend) queda pendiente para cuando ese caso de uso exista.
 
+## Contexto: Gestión de Consumos
+
+Implementado en `backend/src/energia/contexts/consumos/` (US-003), hoy solo para la entidad `Lectura` — `Consumo` y `Lote de Facturación` (`DOMAIN_MODEL.md` §4.3) todavía no tienen endpoints propios; se agregan a este mismo contexto cuando sus historias de usuario aterricen (ver `contexts/README.md`, "One package, staged entities"). Cubre la importación de lecturas históricas y su consulta paginada. Ambos endpoints están montados bajo el prefijo `/api/v1/lecturas`.
+
+Una lectura pertenece a exactamente un suministro (RD-015, `DOMAIN_MODEL.md` §7.5). El payload de importación referencia al suministro por su **clave natural**, `numero_suministro`, no por UUID: el endpoint la resuelve a UUID antes de intentar guardar el registro; si no existe, el registro se rechaza individualmente (ver más abajo), no la request completa.
+
+**Identidad compuesta**: a diferencia de `Cliente`/`Suministro` (una sola clave natural), la identidad de una lectura es el par `(numero_suministro, fecha_lectura)` — un suministro acumula muchas lecturas en el tiempo, una por fecha. `docker/postgres/init/01_schema.sql` no tenía ningún índice único sobre esta clave antes de US-003; se agregó `uq_lecturas_suministro_fecha` (`suministro_id, fecha_lectura`, parcial `WHERE deleted_at IS NULL`) específicamente para que la importación sea idempotente — sin él, reimportar el mismo histórico duplicaba filas en lugar de actualizar/no-hacer-nada.
+
+### POST /api/v1/lecturas/import
+
+Importa lecturas desde un array JSON. Mismo patrón que `POST /api/v1/suministros/import`: es el adaptador de hoy para el puerto `LecturaSource` (ver `domain/ports.py`); un adaptador de archivo o el ETL de Oracle (ADR-004) pueden implementar el mismo puerto más adelante sin tocar dominio ni aplicación.
+
+**Idempotencia**: cada registro se busca por su clave natural compuesta (`numero_suministro` resuelto a `suministro_id`, `fecha_lectura`) antes de decidir si crear, actualizar o no hacer nada. Reimportar el mismo payload no duplica filas: reporta `updated`/`unchanged` en lugar de `created`. Un `(numero_suministro, fecha_lectura)` repetido *dentro* del mismo payload se procesa de forma secuencial: la segunda ocurrencia actualiza sobre la primera, en lugar de entrar en conflicto.
+
+**Rechazo individual**: un registro se rechaza de forma individual, sin abortar el resto del lote, en cualquiera de estos casos:
+
+- `numero_suministro` faltante o el suministro referenciado no existe (`"suministro inexistente: numero_suministro=..."`).
+- El registro viola un invariante de `Lectura`: `fecha_lectura` con formato inválido, `lectura_anterior`/`lectura_actual` faltante, no numérico, negativo (un medidor físico no retrocede — invariante solo de dominio, no una CHECK de la base) o con más de 3 decimales o más de 9 dígitos enteros (no entra en `numeric(12,3)`), `lectura_actual` menor que `lectura_anterior` (RD-013), o `dias_facturados` faltante, no entero o no mayor que cero (RD-014).
+
+**Request body** — array JSON, cada elemento:
+
+| Campo | Tipo | Obligatorio | Notas |
+|---|---|---|---|
+| `numero_suministro` | string | Sí (validado a nivel de dominio, no de schema) | Clave natural de `Suministro`; resuelta a `suministro_id` (UUID) por el puerto `SuministroDirectory` |
+| `fecha_lectura` | string (fecha ISO 8601) | Sí (ídem) | Junto a `numero_suministro`/`suministro_id`, forma la clave natural compuesta. Se parsea con `date.fromisoformat` de Python: `YYYY-MM-DD` es la forma recomendada; la forma compacta `YYYYMMDD` también es válida |
+| `lectura_anterior` | number | Sí (ídem) | `numeric(12,3)`: máx. 9 dígitos enteros, 3 decimales; no negativo |
+| `lectura_actual` | number | Sí (ídem) | Ídem `lectura_anterior`; además debe ser ≥ `lectura_anterior` (RD-013) |
+| `dias_facturados` | integer | Sí (ídem) | Debe ser mayor que cero (RD-014) |
+
+Todos los campos son opcionales *a nivel de schema* (permiten `null`) a propósito, igual que en Gestión de Clientes/Suministros: un valor faltante o inválido es un rechazo de **dominio** o de **resolución de referencia** (HTTP 200, reportado en `rejected`), no un error estructural de request.
+
+**Response 200** — `ImportSummary`:
+
+```json
+{
+  "created": 2,
+  "updated": 0,
+  "unchanged": 0,
+  "rejected": [
+    { "record": { "numero_suministro": "no-existe", "fecha_lectura": "2024-01-15", "...": null },
+      "reasons": ["suministro inexistente: numero_suministro='no-existe'"] },
+    { "record": { "numero_suministro": "SUM-100", "fecha_lectura": "2024-03-15", "...": null },
+      "reasons": ["lectura_actual no puede ser menor que lectura_anterior (100.000 < 200.000)"] }
+  ]
+}
+```
+
+**Errores**:
+
+| Código | Causa |
+|---|---|
+| 422 | Body estructuralmente inválido (no es un array JSON, o un campo tiene un tipo incompatible). Distinto del rechazo de dominio/referencia de arriba, que responde 200. |
+
+### GET /api/v1/lecturas
+
+Lista paginada de lecturas vigentes (excluye soft-deleted, `deleted_at IS NULL`), ordenada por `(fecha_lectura, id)`.
+
+**Por qué ese orden y no la clave natural compuesta**: a diferencia de `numero_cliente`/`numero_suministro` (identificadores de negocio con orden propio), `suministro_id` es un UUID interno sin significado de orden — ordenar primero por `fecha_lectura` es lo que realmente sirve para "disponer del histórico completo" (US-003), tanto en una consulta global como filtrada a un suministro. `id` es solo el desempate: dos suministros distintos pueden compartir la misma `fecha_lectura` en un listado sin filtrar (el índice único solo garantiza unicidad por suministro), así que `fecha_lectura` sola no alcanza para un orden de paginación determinístico.
+
+**Query params**:
+
+| Parámetro | Tipo | Default | Notas |
+|---|---|---|---|
+| `limit` | integer | 50 | Rango 1-200 |
+| `offset` | integer | 0 | ≥ 0 |
+| `numero_suministro` | string \| null | (ninguno) | Filtra a las lecturas de ese suministro. Se resuelve a `suministro_id` con el mismo puerto `SuministroDirectory` del import; un `numero_suministro` que no resuelve a ningún suministro devuelve una página vacía (`total: 0`), no un error — es un filtro, no una búsqueda de la que el cliente dependa. |
+
+**Response 200** — `LecturasPage`:
+
+```json
+{
+  "items": [
+    { "id": "...", "suministro_id": "...", "fecha_lectura": "2024-01-15",
+      "lectura_anterior": "100.000", "lectura_actual": "150.500", "dias_facturados": 30 }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`suministro_id` se expone como UUID, no como `numero_suministro` — misma decisión documentada para `cliente_id`/`categoria_tarifaria_id` en Gestión de Suministros arriba, y pendiente por la misma razón.
+
 ## Contenido pendiente (otros contextos)
 
 - Convenciones generales de la API (formato de URLs, versionado, paginación, filtros y ordenamiento).
 - Formato estándar de request/response (JSON, envoltorios de éxito y error).
 - Autenticación y autorización (JWT, roles, scopes) y su relación con SECURITY_SPEC.md.
-- Endpoints por contexto delimitado restante: Facturación por Lotes, Motor de Inteligencia Energética, Inspecciones, Integración con RRHH. (Gestión de Clientes y Gestión de Suministros: ver secciones propias arriba.)
+- Endpoints por contexto delimitado restante: Facturación por Lotes, Motor de Inteligencia Energética, Inspecciones, Integración con RRHH. Dentro de Gestión de Consumos, también quedan pendientes `Consumo` y `Lote de Facturación`. (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos/Lectura: ver secciones propias arriba.)
 - Modelos de datos (schemas Pydantic) de entrada y salida por endpoint.
 - Catálogo de códigos de error y formato estándar de mensajes de error.
 - Estrategia de versionado de la API y política de compatibilidad hacia atrás.

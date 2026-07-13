@@ -12,7 +12,7 @@ later remains possible without a redesign (ADR-006).
 |---|---|---|
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
-| `consumption` | Gestión de Consumos | Not started |
+| `consumos` | Gestión de Consumos | **Implemented** (US-003, `Lectura` only) |
 | `intelligence_engine` | Motor de Inteligencia Energética | Not started |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
@@ -20,10 +20,12 @@ later remains possible without a redesign (ADR-006).
 
 `clientes` is the first context implemented and sets the two conventions below. `suministros`
 (§4.2) is the second — note it is the Spanish domain noun itself (per the naming convention),
-superseding the `supplies` placeholder this table used before that context shipped. Package
-names for contexts not yet started are still placeholders (English, one option among several);
-the `clientes`/`suministros` naming convention takes precedence once each context actually
-lands — see below.
+superseding the `supplies` placeholder this table used before that context shipped. `consumos`
+(§4.3) is the third, superseding the `consumption` placeholder the same way — see "One package,
+staged entities" below for why it ships today with only `Lectura` implemented, ahead of
+`Consumo`/`Lote de Facturación`. Package names for contexts not yet started are still
+placeholders (English, one option among several); the `clientes`/`suministros`/`consumos` naming
+convention takes precedence once each context actually lands — see below.
 
 ## Naming convention: Spanish domain nouns, English technical parts
 
@@ -97,12 +99,18 @@ own `infrastructure/models.py`, the same way `SuministroRepository` queries `sum
 still its own small port (not folded into `SuministroRepository`) purely so `ImportSuministros`
 stays unit-testable against a plain fake — not because of any cross-context concern.
 
-Future contexts needing another context's data (e.g. `lecturas`/`consumos` resolving a
-`suministro_id`, `inspections` resolving a `resultado_ia_id`) should follow the same rule: if the
-referenced entity belongs to a *different* bounded context, define a `<Entity>Directory` port
-resolved by a direct SQL query in infrastructure; if it belongs to the *same* context, an
-ordinary same-context repository/ORM query is enough — no port-naming ceremony required beyond
-what unit-testability already asks for.
+Future contexts needing another context's data (e.g. `inspections` resolving a `resultado_ia_id`)
+should follow the same rule: if the referenced entity belongs to a *different* bounded context,
+define a `<Entity>Directory` port resolved by a direct SQL query in infrastructure; if it belongs
+to the *same* context, an ordinary same-context repository/ORM query is enough — no port-naming
+ceremony required beyond what unit-testability already asks for.
+
+`consumos` (US-003) is the first context that actually follows this rule for a second time:
+`ImportLecturas` (`consumos/application/import_lecturas.py`) resolves a `numero_suministro`
+natural key to the `suministro_id` UUID `lecturas.suministro_id`'s foreign key requires, via
+`SuministroDirectory` (`consumos/domain/ports.py`) / `SqlDirectSuministroDirectory`
+(`consumos/infrastructure/suministro_directory.py`) — the exact same shape as `ClienteDirectory`/
+`SqlDirectClienteDirectory`, resolving *active* (non-soft-deleted) suministros only.
 
 ## Internal shape of a context
 
@@ -162,6 +170,15 @@ instead is an open question — see `PROJECT_MASTER_SPEC.md`'s debt list.
 (`tests/integration/contexts/suministros/test_suministros_routes_integration.py`) — no new
 resurrection logic was introduced for the second context either.
 
+`consumos` follows the same semantics for `Lectura`, keyed by the *composite* natural key
+`(suministro_id, fecha_lectura)` instead of a single column: `uq_lecturas_suministro_fecha`
+(`docker/postgres/init/01_schema.sql`) is a partial unique index over that pair (`WHERE
+deleted_at IS NULL`), added as part of US-003 — `lecturas` had no natural-key unique index at
+all before this slice, so re-importing the same historical reading would otherwise have
+duplicated it on every re-run instead of upserting. Tested by
+`test_reimporting_a_soft_deleted_key_creates_a_new_identity`
+(`tests/integration/contexts/consumos/test_lecturas_routes_integration.py`).
+
 **Known FK race with a soft-deleted `cliente`**: `fk_suministros_cliente`
 (`docker/postgres/init/01_schema.sql`) is an ordinary foreign key against `clientes.id` — it does
 not, and cannot, check `deleted_at`. If a `cliente` were soft-deleted *between* `ClienteDirectory`
@@ -172,11 +189,26 @@ the API exposes no endpoint to delete/deactivate a `cliente` at all — but it m
 once a `cliente` deactivation feature ships, since that endpoint would make the race a real,
 if narrow, concurrency window.
 
+The identical race exists between `SuministroDirectory` and `ImportLecturas`' write, against
+`fk_lecturas_suministro` instead: also currently unreachable (no endpoint deletes/deactivates a
+`suministro` either), for the same reason.
+
+## One package, staged entities
+
+`DOMAIN_MODEL.md` §4.3 ("Gestión de Consumos") lists three entities: Lectura, Consumo, and Lote
+de Facturación. US-003 only implements `Lectura` — `Consumo` and `Lote de Facturación` have no
+domain entity, table-facing repository, or endpoint yet, and will be added to this same
+`consumos` package (not a new one) as their own user stories land, each following the same four
+Clean Architecture layers already established here. This mirrors how `categoria_tarifaria` was
+folded into the `suministros` package instead of getting its own (`contexts/README.md`,
+"Internal shape of a context"): the package boundary is the *bounded context* §4 defines, not a
+1:1 mapping to entities or user stories.
+
 ## No empty ceremony
 
-Only `clientes` and `suministros` exist so far (see `## Internal shape of a context` above for
-what it looks like in practice). The other 5 packages are not created yet: a context package is
-created only when its first real feature lands — domain entities, a use case, a repository,
-whatever comes first for that context. Scaffolding four empty layer folders ahead of any actual
-code would be ceremony without a behavior behind it, which is exactly what ADR-001's accepted
-trade-offs warn against for a single-developer team.
+Only `clientes`, `suministros` and `consumos` exist so far (see `## Internal shape of a context`
+above for what it looks like in practice). The other 4 packages are not created yet: a context
+package is created only when its first real feature lands — domain entities, a use case, a
+repository, whatever comes first for that context. Scaffolding four empty layer folders ahead of
+any actual code would be ceremony without a behavior behind it, which is exactly what ADR-001's
+accepted trade-offs warn against for a single-developer team.

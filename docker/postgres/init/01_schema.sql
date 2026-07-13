@@ -303,6 +303,14 @@ CREATE TABLE lecturas (
     CONSTRAINT ck_lecturas_dias_facturados_positivo CHECK (dias_facturados > 0)
 );
 
+-- Clave natural compuesta: una lectura por suministro y fecha (RD-015, "una lectura pertenece a
+-- un único suministro"; §7.5 no admite dos lecturas del mismo suministro en la misma fecha).
+-- Implementa la idempotencia de importación (US-003): sin este índice, reimportar el mismo
+-- histórico duplicaría filas en lugar de actualizar/no-hacer-nada, como sí ocurre en
+-- clientes/suministros vía uq_clientes_numero_cliente/uq_suministros_numero_suministro.
+CREATE UNIQUE INDEX uq_lecturas_suministro_fecha
+    ON lecturas (suministro_id, fecha_lectura) WHERE deleted_at IS NULL;
+
 CREATE TRIGGER trg_lecturas_set_updated_at
     BEFORE UPDATE ON lecturas
     FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();

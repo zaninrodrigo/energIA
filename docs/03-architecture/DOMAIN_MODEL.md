@@ -577,6 +577,10 @@ RD-015
 
 Una lectura pertenece a un único suministro.
 
+RD-050
+
+Una lectura de medidor nunca puede ser negativa.
+
 ---
 
 ### Métodos

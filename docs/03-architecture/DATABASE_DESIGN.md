@@ -109,6 +109,7 @@ El esquema tiene **34 restricciones `CHECK`** (contadas por `grep -c "CONSTRAINT
 |---|---|---|
 | RD-013 | `lecturas.lectura_actual` | `CHECK (lectura_actual >= lectura_anterior)` |
 | RD-014 | `lecturas.dias_facturados` | `CHECK (dias_facturados > 0)` |
+| RD-050 | `lecturas.lectura_anterior`/`lectura_actual` | Sin `CHECK` — enforced solo en dominio (`Lectura.create()`, ver `backend/src/energia/contexts/consumos/domain/lectura.py`), deliberado: no se agregó una restricción SQL equivalente |
 | RD-016 | `consumos.kwh` | `CHECK (kwh >= 0)` |
 | RD-017 (parcial) | `consumos` | `UNIQUE (suministro_id, fecha_inicio, fecha_fin)` — evita duplicar el mismo período exacto; no bloquea solapamientos parciales (requeriría `EXCLUDE` con `btree_gist`, no agregado, ver §6.4) |
 | RD-018 | `consumos.lectura_id` | `FOREIGN KEY` (nullable, ver §3.1) |
@@ -208,7 +209,7 @@ Los índices sobre `consumos` (tabla particionada) se declaran una sola vez sobr
 ## 10. Principios generales (heredados del borrador, sin cambios)
 
 - Todo registro es auditable: `created_at`, `updated_at`, `deleted_at`, `created_by`, `updated_by` en las 24 tablas.
-- Soft delete: ningún `DELETE` físico. Las claves naturales (`numero_cliente`, `numero_suministro`, `codigo_lote`, `numero_orden`) usan índices únicos parciales `WHERE deleted_at IS NULL`, para poder reutilizar el valor de negocio si el registro original fue soft-deleted.
+- Soft delete: ningún `DELETE` físico. Las claves naturales (`numero_cliente`, `numero_suministro`, `codigo_lote`, `numero_orden`) usan índices únicos parciales `WHERE deleted_at IS NULL`, para poder reutilizar el valor de negocio si el registro original fue soft-deleted. `lecturas` no tenía índice de este tipo en el borrador original; se agregó `uq_lecturas_suministro_fecha` (US-003) sobre la clave natural *compuesta* `(suministro_id, fecha_lectura)` — sin él, reimportar el mismo histórico duplicaba filas en lugar de actualizar/no-hacer-nada.
 - `created_by`/`updated_by` son `UUID` sin FK: la tabla de usuarios todavía no existe (ver deuda "matriz de roles y permisos diferida" en `PROJECT_MASTER_SPEC.md`).
 
 ---
