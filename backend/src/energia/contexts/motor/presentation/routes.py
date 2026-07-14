@@ -19,12 +19,20 @@ from energia.contexts.motor.application.procesar_lote import (
 )
 from energia.contexts.motor.domain.lote_estado import EstadoLote
 from energia.contexts.motor.domain.ports import LoteProcesamientoPort
+from energia.contexts.motor.infrastructure.duplicidades_data_source import (
+    SqlDuplicidadesDataSource,
+)
 from energia.contexts.motor.infrastructure.lote_procesamiento import SqlLoteProcesamientoPort
 from energia.contexts.motor.infrastructure.validacion_data_source import SqlValidacionDataSource
 from energia.contexts.motor.presentation.schemas import (
+    DriftLoteSchema,
     ExclusionSchema,
     HallazgoSchema,
+    InformeDuplicidadesSchema,
     InformeValidacionSchema,
+    LecturaNearDuplicateSchema,
+    PeriodoConflictivoSchema,
+    PeriodosConflictivosSuministroSchema,
     ProcesarLoteResponseSchema,
 )
 from energia.shared.db import get_db_session
@@ -34,6 +42,7 @@ motor_router = APIRouter(prefix="/api/v1/motor", tags=["motor"])
 
 def _to_response(resultado: ResultadoProcesamiento) -> ProcesarLoteResponseSchema:
     informe = resultado.informe
+    duplicidades = resultado.duplicidades
     return ProcesarLoteResponseSchema(
         estado_final=resultado.estado_final.value,
         informe=InformeValidacionSchema(
@@ -57,6 +66,49 @@ def _to_response(resultado: ResultadoProcesamiento) -> ProcesarLoteResponseSchem
                     motivos=list(exclusion.motivos),
                 )
                 for exclusion in informe.exclusiones
+            ],
+        ),
+        duplicidades=InformeDuplicidadesSchema(
+            lote_id=str(duplicidades.lote_id),
+            periodos_conflictivos=[
+                PeriodosConflictivosSuministroSchema(
+                    suministro_id=str(entrada.suministro_id),
+                    periodos=[
+                        PeriodoConflictivoSchema(
+                            consumo_id=str(periodo.consumo_id),
+                            fecha_inicio=periodo.fecha_inicio,
+                            fecha_fin=periodo.fecha_fin,
+                            lote_id=str(periodo.lote_id),
+                            conflicto_con_consumo_id=str(periodo.conflicto_con_consumo_id),
+                            conflicto_con_fecha_inicio=periodo.conflicto_con_fecha_inicio,
+                            conflicto_con_fecha_fin=periodo.conflicto_con_fecha_fin,
+                            conflicto_con_lote_id=str(periodo.conflicto_con_lote_id),
+                        )
+                        for periodo in entrada.periodos
+                    ],
+                )
+                for entrada in duplicidades.periodos_conflictivos
+            ],
+            lecturas_near_duplicate=[
+                LecturaNearDuplicateSchema(
+                    suministro_id=str(lectura.suministro_id),
+                    lectura_id=str(lectura.lectura_id),
+                    fecha_lectura=lectura.fecha_lectura,
+                    lectura_actual=lectura.lectura_actual,
+                    conflicto_con_lectura_id=str(lectura.conflicto_con_lectura_id),
+                    conflicto_con_fecha_lectura=lectura.conflicto_con_fecha_lectura,
+                )
+                for lectura in duplicidades.lecturas_near_duplicate
+            ],
+            drift_lotes=[
+                DriftLoteSchema(
+                    lote_id=str(drift.lote_id),
+                    codigo_lote=drift.codigo_lote,
+                    cantidad_registros=drift.cantidad_registros,
+                    consumos_activos=drift.consumos_activos,
+                    diferencia=drift.diferencia,
+                )
+                for drift in duplicidades.drift_lotes
             ],
         ),
     )
@@ -85,8 +137,9 @@ async def procesar_lote(
     codigo_lote: str,
     session: AsyncSession = Depends(get_db_session),
 ) -> ProcesarLoteResponseSchema:
-    """Run Etapa 1 (US-006, integrity validation) over `codigo_lote` and decide its final
-    `estado` (`Procesado` if >= 95% of its suministros pass, `Error` otherwise -- DEC-004).
+    """Run Etapa 1 (US-006, integrity validation) + Etapa 2 (US-007, duplicidades) over
+    `codigo_lote` and decide its final `estado` (`Procesado` if >= 95% of its suministros pass
+    Etapa 1, `Error` otherwise -- DEC-004; Etapa 2 never influences this, DEC-005).
 
     A SINGLE commit, after the whole use case returns successfully: `ProcesarLote.execute()`
     itself never commits (see that module's docstring for why a single commit at the very end,
@@ -104,6 +157,7 @@ async def procesar_lote(
     use_case = ProcesarLote(
         lote_port=lote_port,
         validacion_source=SqlValidacionDataSource(session),
+        duplicidades_source=SqlDuplicidadesDataSource(session),
     )
     try:
         resultado = await use_case.execute(codigo_lote)

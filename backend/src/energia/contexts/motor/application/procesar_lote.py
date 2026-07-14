@@ -1,5 +1,5 @@
 """ProcesarLote: Etapa 1's orchestrating use case (US-006 + US-010 trigger, AI_ENGINE_SPEC.md
-§2-§4).
+§2-§4), extended with Etapa 2's duplicidades detection (US-007, §5).
 
 Flow (AI_ENGINE_SPEC.md §2.1, STEP 0 correction):
   (a) the lote must exist and be `Pendiente` or `Error` (retry) -- `Procesando` is a 409
@@ -17,28 +17,49 @@ Flow (AI_ENGINE_SPEC.md §2.1, STEP 0 correction):
       AI_ENGINE_SPEC.md §2.5 for the residual micro-race between this recount and the final
       `commit()` (`presentation/routes.py`).
   (f) run Etapa 1's checks (`domain.informe_validacion.construir_informe`) over the fetched chain.
-  (g) transition `Procesando` -> `Procesado` (>= 95% valid) or `Procesando` -> `Error` (< 95%).
+  (g) run Etapa 2's duplicidades detection (`domain.duplicidades.construir_informe_duplicidades`)
+      over EVERY suministro of THIS lote -- UNCONDITIONALLY, including suministros step (f) just
+      excluded (`domain/duplicidades.py`'s module docstring explains why) -- ANNOTATION ONLY
+      (DEC-005, §5): this never changes `estado_final`, which step (h) below decides from
+      `informe` alone, exactly as it did before Etapa 2 existed. FIX 3 (reviewer finding,
+      documented not changed): an exception raised HERE (e.g. `_construir_duplicidades`'s fetches
+      failing) rolls back the WHOLE transaction, same as a `fetch_chain` failure in step (d) --
+      step (c)'s `Procesando` transition is undone too, and the lote is left exactly where it was
+      (`Pendiente`/`Error`); this is the SAME single-transaction, all-or-nothing design as the
+      rest of this flow (see the docstring paragraph below), intentional consistency-over-partials
+      rather than an accidental side effect of Etapa 2 sharing this transaction -- see
+      AI_ENGINE_SPEC.md §2.5's table.
+  (h) transition `Procesando` -> `Procesado` (>= 95% valid) or `Procesando` -> `Error` (< 95%).
       `assert`ed to succeed: under the row lock held since step (c), a `False` return here would
       mean a broken invariant, not a normal race (protects a future refactor that might
       accidentally release that lock early, e.g. an intermediate commit).
-  (h) return the full `InformeValidacion` plus the final `EstadoLote`.
+  (i) return the full `InformeValidacion` + `InformeDuplicidades` plus the final `EstadoLote`.
 
 Nothing here calls `session.commit()` -- see `presentation/routes.py`'s docstring for why a
-SINGLE commit at the very end (after step (g), not after step (c) too) is what keeps this whole
+SINGLE commit at the very end (after step (h), not after step (c) too) is what keeps this whole
 sequence atomic without extra locking: Postgres's own row lock on the `UPDATE ... WHERE id =
 lote_id` from step (c) blocks any concurrent `procesar` call against the SAME lote until this
-transaction commits or rolls back, so a crash between (c) and (g) rolls the WHOLE sequence back
+transaction commits or rolls back, so a crash between (c) and (h) rolls the WHOLE sequence back
 (the lote never gets stuck at `Procesando` with nothing to show for it) instead of leaving a
 stuck row the way a two-commit design would. That SAME rollback is what reverts (c)'s transition
 when (e) raises `LoteModificadoError`.
 """
 
 from dataclasses import dataclass
+from uuid import UUID
 
 from energia.contexts.motor.domain.completitud import ResultadoCompletitud, evaluar_completitud
+from energia.contexts.motor.domain.duplicidades import (
+    InformeDuplicidades,
+    construir_informe_duplicidades,
+)
 from energia.contexts.motor.domain.informe_validacion import InformeValidacion, construir_informe
 from energia.contexts.motor.domain.lote_estado import EstadoLote
-from energia.contexts.motor.domain.ports import LoteProcesamientoPort, ValidacionDataSource
+from energia.contexts.motor.domain.ports import (
+    DuplicidadesDataSource,
+    LoteProcesamientoPort,
+    ValidacionDataSource,
+)
 
 
 class LoteNoEncontradoError(Exception):
@@ -77,20 +98,28 @@ class LoteNoListoError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ResultadoProcesamiento:
-    """`ProcesarLote.execute()`'s return value: the final estado plus the full report."""
+    """`ProcesarLote.execute()`'s return value: the final estado plus Etapa 1's + Etapa 2's full
+    reports. `duplicidades` never influences `estado_final` (DEC-005: annotate only, §5)."""
 
     estado_final: EstadoLote
     informe: InformeValidacion
+    duplicidades: InformeDuplicidades
 
 
 class ProcesarLote:
-    """US-006 + US-010: valida la integridad de un lote completo y decide su estado final."""
+    """US-006 + US-010 + US-007: valida la integridad de un lote completo (Etapa 1), detecta
+    duplicidades (Etapa 2, anotación únicamente) y decide el estado final del lote."""
 
     def __init__(
-        self, *, lote_port: LoteProcesamientoPort, validacion_source: ValidacionDataSource
+        self,
+        *,
+        lote_port: LoteProcesamientoPort,
+        validacion_source: ValidacionDataSource,
+        duplicidades_source: DuplicidadesDataSource,
     ) -> None:
         self._lote_port = lote_port
         self._validacion_source = validacion_source
+        self._duplicidades_source = duplicidades_source
 
     async def execute(self, codigo_lote: str) -> ResultadoProcesamiento:
         actual = await self._lote_port.obtener_estado_actual(codigo_lote)
@@ -127,6 +156,7 @@ class ProcesarLote:
             raise LoteModificadoError(codigo_lote)
 
         informe = construir_informe(actual.id, list(filas))
+        duplicidades = await self._construir_duplicidades(actual.id)
 
         estado_final = EstadoLote.PROCESADO if informe.umbral_cumplido else EstadoLote.ERROR
         movido_final = await self._lote_port.transicionar_estado(
@@ -138,4 +168,24 @@ class ProcesarLote:
             "el commit final -- ver módulo docstring"
         )
 
-        return ResultadoProcesamiento(estado_final=estado_final, informe=informe)
+        return ResultadoProcesamiento(
+            estado_final=estado_final, informe=informe, duplicidades=duplicidades
+        )
+
+    async def _construir_duplicidades(self, lote_id: UUID) -> InformeDuplicidades:
+        """Etapa 2 (module docstring's step (g)): fetch the relevant cross-lote history and run
+        every `domain.duplicidades` detector over it -- UNCONDITIONALLY over every suministro
+        with an active consumo in `lote_id`, deliberately NOT filtered by Etapa 1's exclusions
+        (`domain/duplicidades.py`'s module docstring explains why: a suministro V5 just excluded
+        from THIS lote's scoring is exactly the case whose overlap Etapa 2 must still mark, so a
+        FUTURE lote's feature windows know to skip it)."""
+        periodos = await self._duplicidades_source.fetch_historial_periodos(lote_id)
+        lecturas = await self._duplicidades_source.fetch_historial_lecturas(lote_id)
+        conteos_lotes = await self._duplicidades_source.fetch_conteos_lotes_relacionados(lote_id)
+
+        return construir_informe_duplicidades(
+            lote_id,
+            periodos=list(periodos),
+            lecturas=list(lecturas),
+            conteos_lotes=list(conteos_lotes),
+        )

@@ -48,7 +48,8 @@ El motor transforma consumos históricos en información accionable (DOMAIN_MODE
 patrones anómalos, estima riesgo (IRE) e impacto económico (IEE), y alimenta el ranking de
 inspecciones. Es el núcleo analítico del sistema y el bounded context `motor`
 (`contexts/README.md` — nombre de paquete, superseding el placeholder `intelligence_engine`
-usado antes de que este contexto tuviera código; Etapa 1, US-006 + US-010, ya implementada).
+usado antes de que este contexto tuviera código; Etapa 1 —US-006 + US-010— y Etapa 2 —US-007—,
+ya implementadas).
 
 ### 1.2 Qué NO es
 
@@ -168,6 +169,7 @@ Forest) — la única etapa implementada hoy no lo necesita.
 | Suministro con datos inválidos | Se excluye del scoring y se anota (§4) | El resto del lote se procesa |
 | Fallo entre `Procesando` y `Procesado`/`Error` (Etapa 1, esta implementación) | Nada — un único `commit()` al final de todo el flujo (§2.1-§2.3), nunca uno intermedio tras la transición a `Procesando` | El rollback automático de la sesión revierte también esa transición; el lote queda en su estado previo (`Pendiente`/`Error`), nunca atascado en `Procesando` |
 | Inserción concurrente de un consumo para el MISMO lote entre el gate de completitud (§2.1) y la relectura posterior a `fetch_chain` (Etapa 1, esta implementación) | Nada — `LoteModificadoError` (`409`) aborta antes de construir el informe; el único cambio de esta transacción (la transición a `Procesando`) se revierte con el mismo rollback | El lote vuelve a su estado previo (`Pendiente`/`Error`); el reintento vuelve a evaluar la completitud desde cero |
+| Fallo en Etapa 2 (detección de duplicidades, §5) | Nada — misma transacción única que el resto del flujo; una excepción acá revierte también la transición a `Procesando`, exactamente el mismo diseño que un fallo de `fetch_chain` (fila anterior): consistencia sobre resultados parciales, deliberado, no accidental | El lote vuelve a su estado previo (`Pendiente`/`Error`); el reintento reprocesa el lote entero (incluida la Etapa 2) |
 
 El motor persiste el conjunto del lote de forma atómica: no deja un lote medio analizado. Ver
 **DEC-003** (outcome de validación) para el tratamiento fino por suministro.
@@ -278,12 +280,51 @@ esta etapa "duplicado" significa lo que la base **no** previene:
 | Tipo | Definición | Fuente |
 |---|---|---|
 | Solapamiento de períodos | Dos consumos del mismo suministro con períodos que se cruzan sin ser idénticos | RD-017 |
-| Consumo repetido entre lotes | El mismo período reimportado en un lote distinto (mismo `suministro_id` + rango, distinto `lote_id`) | — |
+| Drift de conteo entre lotes | Un lote cuya cantidad de `consumos` activos ya no coincide con su `cantidad_registros` declarada, porque una fila migró hacia otro lote (o desde otro lote) — solo lotes con cantidad declarada (`cantidad_registros > 0`); `cantidad_registros == 0` es el default legítimo de "conteo aún no declarado", no algo de lo que pueda haber drift | — |
 | Near-duplicate de lecturas | Lecturas del mismo suministro con fechas muy próximas y valores idénticos | §7.5 |
+
+> **Corrección de consistencia interna (implementación v1, 2026-07-14).** La versión original de
+> esta tabla definía "consumo repetido entre lotes" como "el mismo período reimportado en un lote
+> distinto" — un estado **estructuralmente imposible** de alcanzar hoy: el upsert por clave
+> natural de `consumos` (`uq_consumos_suministro_periodo` sobre `(suministro_id, fecha_inicio,
+> fecha_fin) WHERE deleted_at IS NULL`, `SqlAlchemyConsumoRepository.save`) hace que reimportar el
+> MISMO período actualice la fila existente en el lugar, incluyendo su `lote_id`, que migra hacia
+> el lote que reimportó — nunca existen dos filas, una por lote, para el mismo período. El residuo
+> DETECTABLE de esa migración es el drift de conteo: el lote que perdió la fila (o el que la ganó)
+> termina con una cantidad de `consumos` activos que ya no coincide con su propia
+> `cantidad_registros` declarada. Eso es lo que esta etapa detecta y anota.
 
 **Outcome aceptado (DEC-005, 2026-07-14):** las duplicidades no borran datos (el motor no modifica
 operativos, §1.2); se **anotan** y el período conflictivo se marca para no contarse dos veces en
 las ventanas de features (§6), en lugar de excluir el más reciente, el más antiguo, o promediar.
+DEC-005 se mantiene sin cambios respecto de la validación original.
+
+**Implementación v1 (2026-07-14, Etapa 2 implementada).**
+
+- **Alcance por suministro.** El solapamiento de períodos y el near-duplicate de lecturas se
+  calculan para TODOS los suministros del lote en curso, sin filtrar por las exclusiones de la
+  Etapa 1 (V1-V7) — decisión deliberada: V4/V5 (Etapa 1) y esta etapa detectan el MISMO fenómeno
+  (solapamiento de períodos) en dos alcances distintos: V5 excluye al suministro del scoring de
+  ESTE lote apenas el solapamiento toca los datos del lote actual; la marca de esta etapa es la
+  anotación durable que debe sobrevivir para las ventanas de features de lotes FUTUROS (§6). Si
+  esta etapa omitiera los suministros que V5 acaba de excluir, la marca del caso que precisamente
+  motiva su existencia — un suministro excluido en este lote por el solapamiento que Etapa 3
+  necesita marcado — nunca se generaría. El drift de conteo entre lotes, en cambio, nunca dependió
+  de esta exclusión: reporta la integridad de OTROS lotes, no marcas sobre los suministros de este.
+- **Drift de conteo, alcance best-effort.** Solo son descubribles los lotes OTROS que todavía
+  comparten, en el estado actual de `consumos`, al menos un período activo con algún suministro
+  del lote en curso. Un lote que pierde el ÚLTIMO vínculo compartido (todos sus períodos para esos
+  suministros migraron hacia otro lado, sin dejar rastro soft-deleted porque el upsert nunca borra)
+  deja de ser descubrible por esta vía — señal best-effort, no exhaustiva.
+- **Ventana de near-duplicate de lecturas.** `VENTANA_DIAS_LECTURA_NEAR_DUPLICATE = 3` días
+  (`backend/src/energia/contexts/motor/domain/duplicidades.py`) — constante de implementación, no
+  una de las decisiones DEC-0xx; calibración pendiente contra datos reales
+  (`PROJECT_MASTER_SPEC.md` #8), igual que `TOLERANCIA_KWH_LECTURA`/la contigüidad de un día de
+  V4 (§4.1).
+- **Nunca cambia el resultado de la Etapa 1.** `duplicidades` es un campo adicional de la
+  respuesta de `POST /api/v1/motor/lotes/{codigo_lote}/procesar`; el umbral del 95 % (DEC-004)
+  sigue decidiéndose únicamente por el `InformeValidacion` de la Etapa 1. Ver
+  `docs/03-architecture/API_SPEC.md` para el contrato completo de los nuevos campos.
 
 ---
 

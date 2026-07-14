@@ -13,7 +13,7 @@ later remains possible without a redesign (ADR-006).
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
 | `consumos` | Gestión de Consumos | **Implemented, all 3 entities** (US-003 `Lectura`, US-005 `Lote de Facturación`, US-004 `Consumo` — Épica 1 complete) |
-| `motor` | Motor de Inteligencia Energética | **Implemented, Etapa 1** (US-006 + US-010 trigger — Épica 2 slice 1; Etapas 2-8 not started) |
+| `motor` | Motor de Inteligencia Energética | **Implemented, Etapas 1-2** (US-006 + US-010 trigger, Épica 2 slice 1; US-007 duplicidades, slice 2; Etapas 3-8 not started) |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
 | `dashboard` | Dashboard Ejecutivo | Not started |
@@ -391,8 +391,9 @@ foreign-key reference the way there is for a numeric average.
 ## The `motor` context
 
 `motor` (DOMAIN_MODEL.md §4.4, "Motor de Inteligencia Energética") is the fourth bounded context
-to land, Épica 2 slice 1 (US-006 + US-010 trigger, Etapa 1 only — validación de integridad;
-Etapas 2-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not started). Package name: `motor`, the
+to land, Épica 2 slices 1-2 (US-006 + US-010 trigger, Etapa 1 — validación de integridad; US-007,
+Etapa 2 — detección de duplicidades; Etapas 3-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not
+started). Package name: `motor`, the
 short Spanish domain noun itself (the same naming convention `clientes`/`suministros`/`consumos`
 already established), superseding the `intelligence_engine` placeholder this table used before
 this context shipped — not `intelligence_engine`, `ai_engine`, or `ia`: the canonical name in
@@ -434,6 +435,17 @@ bounded context from `motor` (§4.4), even though both share the same physical `
   above: one set-based SQL query joining `consumos`/`lecturas`/`suministros`/
   `categorias_tarifarias` (none of which belong to `motor`) to build the chain Etapa 1's checks
   (`motor/domain/checks.py`) evaluate — never a per-row loop of individual queries (RNF-001).
+- `motor/infrastructure/duplicidades_data_source.py` (`SqlDuplicidadesDataSource`, implementing
+  `DuplicidadesDataSource`) is Etapa 2's READ-only cross-context port (US-007,
+  `docs/04-ai/AI_ENGINE_SPEC.md` §5): three set-based queries (full cross-lote period history per
+  suministro, full lecturas history, and OTHER-lotes' active-consumo counts vs. their declared
+  `cantidad_registros`), all scoped by the lote being processed. `motor/domain/duplicidades.py`
+  turns those rows into `InformeDuplicidades` — annotation only (DEC-005): it never writes to
+  `consumos`/`lecturas`, and never influences `lotes.estado` (that stays Etapa 1's 95% gate,
+  DEC-004). `ProcesarLote` runs it AFTER Etapa 1, unconditionally over every suministro of the
+  lote (deliberately NOT filtered by Etapa 1's own exclusions — see that module's docstring for
+  why: the mark must survive for a FUTURE lote's feature windows, independent of whether THIS
+  lote's gate excluded the suministro today).
 
 ### Single-transaction atomicity, no explicit locking
 

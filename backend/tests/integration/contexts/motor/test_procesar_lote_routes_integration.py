@@ -83,6 +83,11 @@ async def test_happy_path_transitions_pendiente_lote_to_procesado(
     assert body["informe"]["suministros_excluidos"] == 0
     assert body["informe"]["umbral_cumplido"] is True
     assert body["informe"]["hallazgos"] == []
+    # (d) clean lote -> empty duplicidades (US-007, AI_ENGINE_SPEC.md §5): no overlaps, no
+    # near-duplicate lecturas, no drifted OTHER lotes.
+    assert body["duplicidades"]["periodos_conflictivos"] == []
+    assert body["duplicidades"]["lecturas_near_duplicate"] == []
+    assert body["duplicidades"]["drift_lotes"] == []
 
 
 async def test_reprocessing_an_already_procesado_lote_is_conflict(
@@ -265,3 +270,160 @@ async def test_consumo_inserted_mid_flight_returns_409_and_retry_succeeds(
     segundo = await motor_client.post("/api/v1/motor/lotes/LOTE-RACE/procesar")
     assert segundo.status_code == 200
     assert segundo.json()["estado_final"] == "Procesado"
+
+
+# ---------------------------------------------------------------------------------------------
+# Etapa 2 -- duplicidades (US-007, AI_ENGINE_SPEC.md §5)
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_v5_exclusion_and_duplicidades_both_report_the_same_overlap(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """(a) Mandatory scenario: a suministro with a near-identical, shifted period across two
+    lotes gets EXCLUDED by V5 (Etapa 1) from THIS lote's scoring, AND Etapa 2's duplicidades
+    still lists the conflicting pair for it -- deliberately NOT filtered by Etapa 1's own
+    exclusion (`domain/duplicidades.py`'s module docstring): the mark must survive for a FUTURE
+    lote's feature windows, independent of whether THIS lote's gate excluded the suministro
+    today."""
+    suministro_id = await insert_suministro(db_session, numero_suministro="SUM-DUP-A")
+    lote_previo_id = await insert_lote(
+        db_session, codigo_lote="LOTE-DUP-A-PREVIO", cantidad_registros=1
+    )
+    consumo_previo_id = await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_previo_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("100.000"),
+    )
+    lote_actual_id = await insert_lote(db_session, codigo_lote="LOTE-DUP-A", cantidad_registros=1)
+    consumo_actual_id = await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_actual_id,
+        # Shifted by 14 days, evading uq_consumos_suministro_periodo -- overlaps the previous
+        # period without being identical (V5's exact scenario).
+        fecha_inicio=date(2024, 1, 15),
+        fecha_fin=date(2024, 2, 15),
+        dias_facturados=31,
+        kwh=Decimal("100.000"),
+    )
+
+    response = await motor_client.post("/api/v1/motor/lotes/LOTE-DUP-A/procesar")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["estado_final"] == "Error"  # the lote's only suministro is excluded -> 0% valid
+    assert any(h["check"] == "V5" for h in body["informe"]["hallazgos"])
+    assert body["informe"]["suministros_excluidos"] == 1
+
+    periodos_conflictivos = body["duplicidades"]["periodos_conflictivos"]
+    assert len(periodos_conflictivos) == 1
+    entrada = periodos_conflictivos[0]
+    assert entrada["suministro_id"] == str(suministro_id)
+    consumo_ids_marcados = {p["consumo_id"] for p in entrada["periodos"]}
+    assert consumo_ids_marcados == {str(consumo_previo_id), str(consumo_actual_id)}
+
+
+async def test_near_duplicate_lecturas_are_annotated(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """(b) Mandatory scenario: two lecturas of the same suministro 2 days apart with an
+    identical `lectura_actual` are annotated in `duplicidades.lecturas_near_duplicate` --
+    informational only (DEC-005), never excludes the suministro (that stays Etapa 1's job)."""
+    lote_id = await insert_lote(db_session, codigo_lote="LOTE-DUP-B", cantidad_registros=1)
+    suministro_id = await insert_suministro(db_session, numero_suministro="SUM-DUP-B")
+    await _import_lectura_y_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("100.000"),
+    )
+    # A second lectura, 2 days after the first, with the SAME lectura_actual -- near-duplicate.
+    await insert_lectura(
+        db_session,
+        suministro_id=suministro_id,
+        fecha_lectura=date(2024, 2, 2),
+        lectura_anterior=Decimal("0.000"),
+        lectura_actual=Decimal("100.000"),
+        dias_facturados=2,
+    )
+
+    response = await motor_client.post("/api/v1/motor/lotes/LOTE-DUP-B/procesar")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["estado_final"] == "Procesado"
+    near_duplicates = body["duplicidades"]["lecturas_near_duplicate"]
+    assert len(near_duplicates) == 1
+    assert near_duplicates[0]["suministro_id"] == str(suministro_id)
+
+
+async def test_consumo_migration_between_lotes_reports_drift_on_the_previous_lote(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """(c) Mandatory scenario: migrate a consumo between lotes via re-import (period from lote A
+    re-imported under lote B) -> drift annotation for lote A when processing lote B. Exercises
+    the REAL natural-key upsert (`POST /api/v1/consumos/import`), not a raw-SQL simulation: proves
+    `consumos.uq_consumos_suministro_periodo`'s `ON CONFLICT ... DO UPDATE` migrates the SAME
+    row's `lote_id` in place, exactly as `domain/duplicidades.py`'s module docstring describes."""
+    numero_suministro = "SUM-DUP-C"
+    suministro_id = await insert_suministro(db_session, numero_suministro=numero_suministro)
+    # lote_previo declares 2 records: one that STAYS (January), one that will be re-imported
+    # under lote_actual (February) -- the natural-key upsert updates that SAME row's lote_id,
+    # leaving lote_previo with only 1 active consumo against its still-declared 2.
+    lote_previo_id = await insert_lote(
+        db_session, codigo_lote="LOTE-DUP-C-PREVIO", cantidad_registros=2
+    )
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_previo_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("100.000"),
+    )
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_previo_id,
+        fecha_inicio=date(2024, 2, 1),
+        fecha_fin=date(2024, 2, 29),
+        dias_facturados=29,
+        kwh=Decimal("90.000"),
+    )
+    await insert_lote(db_session, codigo_lote="LOTE-DUP-C", cantidad_registros=1)
+
+    import_response = await motor_client.post(
+        "/api/v1/consumos/import",
+        json=[
+            {
+                "numero_suministro": numero_suministro,
+                "codigo_lote": "LOTE-DUP-C",
+                "fecha_inicio": "2024-02-01",
+                "fecha_fin": "2024-02-29",
+                "dias_facturados": 29,
+                "kwh": 90.0,
+            }
+        ],
+    )
+    assert import_response.status_code == 200
+    assert import_response.json()["updated"] == 1
+
+    response = await motor_client.post("/api/v1/motor/lotes/LOTE-DUP-C/procesar")
+
+    assert response.status_code == 200
+    body = response.json()
+    drift_lotes = body["duplicidades"]["drift_lotes"]
+    assert len(drift_lotes) == 1
+    assert drift_lotes[0]["codigo_lote"] == "LOTE-DUP-C-PREVIO"
+    assert drift_lotes[0]["cantidad_registros"] == 2
+    assert drift_lotes[0]["consumos_activos"] == 1
+    assert drift_lotes[0]["diferencia"] == -1

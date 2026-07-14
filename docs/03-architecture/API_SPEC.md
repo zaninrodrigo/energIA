@@ -2,6 +2,7 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
+| 0.9.0 | 2026-07-14 | En progreso (Contexto: Motor de Inteligencia Energética — `POST /api/v1/motor/lotes/{codigo_lote}/procesar`, Etapa 2 / US-007 — campo `duplicidades` documentado) | Rodrigo Zanin |
 | 0.8.0 | 2026-07-14 | En progreso (Contexto: Motor de Inteligencia Energética — `POST /api/v1/motor/lotes/{codigo_lote}/procesar`, Etapa 1 / US-006 + US-010 — documentado) | Rodrigo Zanin |
 | 0.7.0 | 2026-07-13 | En progreso (DECISIÓN #9 — resurrección al reimportar una clave natural soft-deleted, los cinco endpoints de importación ganan `restored`— y DECISIÓN #13 — `DELETE /api/v1/consumos/{id}`, corrección de períodos — documentadas) | Rodrigo Zanin |
 | 0.6.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura`, `Lote de Facturación` y `Consumo`, las tres entidades de §4.3 completas— documentados) | Rodrigo Zanin |
@@ -479,11 +480,11 @@ Lista paginada de consumos vigentes (excluye soft-deleted, `deleted_at IS NULL`)
 
 ## Contexto: Motor de Inteligencia Energética
 
-Épica 2 slice 1 (US-006 "validar la integridad de los datos importados" + US-010, el disparo del motor). Documenta Etapa 1 únicamente (validación de integridad, `docs/04-ai/AI_ENGINE_SPEC.md` §4); las Etapas 2-8 (duplicados, features, estadística, reglas, Isolation Forest, IRE, IEE) no están implementadas todavía.
+Épica 2, slices 1-2 (US-006 "validar la integridad de los datos importados" + US-010, el disparo del motor; US-007 "detección de duplicados"). Documenta Etapa 1 (validación de integridad, `docs/04-ai/AI_ENGINE_SPEC.md` §4) y Etapa 2 (detección de duplicidades, §5); las Etapas 3-8 (features, estadística, reglas, Isolation Forest, IRE, IEE) no están implementadas todavía.
 
 ### POST /api/v1/motor/lotes/{codigo_lote}/procesar
 
-Ejecuta la Etapa 1 sobre el lote `codigo_lote`: valida que su carga esté completa (AI_ENGINE_SPEC.md §2.1), corre los 7 chequeos de integridad (V1-V7, §4.1) sobre su cadena importada (`consumos` + `lecturas` + `suministros` + `categorias_tarifarias`) y decide su `estado` final.
+Ejecuta la Etapa 1 sobre el lote `codigo_lote`: valida que su carga esté completa (AI_ENGINE_SPEC.md §2.1), corre los 7 chequeos de integridad (V1-V7, §4.1) sobre su cadena importada (`consumos` + `lecturas` + `suministros` + `categorias_tarifarias`) y decide su `estado` final. A continuación corre la Etapa 2 (§5): detecta solapamientos de períodos, near-duplicates de lecturas y drift de conteo entre lotes, y los agrega en el campo `duplicidades` de la respuesta — **anotación únicamente** (DEC-005): nunca cambia el `estado_final`, que sigue decidiéndose solo por la Etapa 1 (DEC-004).
 
 **Disparador corregido (STEP 0, AI_ENGINE_SPEC.md §2.1-§2.2, 2026-07-14):** este endpoint actúa sobre un lote `Pendiente` (o `Error`, reintento) — es el propio motor quien lo transiciona a `Procesando` y luego a `Procesado`/`Error`, nunca al revés. La versión previa de esta especificación (todavía sin implementar) describía el disparo sobre un lote ya `Procesado`, una inconsistencia interna corregida junto con esta implementación (ver AI_ENGINE_SPEC.md §2 para el detalle completo).
 
@@ -530,13 +531,35 @@ Ejecuta la Etapa 1 sobre el lote `codigo_lote`: valida que su carga esté comple
     "umbral_cumplido": true,
     "hallazgos": [],
     "exclusiones": []
+  },
+  "duplicidades": {
+    "lote_id": "5b1b6e0e-...-...",
+    "periodos_conflictivos": [
+      {
+        "suministro_id": "8f2c...-...",
+        "periodos": [
+          {
+            "consumo_id": "aaa1...-...",
+            "fecha_inicio": "2024-01-15",
+            "fecha_fin": "2024-02-15",
+            "lote_id": "5b1b6e0e-...-...",
+            "conflicto_con_consumo_id": "bbb2...-...",
+            "conflicto_con_fecha_inicio": "2024-01-01",
+            "conflicto_con_fecha_fin": "2024-01-31",
+            "conflicto_con_lote_id": "cccc...-..."
+          }
+        ]
+      }
+    ],
+    "lecturas_near_duplicate": [],
+    "drift_lotes": []
   }
 }
 ```
 
 | Campo | Tipo | Notas |
 |---|---|---|
-| `estado_final` | string | `"Procesado"` (`fraccion_valida >= 0.95`, DEC-004) o `"Error"` (por debajo del umbral) |
+| `estado_final` | string | `"Procesado"` (`fraccion_valida >= 0.95`, DEC-004) o `"Error"` (por debajo del umbral) — decidido únicamente por `informe` (Etapa 1); `duplicidades` (Etapa 2) nunca lo influye (DEC-005) |
 | `informe.lote_id` | UUID | — |
 | `informe.total_suministros` | integer | Suministros distintos con al menos un consumo activo en el lote |
 | `informe.suministros_excluidos` | integer | Suministros con al menos un hallazgo V1-V7 (DEC-003: excluir + anotar, no abortar el lote) |
@@ -544,8 +567,12 @@ Ejecuta la Etapa 1 sobre el lote `codigo_lote`: valida que su carga esté comple
 | `informe.umbral_cumplido` | boolean | `fraccion_valida >= 0.95` (DEC-004) |
 | `informe.hallazgos` | array | Uno por chequeo V1-V7 disparado: `{ "check": "V5", "suministro_id": "...", "consumo_id": "...", "motivo": "..." }` |
 | `informe.exclusiones` | array | Uno por suministro excluido: `{ "suministro_id": "...", "motivos": ["V1: ...", "V7: ..."] }` — todos los motivos de ese suministro, no solo el primero |
+| `duplicidades.lote_id` | UUID | — |
+| `duplicidades.periodos_conflictivos` | array | Uno por suministro con al menos un solapamiento (AI_ENGINE_SPEC.md §5) — `periodos`: cada entrada marca UN período de ese suministro (`consumo_id`/`fecha_inicio`/`fecha_fin`/`lote_id`) contra el otro período con el que se solapa (`conflicto_con_*`). Calculado sobre TODOS los suministros del lote, sin filtrar por las exclusiones de la Etapa 1 (ver AI_ENGINE_SPEC.md §5, "Implementación v1"). Es la forma estable que la Etapa 3 (§6, ventanas de features) debe leer para no contar dos veces un período conflictivo |
+| `duplicidades.lecturas_near_duplicate` | array | Uno por par de lecturas próximas (≤ `VENTANA_DIAS_LECTURA_NEAR_DUPLICATE` días, hoy 3) con `lectura_actual` idéntico: `{ "suministro_id": "...", "lectura_id": "...", "fecha_lectura": "...", "lectura_actual": "...", "conflicto_con_lectura_id": "...", "conflicto_con_fecha_lectura": "..." }` — informativo, no afecta el scoring |
+| `duplicidades.drift_lotes` | array | Uno por OTRO lote (no `duplicidades.lote_id`) cuya cantidad de `consumos` activos ya no coincide con su `cantidad_registros` declarada: `{ "lote_id": "...", "codigo_lote": "...", "cantidad_registros": N, "consumos_activos": M, "diferencia": M-N }` — residuo detectable de una migración de `lote_id` vía upsert por clave natural (AI_ENGINE_SPEC.md §5); best-effort, no exhaustivo (ver esa sección) |
 
-**Persistencia (implementación v1, ver AI_ENGINE_SPEC.md §4.2 para el detalle completo):** el `informe` de esta respuesta **no se persiste** en base de datos — `resultados_ia` exige `modelo_ia_id`/`clasificacion` (`NOT NULL`), que no existen hasta la etapa de scoring (§9). El único efecto persistente de este endpoint es la transición de `lotes.estado`.
+**Persistencia (implementación v1, ver AI_ENGINE_SPEC.md §4.2/§5 para el detalle completo):** ni `informe` ni `duplicidades` se persisten en base de datos — `resultados_ia` exige `modelo_ia_id`/`clasificacion` (`NOT NULL`), que no existen hasta la etapa de scoring (§9). El único efecto persistente de este endpoint es la transición de `lotes.estado`.
 
 **Idempotencia y concurrencia**: una segunda solicitud sobre un lote ya `Procesado` responde 409 (RD-010). Una solicitud concurrente contra el MISMO lote `Pendiente`/`Error` se resuelve por una transición optimista (`UPDATE ... WHERE estado IN (...)`, AI_ENGINE_SPEC.md §2.3): solo una gana la carrera hacia `Procesando`, la otra recibe 409. Un lote que aterrizó en `Error` admite reintento (`Error → Procesando`, decisión de negocio 2026-07-13): una nueva solicitud vuelve a correr los chequeos desde cero.
 
@@ -554,7 +581,7 @@ Ejecuta la Etapa 1 sobre el lote `codigo_lote`: valida que su carga esté comple
 - Convenciones generales de la API (formato de URLs, versionado, paginación, filtros y ordenamiento).
 - Formato estándar de request/response (JSON, envoltorios de éxito y error).
 - Autenticación y autorización (JWT, roles, scopes) y su relación con SECURITY_SPEC.md.
-- Endpoints por contexto delimitado restante: Inspecciones, Integración con RRHH. Gestión de Consumos ya no tiene pendientes propios: `Lectura`, `Lote de Facturación` y `Consumo` (§4.3, completo) tienen endpoints. El Motor de Inteligencia Energética tiene su Etapa 1 documentada (ver sección propia arriba); las Etapas 2-8 quedan pendientes. (Gestión de Clientes, Gestión de Suministros, Gestión de Consumos y Motor de Inteligencia Energética: ver secciones propias arriba.)
+- Endpoints por contexto delimitado restante: Inspecciones, Integración con RRHH. Gestión de Consumos ya no tiene pendientes propios: `Lectura`, `Lote de Facturación` y `Consumo` (§4.3, completo) tienen endpoints. El Motor de Inteligencia Energética tiene sus Etapas 1 y 2 documentadas (ver sección propia arriba); las Etapas 3-8 quedan pendientes. (Gestión de Clientes, Gestión de Suministros, Gestión de Consumos y Motor de Inteligencia Energética: ver secciones propias arriba.)
 - Modelos de datos (schemas Pydantic) de entrada y salida por endpoint.
 - Catálogo de códigos de error y formato estándar de mensajes de error.
 - Estrategia de versionado de la API y política de compatibilidad hacia atrás.
