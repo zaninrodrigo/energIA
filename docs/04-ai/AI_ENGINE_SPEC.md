@@ -2,13 +2,13 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
-| 1.0.0 | 2026-07-14 | Propuesto | Rodrigo Zanin |
+| 1.0.0 | 2026-07-14 | Aceptado | Rodrigo Zanin |
 
-> **Estado del documento.** Este diseño nace en estado **Propuesto**. Cada parámetro que
-> exige una decisión de negocio o de datos se marca en el cuerpo como **DECISIÓN (DEC-xxx)**
-> con una recomendación por defecto y sus alternativas, y se consolida en la §15 para su
-> aprobación por Rodrigo Zanin. Ningún valor numérico de este documento (pesos, umbrales,
-> hiperparámetros) es definitivo hasta esa validación.
+> **Estado del documento.** Las 18 decisiones marcadas en el cuerpo como **DECISIÓN (DEC-xxx)**
+> y consolidadas en la §15 fueron validadas por **Rodrigo Zanin el 2026-07-14**: 17 según su
+> recomendación por defecto, y **DEC-017** según su alternativa (IEE expresado en kWh, sin
+> monetización en v1). Los valores numéricos de este documento (pesos, umbrales,
+> hiperparámetros) son definitivos a partir de esa validación.
 
 ## Resumen ejecutivo
 
@@ -28,7 +28,7 @@ volúmenes de hasta **500.000 suministros** (RNF-007).
 | **Entrada** | `consumos`, `lecturas`, `suministros`, `categorias_tarifarias` de un lote `Procesado` |
 | **Salida** | `resultados_ia`, `predicciones`, `anomalias`, `ire`, `impacto_economico`, `feature_vectors` |
 | **Contrato de esquema** | `docker/postgres/init/01_schema.sql` (no se modifica; brechas en §16) |
-| **Decisiones pendientes** | 18 (DEC-001 a DEC-018), consolidadas en §15 |
+| **Decisiones validadas** | 18 (DEC-001 a DEC-018), aceptadas el 2026-07-14 (DEC-017 por alternativa), consolidadas en §15 |
 
 ---
 
@@ -71,10 +71,12 @@ comparación de cohorte (RD-009: "la IA solo compara suministros de categorías 
 necesita la cohorte completa. RF-005 lo formaliza: "ejecutar el Motor al finalizar el
 procesamiento de un lote".
 
-> **Tensión de fuente (contradicción documentada).** RN-005 dice "cada nuevo **consumo**
-> procesado deberá ser analizado automáticamente", granularidad por consumo; RN-013 + ADR-007
-> imponen granularidad **por lote**. ADR-005 reconcilia leyendo RN-005 como "al finalizar el
-> lote". Ver **DEC-001**.
+> **Tensión de fuente (resuelta por DEC-001, 2026-07-14).** RN-005 exigía originalmente "cada
+> nuevo **consumo** procesado deberá ser analizado automáticamente", granularidad por consumo,
+> en contradicción con la granularidad **por lote** de RN-013 + ADR-007. DEC-001 ratificó la
+> granularidad **por lote**, y RN-005 fue reformulada en consecuencia
+> (`docs/01-business/BUSINESS_ANALYSIS.md` §15): el disparo ocurre al completar el
+> procesamiento del lote, alineado con RN-013 y ADR-007. Ver **DEC-001** (§15).
 
 ### 2.2 Máquina de estados del lote
 
@@ -165,15 +167,15 @@ condiciones solo son detectables **en tiempo de análisis** cruzando la cadena i
 
 ### 4.2 Contrato de salida
 
-> **DEC-003 — Outcome de un chequeo fallido.** Recomendación: **excluir** el suministro del
-> scoring y **anotar** el motivo (en `resultados_ia.observaciones` del lote o en un log de
+> **DEC-003 — Outcome de un chequeo fallido (aceptada según recomendación, 2026-07-14).**
+> **Excluir** el suministro del scoring y **anotar** el motivo (en `resultados_ia.observaciones` del lote o en un log de
 > calidad), sin abortar el lote; abortar (marcar `Error`) solo si la fracción de registros
 > inválidos supera un umbral. Alternativas: (a) anotar sin excluir y dejar que el scoring
 > absorba el ruido; (b) fallar el lote ante cualquier inválido. Impacto: cobertura del análisis
 > vs. calidad del scoring.
 
-> **DEC-004 — Umbral de completitud del lote.** Recomendación: permitir el análisis si al menos
-> **95 %** de los suministros del lote pasan la validación; por debajo, marcar `Error` y exigir
+> **DEC-004 — Umbral de completitud del lote (aceptada según recomendación, 2026-07-14).** Se
+> permite el análisis si al menos **95 %** de los suministros del lote pasan la validación; por debajo, marcar `Error` y exigir
 > recarga. Alternativas: 90 %, 99 %, o sin umbral. Impacto: robustez de la cohorte (RD-009,
 > ADR-007 "cohorte completa") vs. tolerancia operativa.
 
@@ -191,10 +193,9 @@ esta etapa "duplicado" significa lo que la base **no** previene:
 | Consumo repetido entre lotes | El mismo período reimportado en un lote distinto (mismo `suministro_id` + rango, distinto `lote_id`) | — |
 | Near-duplicate de lecturas | Lecturas del mismo suministro con fechas muy próximas y valores idénticos | §7.5 |
 
-**Outcome propuesto:** las duplicidades no borran datos (el motor no modifica operativos, §1.2);
-se **anotan** y el período conflictivo se marca para no contarse dos veces en las ventanas de
-features (§6). Ver **DEC-005** para la política exacta (excluir el más reciente, el más antiguo,
-o promediar).
+**Outcome aceptado (DEC-005, 2026-07-14):** las duplicidades no borran datos (el motor no modifica
+operativos, §1.2); se **anotan** y el período conflictivo se marca para no contarse dos veces en
+las ventanas de features (§6), en lugar de excluir el más reciente, el más antiguo, o promediar.
 
 ---
 
@@ -230,7 +231,7 @@ DOMAIN_MODEL §8.5, ampliada con las señales que el IRE (§8.3) exige.
 ### 6.2 Manejo de nulos y cold-start por suministro
 
 El cold-start es **por suministro**, no solo por modelo: un suministro recién dado de alta no
-tiene 12 meses de historia. Política propuesta:
+tiene 12 meses de historia. Política aceptada (DEC-006/DEC-007, 2026-07-14):
 
 - Features de ventana larga con historia insuficiente ⇒ `null` explícito en el jsonb (no 0, que
   el modelo interpretaría como señal real).
@@ -257,9 +258,11 @@ auditables (fuerte para RN-012), mientras que Isolation Forest captura lo multiv
 | `iqr_outlier_flag` | `kwh_t` fuera de [Q1 − 1.5·IQR, Q3 + 1.5·IQR] | cohorte |
 
 Estos indicadores producen directamente `Anomalías` de tipo `Desvío Estadístico` (§8.2) cuando
-superan sus umbrales, y alimentan factores del IRE (§10). **DEC-008**: definir el peer group
-(categoría × localidad vs. solo categoría) según el tamaño típico de cohorte de los datos reales,
-que hoy se desconocen (staging pendiente, PROJECT_MASTER_SPEC #8).
+superan sus umbrales, y alimentan factores del IRE (§10). **DEC-008 (aceptada según
+recomendación, 2026-07-14):** el peer group es categoría × localidad, con fallback a categoría
+sola. El umbral exacto de "cohorte chica" que dispara ese fallback se calibra con el tamaño
+típico de cohorte de los datos reales, que hoy se desconocen (staging pendiente,
+PROJECT_MASTER_SPEC #8) — esa calibración numérica queda abierta; la elección del peer group no.
 
 ---
 
@@ -269,7 +272,7 @@ La **rama de reglas** (ADR-005) codifica los casos conocidos y explícitos: cada
 una regla nombrada, satisfaciendo RN-012 de forma directa. Genera `Anomalías` de tipos concretos
 del catálogo cerrado de §8.2.
 
-| Regla | Condición (propuesta v1) | Tipo de Anomalía (§8.2) | Severidad |
+| Regla | Condición (aceptada v1, DEC-009) | Tipo de Anomalía (§8.2) | Severidad |
 |---|---|---|---|
 | R1 | `zero_consumption_streak ≥ 3` con suministro activo | `Persistencia Anómala` | Alta |
 | R2 | `pct_change_prev_period ≤ −60 %` sostenida ≥ 2 períodos | `Caída Brusca` | Alta |
@@ -292,8 +295,8 @@ One-Class SVM (ADR-005). Persiste en `predicciones` y `resultados_ia`.
 
 ### 9.1 Estrategia de entrenamiento
 
-> **DEC-010 — Modelo global vs. por categoría.** Recomendación: **un modelo por categoría
-> tarifaria** cuando la categoría tenga volumen suficiente (p. ej. ≥ 1.000 suministros), con
+> **DEC-010 — Modelo global vs. por categoría (aceptada según recomendación, 2026-07-14).** **Un
+> modelo por categoría tarifaria** cuando la categoría tenga volumen suficiente (p. ej. ≥ 1.000 suministros), con
 > fallback a un **modelo global** para categorías chicas. Fundamento: RD-009 exige comparar
 > dentro de la cohorte; un modelo por categoría lo respeta por construcción. Alternativa: modelo
 > único global con la categoría como feature (F17). Impacto: precisión de cohorte vs. cantidad de
@@ -301,13 +304,13 @@ One-Class SVM (ADR-005). Persiste en `predicciones` y `resultados_ia`.
 
 ### 9.2 Hiperparámetros
 
-| Parámetro | Default propuesto | Decisión |
+| Parámetro | Valor aceptado | Resolución |
 |---|---|---|
-| `contamination` | `0.03` (≈ 3 % anómalos esperados) | **DEC-011** |
-| `n_estimators` | `200` | **DEC-012** |
-| `max_samples` | `256` (default de la técnica) | **DEC-012** |
+| `contamination` | `0.03` (≈ 3 % anómalos esperados) | **DEC-011** (aceptada, 2026-07-14) |
+| `n_estimators` | `200` | **DEC-012** (aceptada, 2026-07-14) |
+| `max_samples` | `256` (default de la técnica) | **DEC-012** (aceptada, 2026-07-14) |
 | `random_state` | fijo (reproducibilidad, RD-028) | — |
-| Escalado de features | `RobustScaler` (resistente a outliers, que son justo la señal) | incluido en **DEC-006** |
+| Escalado de features | `RobustScaler` (resistente a outliers, que son justo la señal) | incluido en **DEC-006** (aceptada, 2026-07-14) |
 
 ### 9.3 Normalización del score a 0-100
 
@@ -319,10 +322,11 @@ anómalos (puede ser negativo, por eso `resultados_ia.score_anomalia` es `numeri
 - **normalizado a [0,1]** en `resultados_ia.probabilidad` (CHECK 0-1) y `predicciones.score`,
 - la contribución del ML al IRE se calcula desde el normalizado (§10).
 
-> **DEC-013 — Método de normalización.** Recomendación: escala **min-max invertida por lote**
-> sobre los scores del lote (0 = menos anómalo, 100 = más anómalo), calibrada para que la
-> `contamination` esperada caiga sobre el umbral de "Atención". Alternativa: mapeo por percentiles
-> del score histórico. Impacto: estabilidad del IRE entre lotes de distinto tamaño.
+> **DEC-013 — Método de normalización (aceptada según recomendación, 2026-07-14).** Escala
+> **min-max invertida por lote** sobre los scores del lote (0 = menos anómalo, 100 = más
+> anómalo), calibrada para que la `contamination` esperada caiga sobre el umbral de "Atención".
+> Alternativa descartada: mapeo por percentiles del score histórico. Impacto: estabilidad del IRE
+> entre lotes de distinto tamaño.
 
 ### 9.4 Persistencia y versionado
 
@@ -355,7 +359,7 @@ Cada factor se normaliza a [0,100] y se pondera:
 IRE = Σ (wᵢ · factorᵢ)   con Σ wᵢ = 1
 ```
 
-| Factor (§8.3, canónico) | Fuente de cálculo | Peso propuesto (wᵢ) |
+| Factor (§8.3, canónico) | Fuente de cálculo | Peso aceptado (wᵢ) |
 |---|---|---|
 | Score del modelo IA | §9.3 normalizado | 0.30 |
 | Historial de consumos | `deviation_from_baseline` (F9) | 0.15 |
@@ -370,11 +374,11 @@ Suma = 1.00. **En v1** el factor "inspecciones anteriores" es 0 (no hay feedback
 **redistribuye proporcionalmente** entre los otros siete, y así se documenta explícitamente en
 lugar de simular un dato inexistente.
 
-> **DEC-014 — Pesos del IRE.** Recomendación: la tabla anterior, con el score de IA como factor
-> dominante (0.30) por ser el que captura lo multivariado, y persistencia + variación + historial
-> juntos (0.45) para reflejar el comportamiento propio del suministro. Alternativas: pesos iguales
-> (0.125 c/u); esquema calibrado contra los primeros lotes reales. Impacto: forma del ranking de
-> inspecciones (RN-009).
+> **DEC-014 — Pesos del IRE (aceptada según recomendación, 2026-07-14).** La tabla anterior, con
+> el score de IA como factor dominante (0.30) por ser el que captura lo multivariado, y
+> persistencia + variación + historial juntos (0.45) para reflejar el comportamiento propio del
+> suministro. Alternativas descartadas: pesos iguales (0.125 c/u); esquema calibrado contra los
+> primeros lotes reales. Impacto: forma del ranking de inspecciones (RN-009).
 
 ### 10.2 Banding (nivel)
 
@@ -389,11 +393,12 @@ bandas. El diseño debe respetarlas exactamente:
 | 61 – 80 | Alto |
 | 81 – 100 | Crítico |
 
-> **DEC-015 — Mapeo IRE → clasificación.** `resultados_ia.clasificacion` tiene **4** valores
-> (`Normal`, `Atención`, `Alto Riesgo`, `Crítico`), pero `ire.nivel` tiene **5** bandas. Hay que
-> reconciliarlos. Recomendación: `0-20 → Normal`, `21-40 → Atención`, `41-70 → Alto Riesgo`,
-> `71-100 → Crítico`. Alternativa: colapsar Muy Bajo+Bajo → Normal y Medio → Atención. Impacto:
-> semántica del semáforo que ve el analista (US-012).
+> **DEC-015 — Mapeo IRE → clasificación (aceptada según recomendación, 2026-07-14).**
+> `resultados_ia.clasificacion` tiene **4** valores (`Normal`, `Atención`, `Alto Riesgo`,
+> `Crítico`), mientras que `ire.nivel` (columna generada, §10.2) tiene **5** bandas. El puente
+> definitivo entre ambas es: `0-20 → Normal`, `21-40 → Atención`, `41-70 → Alto Riesgo`,
+> `71-100 → Crítico`. La alternativa (colapsar Muy Bajo+Bajo → Normal y Medio → Atención) queda
+> descartada. Impacto: semántica del semáforo que ve el analista (US-012).
 
 ### 10.3 Contrato de explicabilidad (RN-012, RF-013)
 
@@ -407,8 +412,8 @@ por `ResultadoIA`, un **desglose por factor**:
   "reason": "Consumo 68% menor que el mismo período del año anterior" }
 ```
 
-Estructura propuesta: una lista de estos objetos, uno por factor con contribución no nula, más una
-razón legible por cada `Anomalía` (`anomalias.descripcion`).
+Estructura aceptada (DEC-016): una lista de estos objetos, uno por factor con contribución no
+nula, más una razón legible por cada `Anomalía` (`anomalias.descripcion`).
 
 > **Honestidad sobre la rama de ML (tensión de ADR-005).** La contribución del factor "Score del
 > modelo IA" es una **aproximación**: la explicación de Isolation Forest se deriva por atribución
@@ -417,40 +422,70 @@ razón legible por cada `Anomalía` (`anomalias.descripcion`).
 > justificación garantizada. Las ramas de reglas y estadística sí son causalmente explicables; el
 > desglose debe distinguir visualmente unas de otra.
 
-> **DEC-016 — Dónde persistir el desglose.** El esquema **no tiene** una columna estructurada
-> (jsonb) para el desglose del IRE. Recomendación: usar `resultados_ia.observaciones` (text) con el
-> JSON serializado en v1, y evaluar agregar una columna jsonb dedicada cuando el frontend lo
-> consuma (US-013). Alternativa: reconstruir el desglose on-demand desde `feature_vectors`. Impacto:
-> ver §16 (brecha de esquema).
+> **DEC-016 — Dónde persistir el desglose (aceptada según recomendación, 2026-07-14).** El
+> esquema **no tiene** una columna estructurada (jsonb) para el desglose del IRE. Se usa
+> `resultados_ia.observaciones` (text) con el JSON serializado en v1, y se evaluará agregar una
+> columna jsonb dedicada cuando el frontend lo consuma (US-013). Alternativa descartada:
+> reconstruir el desglose on-demand desde `feature_vectors`. Impacto: ver §16 (brecha de esquema).
 
 ---
 
 ## 11. Impacto Económico Estimado (IEE)
 
-El IEE (§8.4, RF-008) estima la pérdida potencial recuperable, insumo del ranking (RN-009) y de la
-gerencia. Se persiste en `impacto_economico` (`monto_estimado` ≥ 0, RD-027; `moneda` default `ARS`).
+El IEE (§8.4, RF-008) estima la pérdida energética recuperable, insumo del ranking (RN-009) y de
+la gerencia. **DEC-017 (resuelta por alternativa, 2026-07-14):** en v1 el IEE se expresa en
+**kWh** (energía no facturada), sin proxy tarifario ni parámetro de configuración de precio; la
+monetización queda diferida a v2, cuando exista una fuente real de precios por categoría
+tarifaria. Se persiste en `impacto_economico`; §11.2 documenta la convención v1 de mapeo a las
+columnas existentes de esa tabla.
 
 ### 11.1 Enfoque
 
 ```
-IEE = max(0, kwh_esperado − kwh_facturado) × precio_kwh
+IEE_kwh = max(0, kwh_esperado − kwh_facturado)
 ```
 
 - `kwh_esperado`: consumo legítimo estimado desde la línea base propia del suministro
   (`moving_avg_12m`, F8) o la mediana de su cohorte cuando no hay historia.
 - Se recorta a ≥ 0 (`max(0, …)`): solo la **sub-facturación** representa pérdida recuperable
-  (RD-027).
+  (RD-027 — el valor nunca es negativo, condición que se preserva en energía igual que en
+  moneda).
 - Debe ser **reproducible** (RD-028) y conservar histórico (RD-029): por eso se guarda por
   `ResultadoIA` con su `fecha_calculo`.
+- **Sin factor de precio.** A diferencia de un diseño monetizado, `IEE_kwh` no multiplica por
+  `precio_kwh`: ese dato no existe en el esquema (`categorias_tarifarias` solo tiene `nombre` y
+  `descripcion`) y DEC-017 descartó introducir un proxy de configuración para v1.
 
-### 11.2 Brecha de datos: no hay precio de tarifa
+### 11.2 Convención de persistencia en `impacto_economico` (v1, energía)
 
-> **DEC-017 — Proxy tarifario.** El esquema **no almacena precios**: `categorias_tarifarias` tiene
-> solo `nombre` y `descripcion`, sin `precio_kwh`. Sin precio no se puede monetizar el IEE.
-> Recomendación v1: un **parámetro de configuración** `precio_kwh_proxy` (un valor ARS/kWh, o un
-> mapa por categoría) inyectado al motor, hasta que exista una tabla de tarifas. Alternativa:
-> expresar el IEE en **kWh** (energía no facturada) y postergar la monetización. Impacto: §16
-> (brecha de esquema); comparabilidad de los reportes económicos (US-017, US-022).
+El esquema (`docker/postgres/init/01_schema.sql`, no modificado) define `impacto_economico` con
+semántica monetaria: `monto_estimado numeric(14,2) NOT NULL` con `CHECK (monto_estimado >= 0)`
+(RD-027) y `moneda varchar(3) NOT NULL DEFAULT 'ARS'`. Sin una tabla de tarifas, el motor no puede
+llenar esas columnas con un valor monetario real. Convención v1, sin alterar el esquema:
+
+| Columna | Contenido en v1 | Motivo |
+|---|---|---|
+| `monto_estimado` | El valor de `IEE_kwh`, en **kWh** (no en ARS) | `numeric(14,2)` admite la magnitud y precisión de un valor de energía sin cambios de tipo; el CHECK `>= 0` (RD-027) es igualmente válido para energía que para moneda |
+| `moneda` | `'kWh'` (en lugar del default `'ARS'`) | `varchar(3)` acepta el literal `'kWh'` sin cambios de esquema; funciona como discriminador explícito de que la fila está expresada en energía, no en moneda |
+| `fecha_calculo` | Sin cambios (RD-028, RD-029) | La reproducibilidad y el histórico no dependen de la unidad |
+
+Este es un **convenio de v1, documentado explícitamente para no confundir energía con dinero**:
+todo consumidor de `impacto_economico` (API, frontend, reportes) debe leer `moneda` antes de
+interpretar `monto_estimado`, y tratar `'kWh'` como señal de que el valor **no** es un monto en
+ARS. Cuando exista una fuente real de precios (v2), la migración consiste en recalcular
+`monto_estimado = IEE_kwh × precio_kwh` y volver a escribir `moneda = 'ARS'`; no requiere cambio
+de esquema, porque las columnas ya existen con los tipos correctos.
+
+### 11.3 Decisión de proxy tarifario (DEC-017)
+
+> **DEC-017 — Proxy tarifario (resuelta por alternativa, 2026-07-14).** El esquema **no
+> almacena precios**: `categorias_tarifarias` tiene solo `nombre` y `descripcion`, sin
+> `precio_kwh`. La recomendación original (un parámetro de configuración `precio_kwh_proxy`)
+> **no** fue la vía elegida: Rodrigo Zanin optó por la alternativa —expresar el IEE en **kWh**
+> (energía no facturada) y postergar la monetización a v2—, para no introducir un precio
+> inventado en configuración cuando no existe una fuente real de tarifas. Impacto: §16 (brecha de
+> esquema, reencuadrada); los reportes económicos (US-017, US-022) quedan en términos de energía
+> hasta v2.
 
 ---
 
@@ -516,28 +551,36 @@ Orden de escritura: `feature_vectors` (con `resultado_ia_id` nulo) → `predicci
 
 ---
 
-## 15. Decisiones pendientes de validación
+## 15. Decisiones validadas (2026-07-14)
 
-| ID | Tema | Recomendación | Alternativas | Impacto |
-|---|---|---|---|---|
-| DEC-001 | Granularidad del disparo (RN-005 per-consumo vs RN-013 per-lote) | Ratificar **per-lote** (transición a `Procesado`), leyendo RN-005 como "al finalizar el lote" | Reescribir RN-005 para alinearlo | Contrato del disparador; consistencia RN-005/RN-013 |
-| DEC-002 | Reproceso de un lote `Procesado` | **No reprocesar** (RD-010 terminal, RD-023 único) | Permitir reproceso con nueva versión de modelo, sobrescribiendo o agregando filas | Idempotencia; trazabilidad histórica |
-| DEC-003 | Outcome de validación de integridad fallida | **Excluir + anotar** el suministro; no abortar salvo umbral | Anotar sin excluir; fallar el lote entero | Cobertura del análisis vs. calidad del scoring |
-| DEC-004 | Umbral de completitud del lote | **≥ 95 %** de suministros válidos para analizar | 90 %, 99 %, sin umbral | Robustez de cohorte (RD-009) vs. tolerancia operativa |
-| DEC-005 | Definición y outcome de "duplicado" | Anotar y excluir el período conflictivo de las ventanas | Excluir más reciente / más antiguo; promediar | Calidad de features; conteo de consumo |
-| DEC-006 | Conjunto de features v1 | Las 17 features de §6.1 con `RobustScaler` | Subconjunto reducido; features derivadas adicionales | Poder de detección; costo de cómputo |
-| DEC-007 | Ventanas y mínimos de historia | 6/12 meses; mínimo 3 períodos para desvíos | 3/6 meses; mínimos distintos | Cold-start; sensibilidad |
-| DEC-008 | Peer group de cohorte | Categoría × localidad, fallback a categoría | Solo categoría; categoría × barrio | Comparabilidad (RD-009); tamaño de cohorte |
-| DEC-009 | Umbrales de las reglas v1 | Los de la tabla §8 (−60 %, +200 %, racha 3, p1/p99) | Umbrales calibrados con datos reales | Falsos positivos de la rama de reglas |
-| DEC-010 | Modelo global vs. por categoría | **Por categoría** (≥ 1.000 suministros), fallback global | Único global con categoría como feature | Precisión de cohorte vs. modelos a mantener |
-| DEC-011 | `contamination` de Isolation Forest | **0.03** | `'auto'`; 0.01–0.05 | Tasa base de anomalías |
-| DEC-012 | `n_estimators` / `max_samples` | **200 / 256** | 100 / `'auto'`; valores mayores | Precisión vs. tiempo (RNF-001) |
-| DEC-013 | Normalización del score a 0-100 | Min-max invertida por lote, calibrada a `contamination` | Percentiles del score histórico | Estabilidad del IRE entre lotes |
-| DEC-014 | Pesos del IRE (8 factores §8.3) | Tabla §10.1 (IA 0.30 dominante) | Pesos iguales; calibración empírica | Forma del ranking (RN-009) |
-| DEC-015 | Mapeo IRE (5 bandas) → clasificación (4 valores) | 0-20 Normal / 21-40 Atención / 41-70 Alto Riesgo / 71-100 Crítico | Colapsar Muy Bajo+Bajo → Normal | Semáforo del analista (US-012) |
-| DEC-016 | Persistencia del desglose de explicabilidad | JSON en `resultados_ia.observaciones` (v1); columna jsonb dedicada (futuro) | Reconstruir on-demand desde `feature_vectors` | RN-012/RF-013; brecha de esquema (§16) |
-| DEC-017 | Proxy tarifario para el IEE | Parámetro `precio_kwh_proxy` (config), o IEE en kWh | Postergar monetización | Reportes económicos (US-017/US-022); brecha de esquema |
-| DEC-018 | Política de reentrenamiento v1 | (Re)ajuste no supervisado por lote; Aprendizaje Continuo supervisado en v2 | Modelo estático; reentrenamiento programado | Deriva del modelo; dependencia del Feedback Loop |
+Las 18 decisiones fueron validadas por Rodrigo Zanin el 2026-07-14. Salvo DEC-017, todas se
+resolvieron según su recomendación por defecto.
+
+| ID | Tema | Recomendación | Alternativas | Impacto | Resolución |
+|---|---|---|---|---|---|
+| DEC-001 | Granularidad del disparo (RN-005 per-consumo vs RN-013 per-lote) | Ratificar **per-lote** (transición a `Procesado`), leyendo RN-005 como "al finalizar el lote" | Reescribir RN-005 para alinearlo | Contrato del disparador; consistencia RN-005/RN-013 | Aceptada según recomendación (2026-07-14) |
+| DEC-002 | Reproceso de un lote `Procesado` | **No reprocesar** (RD-010 terminal, RD-023 único) | Permitir reproceso con nueva versión de modelo, sobrescribiendo o agregando filas | Idempotencia; trazabilidad histórica | Aceptada según recomendación (2026-07-14) |
+| DEC-003 | Outcome de validación de integridad fallida | **Excluir + anotar** el suministro; no abortar salvo umbral | Anotar sin excluir; fallar el lote entero | Cobertura del análisis vs. calidad del scoring | Aceptada según recomendación (2026-07-14) |
+| DEC-004 | Umbral de completitud del lote | **≥ 95 %** de suministros válidos para analizar | 90 %, 99 %, sin umbral | Robustez de cohorte (RD-009) vs. tolerancia operativa | Aceptada según recomendación (2026-07-14) |
+| DEC-005 | Definición y outcome de "duplicado" | Anotar y excluir el período conflictivo de las ventanas | Excluir más reciente / más antiguo; promediar | Calidad de features; conteo de consumo | Aceptada según recomendación (2026-07-14) |
+| DEC-006 | Conjunto de features v1 | Las 17 features de §6.1 con `RobustScaler` | Subconjunto reducido; features derivadas adicionales | Poder de detección; costo de cómputo | Aceptada según recomendación (2026-07-14) |
+| DEC-007 | Ventanas y mínimos de historia | 6/12 meses; mínimo 3 períodos para desvíos | 3/6 meses; mínimos distintos | Cold-start; sensibilidad | Aceptada según recomendación (2026-07-14) |
+| DEC-008 | Peer group de cohorte | Categoría × localidad, fallback a categoría | Solo categoría; categoría × barrio | Comparabilidad (RD-009); tamaño de cohorte | Aceptada según recomendación (2026-07-14) |
+| DEC-009 | Umbrales de las reglas v1 | Los de la tabla §8 (−60 %, +200 %, racha 3, p1/p99) | Umbrales calibrados con datos reales | Falsos positivos de la rama de reglas | Aceptada según recomendación (2026-07-14) |
+| DEC-010 | Modelo global vs. por categoría | **Por categoría** (≥ 1.000 suministros), fallback global | Único global con categoría como feature | Precisión de cohorte vs. modelos a mantener | Aceptada según recomendación (2026-07-14) |
+| DEC-011 | `contamination` de Isolation Forest | **0.03** | `'auto'`; 0.01–0.05 | Tasa base de anomalías | Aceptada según recomendación (2026-07-14) |
+| DEC-012 | `n_estimators` / `max_samples` | **200 / 256** | 100 / `'auto'`; valores mayores | Precisión vs. tiempo (RNF-001) | Aceptada según recomendación (2026-07-14) |
+| DEC-013 | Normalización del score a 0-100 | Min-max invertida por lote, calibrada a `contamination` | Percentiles del score histórico | Estabilidad del IRE entre lotes | Aceptada según recomendación (2026-07-14) |
+| DEC-014 | Pesos del IRE (8 factores §8.3) | Tabla §10.1 (IA 0.30 dominante) | Pesos iguales; calibración empírica | Forma del ranking (RN-009) | Aceptada según recomendación (2026-07-14) |
+| DEC-015 | Mapeo IRE (5 bandas) → clasificación (4 valores) | 0-20 Normal / 21-40 Atención / 41-70 Alto Riesgo / 71-100 Crítico | Colapsar Muy Bajo+Bajo → Normal | Semáforo del analista (US-012) | Aceptada según recomendación (2026-07-14) |
+| DEC-016 | Persistencia del desglose de explicabilidad | JSON en `resultados_ia.observaciones` (v1); columna jsonb dedicada (futuro) | Reconstruir on-demand desde `feature_vectors` | RN-012/RF-013; brecha de esquema (§16) | Aceptada según recomendación (2026-07-14) |
+| DEC-017 | Proxy tarifario para el IEE | Parámetro `precio_kwh_proxy` (config), o IEE en kWh | Postergar monetización | Reportes económicos (US-017/US-022); brecha de esquema | Resuelta por alternativa: IEE en kWh, sin monetización en v1 (2026-07-14) |
+| DEC-018 | Política de reentrenamiento v1 | (Re)ajuste no supervisado por lote; Aprendizaje Continuo supervisado en v2 | Modelo estático; reentrenamiento programado | Deriva del modelo; dependencia del Feedback Loop | Aceptada según recomendación (2026-07-14) |
+
+> **Nota sobre DEC-001.** La aceptación incluyó, además de ratificar la granularidad per-lote,
+> la reformulación directa de RN-005 en `docs/01-business/BUSINESS_ANALYSIS.md` §15 —en lugar de
+> dejar la lectura implícita "RN-005 como 'al finalizar el lote'"— para eliminar de forma
+> permanente la contradicción de fuente documentada en §2.1.
 
 ---
 
@@ -546,8 +589,11 @@ Orden de escritura: `feature_vectors` (con `resultado_ia_id` nulo) → `predicci
 El diseño **no modifica** `docker/postgres/init/01_schema.sql`. Se señalan las columnas que el
 motor necesitaría y que hoy no existen, para decisión posterior (no se agregan aquí):
 
-1. **Precio de tarifa ausente** (bloquea el IEE monetizado). `categorias_tarifarias` no tiene
-   `precio_kwh` ni existe tabla de tarifas. Mitigado por **DEC-017** (proxy en config o IEE en kWh).
+1. **Precio de tarifa ausente** (bloquea únicamente la monetización del IEE, no v1 en sí).
+   `categorias_tarifarias` no tiene `precio_kwh` ni existe tabla de tarifas. Resuelto para v1 por
+   **DEC-017** (2026-07-14): el IEE se expresa en kWh (§11), sin depender de un precio. La brecha
+   queda registrada como trabajo de v2 (incorporar una fuente real de tarifas y migrar
+   `impacto_economico` a monto monetario, §11.2), no como bloqueo de v1.
 2. **Sin columna estructurada para el desglose del IRE** (RN-012). No hay jsonb dedicado al
    breakdown factor→contribución→razón; se usa `resultados_ia.observaciones` (text). Ver **DEC-016**.
 3. **Sin columna para hiperparámetros del modelo** (RD-049: "debe registrarse la configuración
@@ -555,8 +601,8 @@ motor necesitaría y que hoy no existen, para decisión posterior (no se agregan
    (contamination, n_estimators, ventana de entrenamiento). En v1 puede ir embebida en
    `modelos_ia.version` o `nombre`, pero es una brecha real frente a RD-049.
 
-Ninguna es bloqueante para v1 con las mitigaciones propuestas; las tres se registran como deuda de
-esquema.
+Ninguna es bloqueante para v1 con las mitigaciones aceptadas (§15); las tres se registran como
+deuda de esquema para v2.
 
 ---
 

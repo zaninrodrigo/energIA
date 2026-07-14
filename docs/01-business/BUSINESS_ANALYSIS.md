@@ -6,7 +6,12 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
-| 0.2.0 | 2026-07-03 | Borrador | Rodrigo Zanin |
+| 0.3.0 | 2026-07-14 | Borrador | Rodrigo Zanin |
+
+> **Nota de versión (0.3.0).** RN-005 reformulada para alinear con RN-013 y ADR-007 (DEC-001,
+> validada por Rodrigo Zanin el 2026-07-14): el disparo del Motor de Inteligencia Energética
+> pasa de granularidad por consumo a granularidad por lote. Detalle de la decisión en
+> `docs/04-ai/AI_ENGINE_SPEC.md` §15 (DEC-001).
 
 Este documento reúne el análisis de negocio de EnergIA: el contexto operativo de la distribuidora eléctrica, los procesos de facturación e inspección que la plataforma busca optimizar, las reglas de negocio, el glosario de términos, los KPIs de seguimiento y el valor diferencial del proyecto. Los antiguos anexos A a F quedan integrados en las secciones correspondientes de este documento.
 
@@ -196,7 +201,7 @@ Los consumos son generados únicamente a partir de procesos de facturación por 
 
 #### RN-005
 
-Cada nuevo consumo procesado deberá ser analizado automáticamente por el Motor de Inteligencia Energética.
+Todo lote de facturación deberá ser analizado automáticamente por el Motor de Inteligencia Energética al completar su procesamiento.
 
 ---
 
