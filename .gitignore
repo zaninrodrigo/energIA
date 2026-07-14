@@ -31,7 +31,11 @@ coverage/
 .DS_Store
 
 # Data (keep samples only, never raw datasets)
+# Not root-anchored: the synthetic generator's own README has always documented running it from
+# backend/ (`cd backend && make seed-synthetic ...`), which writes to backend/datasets/synthetic/
+# -- a root-anchored `datasets/synthetic/` never matched that real output path.
 datasets/raw/
+**/datasets/synthetic/
 *.parquet
 *.sqlite
 

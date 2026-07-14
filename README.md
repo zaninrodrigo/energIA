@@ -68,6 +68,37 @@ make run       # uvicorn con reload en http://localhost:8000
 
 Detalle completo (targets de Makefile, estructura, variables de entorno) en [`backend/README.md`](./backend/README.md).
 
+## Datos sintéticos
+
+`backend/src/energia/tools/synthetic/` genera un dataset determinístico de clientes,
+suministros, lecturas y consumos, y lo carga en una instancia de EnergIA a través de su propia
+API de importación (no escribe directo a la base). Sirve para tener datos de prueba realistas
+—con estacionalidad, tendencia y anomalías de consumo conocidas— sin depender de acceso a Oracle
+(todavía no existe, ADR-004) ni de un archivo histórico real.
+
+**Uso rápido** (con la API corriendo, `cd backend && make run` en otra terminal):
+
+```bash
+cd backend
+make seed-synthetic BASE_URL=http://localhost:8000 SCALE=small SEED=42
+```
+
+| Concepto | Qué es |
+|---|---|
+| `--scale` | Tamaño del dataset: `small` (100 suministros/24 meses), `medium` (1000/36), `large` (5000/36) |
+| `--seed` | Semilla determinística: misma semilla + escala → mismo dataset y manifiesto, byte a byte. Cada identidad natural (`numero_suministro`, `numero_cliente`, `codigo_lote`) incluye la semilla (p. ej. `SYN-S42-SUM-00001`), así que dos semillas distintas nunca colisionan ni se pisan entre sí al cargarse contra la misma instancia |
+| Anomalías de fuerza de regla | `sudden_drop` (caída 60-80%, permanente), `zero_consumption_streak` (3-6 meses en cero), `gradual_decline` (-5%/mes durante 12 meses), `spike` (un mes 3-5x, no fraudulento) — cada una calibrada para disparar, con margen, alguna regla R1/R2/R3 (`AI_ENGINE_SPEC.md` sec. 8) |
+| Anomalías sub-umbral | `sudden_drop_leve` (caída 30-50%, deliberadamente por debajo del -60% de R2) y `spike_leve` (multiplicador 1.8-2.6x, por debajo del +200% de R3) — a estas solo las puede detectar el motor estadístico o Isolation Forest, nunca las reglas de negocio; existen para aislar el aporte real de esas dos ramas del motor |
+| `manifest.json` | Ground truth: qué suministro recibió qué anomalía, en qué período y con qué parámetros — se escribe en `datasets/synthetic/<scale>-seed<seed>/manifest.json`. Para `sudden_drop(_leve)`/`spike(_leve)`, `parametros.pct_change_first_month` es el cambio porcentual REALIZADO (calculado directo de los `kwh` persistidos, nunca a partir del parámetro sorteado), para que ningún consumidor de calibración tenga que re-derivarlo |
+
+El manifiesto es lo que le da valor al dataset: al no depender de datos reales etiquetados
+(que no existen todavía), es la única forma de saber con certeza qué debería detectar el Motor
+de Inteligencia Energética al procesar este dataset — la referencia para calibrar y probar sus
+Etapas 3 a 6 (reglas de negocio, estadística e Isolation Forest, `docs/04-ai/AI_ENGINE_SPEC.md`
+secciones 6 a 9) antes de tener datos de producción reales.
+
+Detalle completo (flags, estructura de módulos) en [`backend/README.md`](./backend/README.md).
+
 ## Estructura del repositorio
 
 ```

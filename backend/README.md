@@ -55,6 +55,39 @@ Variables de entorno leídas por `energia.shared.config.Settings` (ver `../env.e
 `POSTGRES_HOST`, `POSTGRES_HOST_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`
 ensamblan la URL de conexión; `DATABASE_URL`, si está definida, la reemplaza por completo.
 
+## Datos sintéticos
+
+`energia.tools.synthetic` genera un dataset determinístico y lo carga en una instancia de
+EnergIA a través de su API real de importación (clientes, suministros, lotes, lecturas,
+consumos), plantando anomalías de consumo conocidas y registrándolas en un manifiesto de ground
+truth (`manifest.json`). Sirve como fixture para calibrar y probar el Motor de Inteligencia
+Energética (Etapas 3-6, `docs/04-ai/AI_ENGINE_SPEC.md` secciones 6-9) — ver la sección "Datos
+sintéticos" del README raíz para el detalle completo (qué genera, qué contiene el manifiesto,
+cómo interpretar el resultado).
+
+Requiere una instancia de la API corriendo (`make run` en otra terminal):
+
+```bash
+make seed-synthetic BASE_URL=http://localhost:8000 SCALE=small SEED=42
+```
+
+**Flags de `python -m energia.tools.synthetic`** (invocado por el target de arriba):
+
+| Flag | Default | Notas |
+|---|---|---|
+| `--base-url` | `http://localhost:8000` | Instancia de la API donde importar |
+| `--scale` | `small` | `small` (100 suministros/24 meses), `medium` (1000/36), `large` (5000/36) |
+| `--seed` | `42` | Misma semilla + escala = mismo dataset y manifiesto, byte a byte. Cada identidad natural (`numero_suministro`, `numero_cliente`, `codigo_lote`) incluye la semilla, así que dos semillas distintas producen datasets disjuntos (nunca se pisan al cargarse contra la misma instancia) |
+| `--years` | (según `--scale`) | `2` o `3`; sobrescribe la cantidad de meses por defecto de la escala |
+| `--out` | `datasets/synthetic/` | El manifiesto se escribe en `<out>/<scale>-seed<seed>/manifest.json` |
+| `--batch-size` | `500` | Registros máximos por POST de importación |
+
+### Esquema de `manifest.json`
+
+- `anomalias[].tipo`: una de las 4 formas de fuerza de regla (`sudden_drop`, `zero_consumption_streak`, `gradual_decline`, `spike`) o una de las 2 formas sub-umbral (`sudden_drop_leve`, `spike_leve`) -- ver `anomalies.py` para el detalle de cada una y por qué existen las sub-umbral (aislar el aporte de las ramas estadística/Isolation Forest del motor, que un dataset con solo anomalías de fuerza de regla no puede demostrar).
+- `anomalias[].parametros.pct_change_first_month` (solo para los 4 tipos anclados: `sudden_drop(_leve)`/`spike(_leve)`): el cambio porcentual mes a mes REALIZADO en el primer mes afectado, calculado directamente de los valores de `kwh` efectivamente persistidos -- no re-derivado del parámetro sorteado (`drop_fraction`/`multiplier`), que por sí solo no garantiza ese resultado exacto una vez aplicados estacionalidad/tendencia/ruido.
+- `anomalias[].periodos_afectados` vs `parametros.duration_months` (solo en `gradual_decline`): son alcances distintos. `periodos_afectados` es la cola completa desde `periodo_inicio` hasta el final de la serie de ese suministro (la caída se sostiene de forma permanente). `parametros.duration_months` es solo la ventana activa de declive (-5%/mes, hasta 12 meses); después de esa ventana el consumo queda constante en el nivel alcanzado, pero sigue contando dentro de `periodos_afectados`.
+
 ## Estructura
 
 ```
@@ -64,6 +97,8 @@ backend/
     shared/          # config y wiring de base de datos, transversal a todos los contextos
     contexts/         # un paquete por bounded context (ver contexts/README.md)
       clientes/         # Gestión de Clientes — implementado (US-001, import + listado)
+    tools/
+      synthetic/       # generador de datos sintéticos (ver "Datos sintéticos" arriba)
   tests/
     unit/            # sin red ni DB real
     integration/      # contra energia-db real
