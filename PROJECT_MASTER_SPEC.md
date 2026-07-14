@@ -24,7 +24,7 @@ Este documento es el índice maestro de toda la documentación de EnergIA. Reún
 | `docs/03-architecture/SOFTWARE_ARCHITECTURE_DOCUMENT.md` | Documento de arquitectura de software | Esqueleto (sin contenido, salvo §19 Decisiones Arquitectónicas) |
 | `docs/03-architecture/adr/` | Architectural Decision Records (ADR-001 a ADR-007) | Aceptados (2026-07-06) |
 | `docs/03-architecture/API_SPEC.md` | Especificación de la API REST del backend | En progreso (Clientes, Suministros y Consumos —`Lectura`, `Lote de Facturación` y `Consumo`, las tres entidades de §4.3 completas— documentados) |
-| `docs/04-ai/AI_ENGINE_SPEC.md` | Especificación del Motor de Inteligencia Energética | Pendiente |
+| `docs/04-ai/AI_ENGINE_SPEC.md` | Especificación del Motor de Inteligencia Energética | Propuesto (v1.0.0, pendiente de validación) |
 | `docs/04-ai/DATA_SCIENCE_NOTEBOOK.md` | Plan de análisis exploratorio de datos | Pendiente |
 | `docs/05-devops/SECURITY_SPEC.md` | Especificación de seguridad (autenticación, autorización, OWASP) | Pendiente |
 | `docs/05-devops/TESTING_SPEC.md` | Estrategia de testing (unitario, integración, E2E) | Pendiente |
