@@ -2,6 +2,7 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
+| 0.8.0 | 2026-07-14 | En progreso (Contexto: Motor de Inteligencia Energética — `POST /api/v1/motor/lotes/{codigo_lote}/procesar`, Etapa 1 / US-006 + US-010 — documentado) | Rodrigo Zanin |
 | 0.7.0 | 2026-07-13 | En progreso (DECISIÓN #9 — resurrección al reimportar una clave natural soft-deleted, los cinco endpoints de importación ganan `restored`— y DECISIÓN #13 — `DELETE /api/v1/consumos/{id}`, corrección de períodos — documentadas) | Rodrigo Zanin |
 | 0.6.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura`, `Lote de Facturación` y `Consumo`, las tres entidades de §4.3 completas— documentados) | Rodrigo Zanin |
 | 0.5.0 | 2026-07-13 | En progreso (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos —`Lectura` y `Lote de Facturación`— documentados) | Rodrigo Zanin |
@@ -476,12 +477,84 @@ Lista paginada de consumos vigentes (excluye soft-deleted, `deleted_at IS NULL`)
 
 `suministro_id`/`lote_id`/`lectura_id` se exponen como UUID, no como sus claves naturales — misma decisión documentada para `cliente_id`/`categoria_tarifaria_id` en Gestión de Suministros, y pendiente por la misma razón.
 
+## Contexto: Motor de Inteligencia Energética
+
+Épica 2 slice 1 (US-006 "validar la integridad de los datos importados" + US-010, el disparo del motor). Documenta Etapa 1 únicamente (validación de integridad, `docs/04-ai/AI_ENGINE_SPEC.md` §4); las Etapas 2-8 (duplicados, features, estadística, reglas, Isolation Forest, IRE, IEE) no están implementadas todavía.
+
+### POST /api/v1/motor/lotes/{codigo_lote}/procesar
+
+Ejecuta la Etapa 1 sobre el lote `codigo_lote`: valida que su carga esté completa (AI_ENGINE_SPEC.md §2.1), corre los 7 chequeos de integridad (V1-V7, §4.1) sobre su cadena importada (`consumos` + `lecturas` + `suministros` + `categorias_tarifarias`) y decide su `estado` final.
+
+**Disparador corregido (STEP 0, AI_ENGINE_SPEC.md §2.1-§2.2, 2026-07-14):** este endpoint actúa sobre un lote `Pendiente` (o `Error`, reintento) — es el propio motor quien lo transiciona a `Procesando` y luego a `Procesado`/`Error`, nunca al revés. La versión previa de esta especificación (todavía sin implementar) describía el disparo sobre un lote ya `Procesado`, una inconsistencia interna corregida junto con esta implementación (ver AI_ENGINE_SPEC.md §2 para el detalle completo).
+
+**Path param**:
+
+| Parámetro | Tipo | Notas |
+|---|---|---|
+| `codigo_lote` | string | Clave natural del `Lote` (`lotes.codigo_lote`) |
+
+**Precondiciones y sus códigos de error** (evaluadas en este orden):
+
+| Código | Causa |
+|---|---|
+| 404 | No existe un lote (no soft-deleted) con ese `codigo_lote`. |
+| 409 | El lote ya está `Procesado` — terminal (RD-010: "un lote no puede ejecutarse dos veces"); no se reprocesa. Detectado al inicio, o al releer el estado tras perder la carrera optimista hacia `Procesando` (fila siguiente) si una ejecución concurrente ya lo completó. |
+| 409 | El lote está `Procesando` — ya en ejecución. Detectado al inicio, o revelado por esa misma relectura si la ejecución concurrente que ganó la carrera todavía no terminó. |
+| 409 | El lote perdió la carrera optimista hacia `Procesando` y, al releerlo, ya finalizó en `Error` — puede reintentarse. |
+| 409 | El lote fue modificado durante el análisis: un consumo activo se insertó (o se eliminó) para ese mismo `lote_id` entre el gate de completitud y la relectura posterior a la lectura de la cadena importada — reintente (AI_ENGINE_SPEC.md §2.5, `LoteModificadoError`). |
+| 422 | El lote no está completo (AI_ENGINE_SPEC.md §2.1: `cantidad_registros == 0`, o la cantidad de `consumos` activos no coincide con `cantidad_registros`). El `estado` del lote **no cambia** en este caso. |
+
+**Respuesta 422** — cuerpo con ambos números comparados, para que el llamador entienda la brecha exacta:
+
+```json
+{
+  "detail": {
+    "detail": "el lote no está completo",
+    "cantidad_registros": 5,
+    "consumos_activos": 2,
+    "motivo": "cantidad de consumos activos (2) no coincide con cantidad_registros declarada (5)"
+  }
+}
+```
+
+**Response 200** — `ProcesarLoteResponse`, en AMBOS desenlaces del umbral de completitud (DEC-004): que el lote termine `Procesado` o `Error` es un resultado legítimo de una ejecución exitosa del motor — la request en sí tuvo éxito. Solo las precondiciones de la tabla anterior son errores HTTP.
+
+```json
+{
+  "estado_final": "Procesado",
+  "informe": {
+    "lote_id": "5b1b6e0e-...-...",
+    "total_suministros": 3,
+    "suministros_excluidos": 0,
+    "fraccion_valida": "1",
+    "umbral_cumplido": true,
+    "hallazgos": [],
+    "exclusiones": []
+  }
+}
+```
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `estado_final` | string | `"Procesado"` (`fraccion_valida >= 0.95`, DEC-004) o `"Error"` (por debajo del umbral) |
+| `informe.lote_id` | UUID | — |
+| `informe.total_suministros` | integer | Suministros distintos con al menos un consumo activo en el lote |
+| `informe.suministros_excluidos` | integer | Suministros con al menos un hallazgo V1-V7 (DEC-003: excluir + anotar, no abortar el lote) |
+| `informe.fraccion_valida` | string (decimal) | `(total_suministros - suministros_excluidos) / total_suministros` — serializado como string, igual que `kwh`/`consumo_promedio_diario` en Gestión de Consumos (precisión de `Decimal`, no de `float`) |
+| `informe.umbral_cumplido` | boolean | `fraccion_valida >= 0.95` (DEC-004) |
+| `informe.hallazgos` | array | Uno por chequeo V1-V7 disparado: `{ "check": "V5", "suministro_id": "...", "consumo_id": "...", "motivo": "..." }` |
+| `informe.exclusiones` | array | Uno por suministro excluido: `{ "suministro_id": "...", "motivos": ["V1: ...", "V7: ..."] }` — todos los motivos de ese suministro, no solo el primero |
+
+**Persistencia (implementación v1, ver AI_ENGINE_SPEC.md §4.2 para el detalle completo):** el `informe` de esta respuesta **no se persiste** en base de datos — `resultados_ia` exige `modelo_ia_id`/`clasificacion` (`NOT NULL`), que no existen hasta la etapa de scoring (§9). El único efecto persistente de este endpoint es la transición de `lotes.estado`.
+
+**Idempotencia y concurrencia**: una segunda solicitud sobre un lote ya `Procesado` responde 409 (RD-010). Una solicitud concurrente contra el MISMO lote `Pendiente`/`Error` se resuelve por una transición optimista (`UPDATE ... WHERE estado IN (...)`, AI_ENGINE_SPEC.md §2.3): solo una gana la carrera hacia `Procesando`, la otra recibe 409. Un lote que aterrizó en `Error` admite reintento (`Error → Procesando`, decisión de negocio 2026-07-13): una nueva solicitud vuelve a correr los chequeos desde cero.
+
 ## Contenido pendiente (otros contextos)
 
 - Convenciones generales de la API (formato de URLs, versionado, paginación, filtros y ordenamiento).
 - Formato estándar de request/response (JSON, envoltorios de éxito y error).
 - Autenticación y autorización (JWT, roles, scopes) y su relación con SECURITY_SPEC.md.
-- Endpoints por contexto delimitado restante: Motor de Inteligencia Energética, Inspecciones, Integración con RRHH. Gestión de Consumos ya no tiene pendientes propios: `Lectura`, `Lote de Facturación` y `Consumo` (§4.3, completo) tienen endpoints. (Gestión de Clientes, Gestión de Suministros y Gestión de Consumos: ver secciones propias arriba.)
+- Endpoints por contexto delimitado restante: Inspecciones, Integración con RRHH. Gestión de Consumos ya no tiene pendientes propios: `Lectura`, `Lote de Facturación` y `Consumo` (§4.3, completo) tienen endpoints. El Motor de Inteligencia Energética tiene su Etapa 1 documentada (ver sección propia arriba); las Etapas 2-8 quedan pendientes. (Gestión de Clientes, Gestión de Suministros, Gestión de Consumos y Motor de Inteligencia Energética: ver secciones propias arriba.)
 - Modelos de datos (schemas Pydantic) de entrada y salida por endpoint.
 - Catálogo de códigos de error y formato estándar de mensajes de error.
 - Estrategia de versionado de la API y política de compatibilidad hacia atrás.

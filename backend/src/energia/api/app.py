@@ -12,6 +12,7 @@ from energia.contexts.consumos.presentation.routes import (
     lecturas_router,
     lotes_router,
 )
+from energia.contexts.motor.presentation.routes import motor_router
 from energia.contexts.suministros.presentation.routes import router as suministros_router
 from energia.shared.config import get_settings
 from energia.shared.db import build_engine, build_sessionmaker
@@ -42,4 +43,5 @@ def create_app() -> FastAPI:
     app.include_router(lecturas_router)
     app.include_router(lotes_router)
     app.include_router(consumos_router)
+    app.include_router(motor_router)
     return app

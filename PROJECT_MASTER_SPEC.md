@@ -23,7 +23,7 @@ Este documento es el índice maestro de toda la documentación de EnergIA. Reún
 | `docs/03-architecture/DATABASE_DESIGN.md` | Diseño lógico y físico de la base de datos PostgreSQL | Completo (v1.0.0, DDL ejecutable en `docker/postgres/init/`) |
 | `docs/03-architecture/SOFTWARE_ARCHITECTURE_DOCUMENT.md` | Documento de arquitectura de software | Esqueleto (sin contenido, salvo §19 Decisiones Arquitectónicas) |
 | `docs/03-architecture/adr/` | Architectural Decision Records (ADR-001 a ADR-007) | Aceptados (2026-07-06) |
-| `docs/03-architecture/API_SPEC.md` | Especificación de la API REST del backend | En progreso (Clientes, Suministros y Consumos —`Lectura`, `Lote de Facturación` y `Consumo`, las tres entidades de §4.3 completas— documentados) |
+| `docs/03-architecture/API_SPEC.md` | Especificación de la API REST del backend | En progreso (Clientes, Suministros, Consumos —`Lectura`, `Lote de Facturación` y `Consumo`, las tres entidades de §4.3 completas— y Motor de Inteligencia Energética —Etapa 1, US-006 + US-010— documentados) |
 | `docs/04-ai/AI_ENGINE_SPEC.md` | Especificación del Motor de Inteligencia Energética | Aceptado (v1.0.0, decisiones validadas 2026-07-14) |
 | `docs/04-ai/DATA_SCIENCE_NOTEBOOK.md` | Plan de análisis exploratorio de datos | Pendiente |
 | `docs/05-devops/SECURITY_SPEC.md` | Especificación de seguridad (autenticación, autorización, OWASP) | Pendiente |

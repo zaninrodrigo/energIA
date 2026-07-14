@@ -9,6 +9,14 @@
 > recomendación por defecto, y **DEC-017** según su alternativa (IEE expresado en kWh, sin
 > monetización en v1). Los valores numéricos de este documento (pesos, umbrales,
 > hiperparámetros) son definitivos a partir de esa validación.
+>
+> **Corrección de consistencia interna en §2 (estados del lote); decisiones sin cambios
+> (2026-07-14).** §2.1-§2.3 tenían una inconsistencia interna: describían al motor actuando
+> sobre lotes en `Procesado` (terminal, RD-010), pero DEC-004 exige transicionar a `Error`
+> cuando la validación cae por debajo del 95 % — una transición imposible desde un estado
+> terminal. Corregido: el disparador es un lote `Pendiente` (o `Error`, reintento) completo; es
+> el propio motor quien transiciona a `Procesando` y luego a `Procesado`/`Error`. Las 18
+> decisiones (DEC-001..018, §15) no se modifican.
 
 ## Resumen ejecutivo
 
@@ -19,13 +27,13 @@ por suministro, un `ResultadoIA` con su `IRE` (0-100), su `IEE` y sus `Anomalía
 
 Es un **motor híbrido de tres ramas** (ADR-005): reglas de negocio explícitas, análisis
 estadístico e Isolation Forest no supervisado, que convergen en el IRE. Corre **por lote**
-(ADR-007), disparado por la transición del lote a `Procesado`, en un **proceso worker**
-aislado (ADR-006, ADR-002), con un presupuesto de **menos de 10 minutos** (RNF-001) para
-volúmenes de hasta **500.000 suministros** (RNF-007).
+(ADR-007), disparado por un lote `Pendiente` (o `Error`, reintento) **completo** (§2.1-§2.2),
+en un **proceso worker** aislado (ADR-006, ADR-002), con un presupuesto de **menos de 10
+minutos** (RNF-001) para volúmenes de hasta **500.000 suministros** (RNF-007).
 
 | | |
 |---|---|
-| **Entrada** | `consumos`, `lecturas`, `suministros`, `categorias_tarifarias` de un lote `Procesado` |
+| **Entrada** | `consumos`, `lecturas`, `suministros`, `categorias_tarifarias` de un lote `Pendiente`/`Error` completo (§2.1) |
 | **Salida** | `resultados_ia`, `predicciones`, `anomalias`, `ire`, `impacto_economico`, `feature_vectors` |
 | **Contrato de esquema** | `docker/postgres/init/01_schema.sql` (no se modifica; brechas en §16) |
 | **Decisiones validadas** | 18 (DEC-001 a DEC-018), aceptadas el 2026-07-14 (DEC-017 por alternativa), consolidadas en §15 |
@@ -38,8 +46,9 @@ volúmenes de hasta **500.000 suministros** (RNF-007).
 
 El motor transforma consumos históricos en información accionable (DOMAIN_MODEL §8): detecta
 patrones anómalos, estima riesgo (IRE) e impacto económico (IEE), y alimenta el ranking de
-inspecciones. Es el núcleo analítico del sistema y el bounded context `intelligence_engine`
-(`contexts/README.md`), todavía no implementado.
+inspecciones. Es el núcleo analítico del sistema y el bounded context `motor`
+(`contexts/README.md` — nombre de paquete, superseding el placeholder `intelligence_engine`
+usado antes de que este contexto tuviera código; Etapa 1, US-006 + US-010, ya implementada).
 
 ### 1.2 Qué NO es
 
@@ -55,7 +64,7 @@ inspecciones. Es el núcleo analítico del sistema y el bounded context `intelli
 | ADR | Consecuencia sobre el motor |
 |---|---|
 | ADR-005 | Enfoque híbrido; Isolation Forest como algoritmo principal; tensión de explicabilidad (§10.4) |
-| ADR-007 | Ejecución batch por lote; disparo en transición a `Procesado`; RN-013 lote completo |
+| ADR-007 | Ejecución batch por lote; disparo en lote `Pendiente`/`Error` completo (§2.1-§2.2); RN-013 lote completo |
 | ADR-006 | Cómputo pesado aislado en proceso worker; monolito modular |
 | ADR-002 | Python/Scikit-Learn; GIL ⇒ scoring CPU-bound ⇒ multiprocessing/joblib |
 
@@ -65,18 +74,34 @@ inspecciones. Es el núcleo analítico del sistema y el bounded context `intelli
 
 ### 2.1 Disparador
 
-El motor se ejecuta **una vez por lote**, cuando el `Lote` transiciona a `Procesado`
-(ADR-007; DOMAIN_MODEL §7.4). RN-013 exige lote completo antes de correr la IA, porque la
-comparación de cohorte (RD-009: "la IA solo compara suministros de categorías equivalentes")
-necesita la cohorte completa. RF-005 lo formaliza: "ejecutar el Motor al finalizar el
-procesamiento de un lote".
+El motor se ejecuta **una vez por lote**, disparado por un lote en estado `Pendiente` (o
+reintentado desde `Error`, §2.2) cuya **carga de datos está completa** (ADR-007; DOMAIN_MODEL
+§7.4). RN-013 exige lote completo antes de correr la IA, porque la comparación de cohorte
+(RD-009: "la IA solo compara suministros de categorías equivalentes") necesita la cohorte
+completa. RF-005 lo formaliza: "ejecutar el Motor al finalizar el procesamiento de un lote" —
+"finalizar el procesamiento" significa que la **carga** terminó de completarse, no que el lote
+ya esté `Procesado`: esa transición es precisamente lo que el motor decide al correr (§2.2).
+
+**Definición de completitud.** Un lote está listo para el motor cuando:
+
+1. `cantidad_registros > 0`, **y**
+2. la cantidad de `consumos` activos (no soft-deleted) con ese `lote_id` es exactamente igual a
+   `cantidad_registros`.
+
+`cantidad_registros == 0` **nunca** está listo, sin importar el conteo de consumos: un lote que
+no declara cuántos registros espera no terminó de describirse, no es "trivialmente completo con
+cero registros". Un desajuste entre ambos números —de más o de menos— tampoco está listo; el
+motor reporta ambos valores (`cantidad_registros` declarada y el conteo real de consumos
+activos), para que quien dispara el análisis entienda la brecha exacta. Implementado en
+`backend/src/energia/contexts/motor/domain/completitud.py`; expuesto como `422` con ambos
+números en el cuerpo de la respuesta (`docs/03-architecture/API_SPEC.md`).
 
 > **Tensión de fuente (resuelta por DEC-001, 2026-07-14).** RN-005 exigía originalmente "cada
 > nuevo **consumo** procesado deberá ser analizado automáticamente", granularidad por consumo,
 > en contradicción con la granularidad **por lote** de RN-013 + ADR-007. DEC-001 ratificó la
 > granularidad **por lote**, y RN-005 fue reformulada en consecuencia
-> (`docs/01-business/BUSINESS_ANALYSIS.md` §15): el disparo ocurre al completar el
-> procesamiento del lote, alineado con RN-013 y ADR-007. Ver **DEC-001** (§15).
+> (`docs/01-business/BUSINESS_ANALYSIS.md` §15): el disparo ocurre al completar la carga del
+> lote, alineado con RN-013 y ADR-007. Ver **DEC-001** (§15).
 
 ### 2.2 Máquina de estados del lote
 
@@ -86,18 +111,38 @@ Pendiente ──▶ Procesando ──▶ Procesado   (terminal, RD-010)
                   └────────▶ Error ──▶ Procesando   (reintento, decisión 2026-07-13)
 ```
 
-El motor solo actúa sobre lotes `Procesado`. La transición `Error → Procesando` (reintento
-aprobado, PROJECT_MASTER_SPEC #12; `contexts/README.md`) es del pipeline de importación,
-**previo** al motor; `Procesado` sigue siendo terminal (RD-010: "un lote no puede ejecutarse
-dos veces"). `Lote.estado` nunca se acepta desde el payload de importación (`contexts/README.md`),
-así que el único camino a `Procesado` es el pipeline real.
+El diagrama de transiciones no cambia — es exactamente el que `consumos/domain/lote.py` ya
+declaraba (`ALLOWED_TRANSITIONS`) antes de que el motor existiera para accionarlo. Lo que esta
+sección corrige es la **semántica** de cada estado: la máquina describe el ciclo de vida del
+**análisis**, no (solo) el de la importación.
+
+| Estado | Significado |
+|---|---|
+| `Pendiente` | El lote fue importado; su carga de datos está en curso o a la espera de análisis. |
+| `Procesando` | El motor está ejecutando sus chequeos sobre este lote ahora mismo. |
+| `Procesado` | El análisis terminó **exitosamente** (terminal, RD-010: "un lote no puede ejecutarse dos veces"). |
+| `Error` | Falló la carga **o** el análisis. Admite reintento: `Error → Procesando` (decisión de negocio, 2026-07-13; PROJECT_MASTER_SPEC #12; `contexts/README.md`). |
+
+El disparador del motor (§2.1) es un lote `Pendiente` (o `Error`, vía reintento) **completo**: es
+el propio motor quien lo transiciona a `Procesando` y, según el resultado de la validación de
+integridad (§4), a `Procesado` o a `Error` — nunca al revés. `Procesado` sigue siendo terminal
+(RD-010); `Lote.estado` nunca se acepta desde el payload de importación (`contexts/README.md`),
+así que el único camino a `Procesado` es esta ejecución real del motor.
 
 ### 2.3 Idempotencia (RD-010)
 
 `resultados_ia` tiene `UNIQUE (suministro_id, lote_id)` (RD-023): existe a lo sumo un
-`ResultadoIA` por suministro y lote. Si se pide procesar un lote ya `Procesado`, el motor
-**no reprocesa** por defecto: el estado terminal y la restricción única lo garantizan. Ver
-**DEC-002** para la política de reproceso deliberado (nueva versión de modelo).
+`ResultadoIA` por suministro y lote — esa garantía llega con la etapa de scoring, cuando el
+motor empiece a escribir en esa tabla (§4.2). Para Etapa 1 (esta implementación), la
+idempotencia se sostiene en `Lote.estado` mismo: `Procesado` es terminal (RD-010,
+`ALLOWED_TRANSITIONS`, §2.2) — pedir procesar un lote ya `Procesado` se rechaza (`409`, sin
+reprocesar), y el estado terminal lo garantiza.
+
+Un pedido concurrente contra el MISMO lote `Pendiente`/`Error` se resuelve con una transición
+**optimista** (`UPDATE lotes SET estado = ... WHERE estado IN (...)`, verificando `rowcount`):
+solo una de las dos solicitudes concurrentes gana la carrera hacia `Procesando`; la otra recibe
+`409` (`backend/src/energia/contexts/motor/infrastructure/lote_procesamiento.py`). Ver
+**DEC-002** para la política de reproceso deliberado (nueva versión de modelo, todavía v2).
 
 ### 2.4 Ejecución en worker aislado
 
@@ -106,23 +151,48 @@ en un **proceso worker separado** (ADR-006), fuera del pool de hilos de la API, 
 degradar la latencia de los dashboards concurrentes. El paralelismo real se obtiene con
 multiprocessing/joblib sobre el scoring de Isolation Forest (§12).
 
+**Etapa 1, esta implementación: síncrona en el request.** La validación de integridad (§4) es
+SQL-bound (consultas set-based, sin cómputo pesado en Python) y corre **síncronamente dentro del
+request HTTP** (`POST /api/v1/motor/lotes/{codigo_lote}/procesar`,
+`backend/src/energia/contexts/motor/presentation/routes.py`) — no hay proceso worker todavía. El
+aislamiento en worker que describe el párrafo anterior sigue siendo el objetivo (ADR-006 no
+cambia); se activa cuando aterricen las etapas CPU-bound (3-6: features, estadística, Isolation
+Forest) — la única etapa implementada hoy no lo necesita.
+
 ### 2.5 Semántica de fallo
 
 | Situación | Qué persiste | Estado resultante |
 |---|---|---|
-| Fallo antes de escribir resultados | Nada (transacción no confirmada) | Lote queda auditables; reintento reprocesa el lote entero |
+| Fallo antes de escribir resultados | Nada (transacción no confirmada) | El lote queda auditable en su estado previo; el reintento reprocesa el lote entero |
 | Fallo a mitad de escritura | La escritura se hace **por lote transaccional**, no por suministro suelto | Rollback total; sin resultados parciales |
 | Suministro con datos inválidos | Se excluye del scoring y se anota (§4) | El resto del lote se procesa |
+| Fallo entre `Procesando` y `Procesado`/`Error` (Etapa 1, esta implementación) | Nada — un único `commit()` al final de todo el flujo (§2.1-§2.3), nunca uno intermedio tras la transición a `Procesando` | El rollback automático de la sesión revierte también esa transición; el lote queda en su estado previo (`Pendiente`/`Error`), nunca atascado en `Procesando` |
+| Inserción concurrente de un consumo para el MISMO lote entre el gate de completitud (§2.1) y la relectura posterior a `fetch_chain` (Etapa 1, esta implementación) | Nada — `LoteModificadoError` (`409`) aborta antes de construir el informe; el único cambio de esta transacción (la transición a `Procesando`) se revierte con el mismo rollback | El lote vuelve a su estado previo (`Pendiente`/`Error`); el reintento vuelve a evaluar la completitud desde cero |
 
 El motor persiste el conjunto del lote de forma atómica: no deja un lote medio analizado. Ver
 **DEC-003** (outcome de validación) para el tratamiento fino por suministro.
+
+**Guardia de completitud atómica y su ventana residual (implementación v1, Etapa 1).** Tras
+`fetch_chain`, dentro de la MISMA transacción que certificó la completitud en el gate (§2.1), el
+motor vuelve a contar los consumos activos del lote y lo compara contra el conteo certificado;
+un desajuste levanta `LoteModificadoError` (fila anterior). Esto no cierra la ventana de carrera
+por completo: entre ese recount y el `commit()` final (`presentation/routes.py`) queda una
+**micro-ventana residual** — bajo `READ COMMITTED` (el nivel por defecto de esta transacción),
+una inserción que aterrice DESPUÉS del recount y ANTES del commit no queda cubierta por este
+chequeo. **Nota operativa:** no importar consumos hacia un lote mientras se dispara su
+procesamiento. **Alternativa evaluada y descartada:** subir toda la transacción de
+`ProcesarLote` a aislamiento `REPEATABLE READ` cerraría la ventana por completo (la transacción
+vería una foto fija desde su inicio, haciendo el recount redundante) — descartada por ahora para
+no introducir fallos de serialización/reintentos de transacción en una ruta que hoy no los
+necesita; un recount explícito y acotado es más simple y suficientemente seguro para el volumen
+esperado.
 
 ---
 
 ## 3. Pipeline: visión general
 
 ```
-Lote Procesado
+Lote Pendiente/Error completo
    │
    ▼
 [1] Validación de integridad (US-006)      ── excluye/anota suministros inválidos
@@ -141,6 +211,10 @@ Lote Procesado
    ▼
 [8] Impacto Económico Estimado             ──▶ impacto_economico
 ```
+
+El primer recuadro es la PRECONDICIÓN de entrada (§2.1), no un estado que el pipeline reciba ya
+resuelto: es el propio pipeline quien produce el `Procesado`/`Error` final (§2.2) al terminar,
+nunca al revés.
 
 Las etapas 4, 5 y 6 son las **tres ramas** del híbrido (ADR-005; TO-BE de BUSINESS_ANALYSIS §5).
 Convergen en la etapa 7.
@@ -178,6 +252,20 @@ condiciones solo son detectables **en tiempo de análisis** cruzando la cadena i
 > permite el análisis si al menos **95 %** de los suministros del lote pasan la validación; por debajo, marcar `Error` y exigir
 > recarga. Alternativas: 90 %, 99 %, o sin umbral. Impacto: robustez de la cohorte (RD-009,
 > ADR-007 "cohorte completa") vs. tolerancia operativa.
+
+> **Persistencia del informe (implementación v1, Etapa 1 aislada).** `resultados_ia` exige
+> `modelo_ia_id` (`NOT NULL`, FK a `modelos_ia`) y `clasificacion` (`NOT NULL`, CHECK con los 4
+> valores de §8.1) — ninguno de los dos existe todavía cuando solo corrió la Etapa 1: no hay
+> modelo IA entrenado, no hay score que clasificar. Escribir una fila de `resultados_ia`
+> "solo-Etapa-1" implicaría inventar un `modelo_ia_id`/`clasificacion` que no representarían nada
+> real, así que esta implementación no lo hace. **Decisión v1**: el `InformeValidacion` completo
+> (hallazgos V1-V7, exclusiones por suministro con motivo, fracción válida, veredicto de umbral)
+> se devuelve en el cuerpo de la respuesta de
+> `POST /api/v1/motor/lotes/{codigo_lote}/procesar` (`docs/03-architecture/API_SPEC.md`), **sin
+> persistencia en base de datos** — la persistencia del informe llega con la etapa de scoring
+> (§9, cuando exista un `modelo_ia_id`/`clasificacion` reales que rellenar). El único efecto
+> persistente de esta implementación es la transición de `lotes.estado`
+> (`Pendiente`/`Error` → `Procesando` → `Procesado`/`Error`, §2.2).
 
 ---
 
@@ -558,7 +646,7 @@ resolvieron según su recomendación por defecto.
 
 | ID | Tema | Recomendación | Alternativas | Impacto | Resolución |
 |---|---|---|---|---|---|
-| DEC-001 | Granularidad del disparo (RN-005 per-consumo vs RN-013 per-lote) | Ratificar **per-lote** (transición a `Procesado`), leyendo RN-005 como "al finalizar el lote" | Reescribir RN-005 para alinearlo | Contrato del disparador; consistencia RN-005/RN-013 | Aceptada según recomendación (2026-07-14) |
+| DEC-001 | Granularidad del disparo (RN-005 per-consumo vs RN-013 per-lote) | Ratificar **per-lote** (disparo al completarse la carga del lote), leyendo RN-005 como "al finalizar el lote" | Reescribir RN-005 para alinearlo | Contrato del disparador; consistencia RN-005/RN-013 | Aceptada según recomendación (2026-07-14) |
 | DEC-002 | Reproceso de un lote `Procesado` | **No reprocesar** (RD-010 terminal, RD-023 único) | Permitir reproceso con nueva versión de modelo, sobrescribiendo o agregando filas | Idempotencia; trazabilidad histórica | Aceptada según recomendación (2026-07-14) |
 | DEC-003 | Outcome de validación de integridad fallida | **Excluir + anotar** el suministro; no abortar salvo umbral | Anotar sin excluir; fallar el lote entero | Cobertura del análisis vs. calidad del scoring | Aceptada según recomendación (2026-07-14) |
 | DEC-004 | Umbral de completitud del lote | **≥ 95 %** de suministros válidos para analizar | 90 %, 99 %, sin umbral | Robustez de cohorte (RD-009) vs. tolerancia operativa | Aceptada según recomendación (2026-07-14) |
@@ -609,7 +697,7 @@ deuda de esquema para v2.
 ## 17. Referencias
 
 - **ADR-005** (motor híbrido; Isolation Forest; tensión de explicabilidad; cold-start),
-  **ADR-007** (batch por lote; disparo en `Procesado`; RN-013; RD-009 cohorte), **ADR-006**
+  **ADR-007** (batch por lote; disparo en lote `Pendiente`/`Error` completo; RN-013; RD-009 cohorte), **ADR-006**
   (worker aislado; monolito modular), **ADR-002** (GIL; scoring CPU-bound; multiprocessing/joblib)
   — `docs/03-architecture/adr/`.
 - **DOMAIN_MODEL** §8 (ResultadoIA §8.1, Anomalía §8.2, IRE §8.3 — factores canónicos, IEE §8.4,
@@ -623,5 +711,5 @@ deuda de esquema para v2.
 - **Esquema** (contrato de persistencia): tablas `feature_vectors`, `resultados_ia`,
   `predicciones`, `anomalias`, `ire`, `impacto_economico`, `modelos_ia`, `metricas_modelo` —
   `docker/postgres/init/01_schema.sql`.
-- **Convenciones de contexto** (bounded context `intelligence_engine`, estados de `Lote`,
+- **Convenciones de contexto** (bounded context `motor`, estados de `Lote`,
   reintento `Error → Procesando`) — `backend/src/energia/contexts/README.md`.

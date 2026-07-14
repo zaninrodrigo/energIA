@@ -13,7 +13,7 @@ later remains possible without a redesign (ADR-006).
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
 | `consumos` | Gestión de Consumos | **Implemented, all 3 entities** (US-003 `Lectura`, US-005 `Lote de Facturación`, US-004 `Consumo` — Épica 1 complete) |
-| `intelligence_engine` | Motor de Inteligencia Energética | Not started |
+| `motor` | Motor de Inteligencia Energética | **Implemented, Etapa 1** (US-006 + US-010 trigger — Épica 2 slice 1; Etapas 2-8 not started) |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
 | `dashboard` | Dashboard Ejecutivo | Not started |
@@ -23,9 +23,11 @@ later remains possible without a redesign (ADR-006).
 superseding the `supplies` placeholder this table used before that context shipped. `consumos`
 (§4.3) is the third, superseding the `consumption` placeholder the same way — see "One package,
 staged entities" below for why it ships today with only `Lectura` implemented, ahead of
-`Consumo`/`Lote de Facturación`. Package names for contexts not yet started are still
-placeholders (English, one option among several); the `clientes`/`suministros`/`consumos` naming
-convention takes precedence once each context actually lands — see below.
+`Consumo`/`Lote de Facturación`. `motor` (§4.4) is the fourth, superseding the `intelligence_engine`
+placeholder the same way — see "The `motor` context" below for its naming and the new
+cross-context write pattern it establishes. Package names for contexts not yet started are still
+placeholders (English, one option among several); the `clientes`/`suministros`/`consumos`/`motor`
+naming convention takes precedence once each context actually lands — see below.
 
 ## Naming convention: Spanish domain nouns, English technical parts
 
@@ -275,9 +277,16 @@ simply does not apply — `ImportLotes` only needs a `LoteSource` and a `LoteRep
 `Lote` models its `estado` (`domain/lote.py`'s `EstadoLote`) as a real four-value enum
 (`Pendiente`/`Procesando`/`Procesado`/`Error`, DOMAIN_MODEL.md §7.4 "Estados"), with an
 `ALLOWED_TRANSITIONS` map and a `Lote.transition_to()` method enforcing RD-010 ("un lote no puede
-ejecutarse dos veces": no transition back to `Pendiente`, no skipping `Procesando`). Nothing calls
-`transition_to()` yet — the processing engine that would is a future user story — but the
-invariant lives in the domain now, not bolted on later as an afterthought.
+ejecutarse dos veces": no transition back to `Pendiente`, no skipping `Procesando`). The
+processing engine that drives these transitions now exists (`motor`, Épica 2 slice 1, see "The
+`motor` context" below) — but nothing in `contexts.consumos` itself ever calls `Lote.transition_to()`
+in-process: `motor` is a *different* bounded context and, per this document's own cross-context
+rule, never imports `Lote` (or anything else from `contexts.consumos`) to do so. `motor` mirrors
+the same `EstadoLote`/`ALLOWED_TRANSITIONS` shape in its own domain
+(`motor/domain/lote_estado.py`) and writes `lotes.estado` through a direct, optimistic SQL
+`UPDATE` instead — see "The `motor` context" below for the full write-boundary rationale. The
+invariant has lived in `consumos`' own domain since before `motor` existed, not bolted on later
+as an afterthought, and stays the single source of truth both mirrors are checked against.
 
 `Lote.create()` has **no `estado` parameter at all**, not even an optional one defaulting to
 `Pendiente`: every freshly created `Lote` is unconditionally born `Pendiente`, by construction.
@@ -379,11 +388,68 @@ application layer before ever calling `create()`, the same way `SuministroDirect
 `LoteDirectory` resolutions already do, and there is no "recompute from inputs" fallback for a
 foreign-key reference the way there is for a numeric average.
 
+## The `motor` context
+
+`motor` (DOMAIN_MODEL.md §4.4, "Motor de Inteligencia Energética") is the fourth bounded context
+to land, Épica 2 slice 1 (US-006 + US-010 trigger, Etapa 1 only — validación de integridad;
+Etapas 2-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not started). Package name: `motor`, the
+short Spanish domain noun itself (the same naming convention `clientes`/`suministros`/`consumos`
+already established), superseding the `intelligence_engine` placeholder this table used before
+this context shipped — not `intelligence_engine`, `ai_engine`, or `ia`: the canonical name in
+DOMAIN_MODEL.md/AI_ENGINE_SPEC.md is "Motor de Inteligencia Energética", and `motor` is what a
+reader of either document would recognize immediately, the same reasoning `clientes`/
+`suministros` already used to reject their own English placeholders.
+
+### A cross-context WRITE port, not just a read one
+
+Every directory port before `motor` ("Cross-context directory-port pattern" above) only ever
+*resolves* a natural key to a UUID — a read. `motor` needs to both read `lotes.estado`/
+`cantidad_registros` and, having decided the outcome, *write* `lotes.estado` (`Pendiente`/
+`Error` → `Procesando` → `Procesado`/`Error`) — and `Lote` (the entity, its `ALLOWED_TRANSITIONS`,
+`Lote.transition_to()`) belongs entirely to `consumos` (DOMAIN_MODEL.md §4.3), a *different*
+bounded context from `motor` (§4.4), even though both share the same physical `lotes` table
+(ADR-006). Per this document's own cross-context rule, `motor` never imports
+`contexts.consumos.domain.lote.Lote` (or its repository) to perform that write. Instead:
+
+- `motor/domain/lote_estado.py` is a small, deliberate **mirror** of `consumos`' own
+  `EstadoLote`/`ALLOWED_TRANSITIONS` (same 4 states, same edges) — the pre-flight check
+  `ProcesarLote` runs before ever issuing SQL, the same way `SqlDirectSuministroDirectory`
+  duplicates knowledge of `suministros`' shape via raw SQL instead of importing its ORM model.
+  The single source of truth for the actual states/transitions is the database's own
+  `ck_lotes_estado` CHECK constraint plus DOMAIN_MODEL.md §7.4 — not either mirror.
+- `motor/infrastructure/lote_procesamiento.py` (`SqlLoteProcesamientoPort`, implementing
+  `LoteProcesamientoPort`, `motor/domain/ports.py`) reads `lotes` via `sqlalchemy.text` and
+  WRITES `lotes.estado` via an **optimistic** `UPDATE lotes SET estado = :hacia WHERE id =
+  :lote_id AND estado IN (...)`, checking `rowcount` — the concurrency guarantee a concurrent
+  trigger race degrades to a `409` response, not a lost update. This is the one write path this
+  codebase grants to a context that does not own the table's entity, and it is deliberately
+  narrow: one column (`estado`), one table (`lotes`), no other field of `Lote` is ever touched
+  from `motor`.
+- The consumos-context import repository (`SqlAlchemyLoteRepository`) still deliberately never
+  writes `estado` (see "`Lote.estado` is never accepted from the import payload" above) — that
+  boundary is unchanged and unweakened by `motor`'s existence. The two write paths are disjoint:
+  `ImportLotes` never writes `estado`; `motor` never writes anything else on `lotes`.
+- `motor/infrastructure/validacion_data_source.py` (`SqlValidacionDataSource`, implementing
+  `ValidacionDataSource`) is a READ-only cross-context port, following the ordinary pattern
+  above: one set-based SQL query joining `consumos`/`lecturas`/`suministros`/
+  `categorias_tarifarias` (none of which belong to `motor`) to build the chain Etapa 1's checks
+  (`motor/domain/checks.py`) evaluate — never a per-row loop of individual queries (RNF-001).
+
+### Single-transaction atomicity, no explicit locking
+
+`ProcesarLote.execute()` (`motor/application/procesar_lote.py`) never calls `session.commit()`;
+the route (`motor/presentation/routes.py`) commits exactly once, after the whole sequence
+(completeness gate → `Procesando` → checks → `Procesado`/`Error`) succeeds. Postgres's own row
+lock on the `Procesando` `UPDATE` blocks any concurrent `procesar` call against the SAME lote
+until this transaction commits or rolls back — so a crash between the two transitions rolls the
+WHOLE sequence back (the lote is never left stuck at `Procesando`) instead of requiring a
+separate recovery mechanism a two-commit design would need.
+
 ## No empty ceremony
 
-Only `clientes`, `suministros` and `consumos` exist so far (see `## Internal shape of a context`
-above for what it looks like in practice). The other 4 packages are not created yet: a context
-package is created only when its first real feature lands — domain entities, a use case, a
-repository, whatever comes first for that context. Scaffolding four empty layer folders ahead of
-any actual code would be ceremony without a behavior behind it, which is exactly what ADR-001's
+`clientes`, `suministros`, `consumos` and `motor` exist so far (see `## Internal shape of a
+context` above for what it looks like in practice). The other 3 packages are not created yet: a
+context package is created only when its first real feature lands — domain entities, a use case,
+a repository, whatever comes first for that context. Scaffolding empty layer folders ahead of any
+actual code would be ceremony without a behavior behind it, which is exactly what ADR-001's
 accepted trade-offs warn against for a single-developer team.
