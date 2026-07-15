@@ -1,6 +1,7 @@
 """Unit tests for `ProcesarLote` (US-006 + US-010 trigger, AI_ENGINE_SPEC.md §2-§4) against
 plain in-memory fakes of `LoteProcesamientoPort`/`ValidacionDataSource` -- no database."""
 
+import functools
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date
@@ -9,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from energia.contexts.motor.application import procesar_lote as procesar_lote_module
 from energia.contexts.motor.application.procesar_lote import (
     LoteEnProgresoError,
     LoteModificadoError,
@@ -16,6 +18,13 @@ from energia.contexts.motor.application.procesar_lote import (
     LoteNoListoError,
     LoteYaProcesadoError,
     ProcesarLote,
+)
+from energia.contexts.motor.domain.isolation_forest import (
+    ALGORITMO_ISOLATION_FOREST,
+    SCOPE_GLOBAL,
+    agrupar_para_entrenamiento,
+    bandear_clasificacion,
+    construir_nombre_modelo,
 )
 from energia.contexts.motor.domain.lote_estado import EstadoLote
 from energia.contexts.motor.domain.ports import (
@@ -26,6 +35,7 @@ from energia.contexts.motor.domain.ports import (
     LecturaHistorialRow,
     LoteConteoRow,
     PeriodoHistorialRow,
+    PrediccionParaGuardar,
     PriorAnomalyCountRow,
     SuministroMetadataRow,
 )
@@ -139,6 +149,73 @@ class FakeFeatureVectorRepository:
         self.guardados.extend(vectores)
 
 
+@dataclass
+class FakeIsolationForestScorer:
+    """In-memory fake of `IsolationForestScorer` (Etapa 6, AI_ENGINE_SPEC.md §9) -- deterministic,
+    no sklearn: returns `-sum(fila)` per row (a row with LARGER feature values gets a MORE
+    NEGATIVE fake score, standing in for "more anomalous" without needing real fitting in these
+    WIRING tests -- the real scorer's own smoke tests live in `tests/unit/contexts/motor/
+    infrastructure/test_isolation_forest_scorer.py`). Records every matrix it was called with."""
+
+    llamadas: list[list[tuple[float, ...]]] = field(default_factory=list)
+
+    async def ajustar_y_puntuar(self, matriz: Sequence[Sequence[float]]) -> Sequence[float]:
+        self.llamadas.append([tuple(fila) for fila in matriz])
+        return [-sum(fila) for fila in matriz]
+
+
+@dataclass
+class FakeModelosIaRepository:
+    """In-memory fake of `ModelosIaRepository` -- records every `registrar_fit` call (never
+    touches a database); returns a fresh `UUID` per call (this file tests WIRING, not the real
+    upsert/single-Activo-per-nombre semantics -- those are `tests/integration/contexts/motor/
+    test_modelos_ia_repository_integration.py`'s job, against the real DB)."""
+
+    llamadas: list[dict[str, str]] = field(default_factory=list)
+
+    async def registrar_fit(self, *, nombre: str, version: str, algoritmo: str) -> UUID:
+        self.llamadas.append({"nombre": nombre, "version": version, "algoritmo": algoritmo})
+        return uuid4()
+
+
+@dataclass
+class FakePrediccionesRepository:
+    """In-memory fake of `PrediccionesRepository` -- records every `reemplazar_lote` call (never
+    touches a database)."""
+
+    llamadas: list[tuple[UUID, list[PrediccionParaGuardar]]] = field(default_factory=list)
+
+    async def reemplazar_lote(self, lote_id: UUID, filas: Sequence[PrediccionParaGuardar]) -> None:
+        self.llamadas.append((lote_id, list(filas)))
+
+
+def _construir_use_case(
+    *,
+    lote_port: FakeLoteProcesamientoPort,
+    validacion_source: FakeValidacionDataSource,
+    duplicidades_source: FakeDuplicidadesDataSource,
+    features_source: FakeFeaturesDataSource,
+    feature_vector_repository: FakeFeatureVectorRepository,
+    isolation_forest_scorer: FakeIsolationForestScorer | None = None,
+    modelos_ia_repository: FakeModelosIaRepository | None = None,
+    predicciones_repository: FakePrediccionesRepository | None = None,
+) -> ProcesarLote:
+    """Builds a `ProcesarLote` with sensible Etapa-6 fakes by default, so every Etapa 1-5 test
+    written before Etapa 6 existed keeps working unchanged (only this ONE factory function needed
+    updating when Etapa 6's 3 new constructor dependencies landed, not all 19 call sites) --
+    Etapa-6-focused tests pass their OWN fakes explicitly to inspect what was recorded."""
+    return ProcesarLote(
+        lote_port=lote_port,
+        validacion_source=validacion_source,
+        duplicidades_source=duplicidades_source,
+        features_source=features_source,
+        feature_vector_repository=feature_vector_repository,
+        isolation_forest_scorer=isolation_forest_scorer or FakeIsolationForestScorer(),
+        modelos_ia_repository=modelos_ia_repository or FakeModelosIaRepository(),
+        predicciones_repository=predicciones_repository or FakePrediccionesRepository(),
+    )
+
+
 def _fila_valida(suministro_id: UUID | None = None) -> ConsumoValidacionRow:
     return ConsumoValidacionRow(
         consumo_id=uuid4(),
@@ -159,7 +236,7 @@ def _fila_valida(suministro_id: UUID | None = None) -> ConsumoValidacionRow:
 
 async def test_lote_not_found_raises() -> None:
     lote_port = FakeLoteProcesamientoPort(lote=None)
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -178,7 +255,7 @@ async def test_lote_procesando_raises_conflict() -> None:
             id=lote_id, codigo_lote="LOTE-1", estado=EstadoLote.PROCESANDO, cantidad_registros=3
         )
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -197,7 +274,7 @@ async def test_lote_procesado_raises_terminal_conflict() -> None:
             id=lote_id, codigo_lote="LOTE-1", estado=EstadoLote.PROCESADO, cantidad_registros=3
         )
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -217,7 +294,7 @@ async def test_incomplete_lote_raises_not_ready_and_makes_no_transition() -> Non
         ),
         consumos_activos=2,
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -244,7 +321,7 @@ async def test_complete_lote_with_valid_checks_transitions_to_procesado() -> Non
         consumos_activos=2,
     )
     filas = [_fila_valida(), _fila_valida()]
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: filas}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -294,7 +371,7 @@ async def test_complete_lote_below_threshold_transitions_to_error() -> None:
         prev_fecha_fin=None,
         categoria_deleted_at=None,
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [fila_invalida]}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -318,7 +395,7 @@ async def test_error_lote_can_retry() -> None:
         ),
         consumos_activos=1,
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida()]}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -344,7 +421,7 @@ async def test_concurrent_trigger_race_degrades_to_conflict() -> None:
         consumos_activos=1,
         roba_transicion_concurrente=True,
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida()]}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -378,7 +455,7 @@ async def test_consumo_inserted_mid_flight_raises_lote_modificado_with_no_final_
         # inserted, read back by the recount `contar_consumos_activos` call right after this.
         lote_port.consumos_activos = 2
 
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource(
             {lote_id: [_fila_valida()]}, on_fetch=_simular_insert_concurrente
@@ -412,7 +489,7 @@ async def test_final_transition_returning_false_raises_assertion_error() -> None
         consumos_activos=1,
         falla_transicion_final=True,
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida()]}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -479,7 +556,7 @@ async def test_duplicidades_defaults_to_empty_when_source_has_nothing() -> None:
         ),
         consumos_activos=1,
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida()]}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -517,7 +594,7 @@ async def test_duplicidades_marks_suministro_even_when_etapa1_excluded_it() -> N
             ]
         }
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource(
             {lote_id: [_fila_valida(suministro_ok), _fila_excluida(suministro_excluido)]}
@@ -546,7 +623,7 @@ async def test_duplicidades_present_regardless_of_estado_final() -> None:
     conteo_drift = LoteConteoRow(
         lote_id=uuid4(), codigo_lote="LOTE-OTRO", cantidad_registros=3, consumos_activos=2
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_excluida()]}),
         duplicidades_source=FakeDuplicidadesDataSource(conteos_por_lote={lote_id: [conteo_drift]}),
@@ -579,6 +656,7 @@ def _metadata(
     categoria_id: UUID | None = None,
     numero_suministro: str | None = None,
     estado: str = "Activo",
+    categoria_tarifaria_nombre: str = "Residencial",
 ) -> SuministroMetadataRow:
     return SuministroMetadataRow(
         suministro_id=suministro_id,
@@ -587,6 +665,7 @@ def _metadata(
         fecha_alta=date(2020, 1, 1),
         numero_suministro=numero_suministro or f"SUM-{suministro_id}",
         estado=estado,
+        categoria_tarifaria_nombre=categoria_tarifaria_nombre,
     )
 
 
@@ -634,7 +713,7 @@ async def test_features_generated_only_for_non_excluded_suministros() -> None:
         conteos_por_lote={lote_id: [PriorAnomalyCountRow(suministro_id=suministro_ok, cantidad=5)]},
     )
     repository = FakeFeatureVectorRepository()
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource(
             {lote_id: [_fila_valida(suministro_ok), _fila_excluida(suministro_excluido)]}
@@ -712,7 +791,7 @@ async def test_conflicted_consumo_is_excluded_from_the_feature_window() -> None:
         metadata_por_lote={lote_id: [_metadata(suministro_id)]},
     )
     repository = FakeFeatureVectorRepository()
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
         duplicidades_source=FakeDuplicidadesDataSource(
@@ -814,7 +893,7 @@ async def test_conflicted_nonzero_period_still_breaks_the_zero_streak() -> None:
         metadata_por_lote={lote_id: [_metadata(suministro_id)]},
     )
     repository = FakeFeatureVectorRepository()
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
         duplicidades_source=FakeDuplicidadesDataSource(
@@ -861,7 +940,7 @@ async def test_reglas_reports_zero_hits_for_a_single_period_clean_suministro() -
         },
         metadata_por_lote={lote_id: [_metadata(suministro_id)]},
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -909,7 +988,7 @@ async def test_reglas_fires_r1_end_to_end_reusing_the_built_vector() -> None:
             lote_id: [_metadata(suministro_id, numero_suministro="SUM-R1", estado="Activo")]
         },
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
         duplicidades_source=FakeDuplicidadesDataSource(),
@@ -955,7 +1034,7 @@ async def test_reglas_never_evaluates_a_suministro_excluded_by_etapa_1() -> None
         },
         metadata_por_lote={lote_id: [_metadata(suministro_ok), _metadata(suministro_excluido)]},
     )
-    use_case = ProcesarLote(
+    use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource(
             {lote_id: [_fila_valida(suministro_ok), _fila_excluida(suministro_excluido)]}
@@ -970,4 +1049,339 @@ async def test_reglas_never_evaluates_a_suministro_excluded_by_etapa_1() -> None
     assert resultado.reglas.resumen.suministros_evaluados == 1
     assert all(
         entrada.suministro_id != suministro_excluido for entrada in resultado.reglas.suministros
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# Etapa 6 -- Isolation Forest (US-011/RF-006, AI_ENGINE_SPEC.md §9). These are WIRING tests, same
+# discipline as Etapas 3-5's own sections above: the matrix/grouping/normalization/banding MATH
+# itself is unit-tested exhaustively in `tests/unit/contexts/motor/domain/test_isolation_forest.
+# py` against hand-computed values (including the per-categoria training-strategy split, DEC-010
+# -- this file's own synthetic scale never reaches `MODELO_POR_CATEGORIA_MINIMO`, so every
+# scenario below lands in the single "global" scope) -- what matters here is that `ProcesarLote`
+# (a) scores exactly the non-excluded population Etapa 5 already evaluated, reusing the SAME
+# vectors, (b) never lets Etapa 6 influence `estado_final`, (c) registers one `modelos_ia` fit per
+# scope and threads its id into every `predicciones` row for that scope, and (d) surfaces the
+# result on `ResultadoProcesamiento.ml`.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_ml_scores_every_non_excluded_suministro_and_never_touches_estado() -> None:
+    lote_id = uuid4()
+    suministro_a = uuid4()
+    suministro_b = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-ML-1", estado=EstadoLote.PENDIENTE, cantidad_registros=2
+        ),
+        consumos_activos=2,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_a, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000"),
+                _historial(suministro_b, lote_id, fecha_inicio=date(2024, 1, 1), kwh="500.000"),
+            ]
+        },
+        metadata_por_lote={
+            lote_id: [
+                _metadata(suministro_a, numero_suministro="SUM-ML-A"),
+                _metadata(suministro_b, numero_suministro="SUM-ML-B"),
+            ]
+        },
+    )
+    modelos_ia_repository = FakeModelosIaRepository()
+    predicciones_repository = FakePrediccionesRepository()
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource(
+            {lote_id: [_fila_valida(suministro_a), _fila_valida(suministro_b)]}
+        ),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        modelos_ia_repository=modelos_ia_repository,
+        predicciones_repository=predicciones_repository,
+    )
+
+    resultado = await use_case.execute("LOTE-ML-1")
+
+    # Etapa 6 never influences the estado/95% verdict (mission directive #8).
+    assert resultado.estado_final is EstadoLote.PROCESADO
+
+    assert resultado.ml.suministros_scored == 2
+    assert resultado.ml.lote_id == lote_id
+    assert len(resultado.ml.modelos) == 1
+    assert resultado.ml.modelos[0].scope == SCOPE_GLOBAL
+    assert resultado.ml.modelos[0].suministros_entrenados == 2
+
+    # One `registrar_fit` call for the single "global" scope (small population, DEC-010).
+    assert len(modelos_ia_repository.llamadas) == 1
+    assert modelos_ia_repository.llamadas[0]["nombre"] == construir_nombre_modelo(SCOPE_GLOBAL)
+    assert modelos_ia_repository.llamadas[0]["algoritmo"] == ALGORITMO_ISOLATION_FOREST
+
+    # One `reemplazar_lote` call, with exactly 2 predicciones rows, correct modelo_ia_id threaded.
+    assert len(predicciones_repository.llamadas) == 1
+    lote_llamado, filas = predicciones_repository.llamadas[0]
+    assert lote_llamado == lote_id
+    assert len(filas) == 2
+    assert {fila.suministro_id for fila in filas} == {suministro_a, suministro_b}
+    modelo_id_esperado = resultado.ml.modelos[0].modelo_ia_id
+    assert all(fila.modelo_ia_id == modelo_id_esperado for fila in filas)
+    for fila in filas:
+        assert 0.0 <= fila.score <= 1.0
+        assert fila.clasificacion in {"Normal", "Atención", "Alto Riesgo", "Crítico"}
+
+
+async def test_ml_top_10_reflects_the_more_anomalous_suministro_first() -> None:
+    """`FakeIsolationForestScorer` returns `-sum(fila)` per row -- a suministro whose features
+    sum to a LARGER value gets a MORE NEGATIVE fake raw score, i.e. MORE anomalous under DEC-013's
+    inverted min-max (module docstring, `domain/isolation_forest.py`). `suministro_b`'s much
+    higher `avg_consumption`/`max_consumption`/etc. (kwh=900 vs. kwh=100) must rank #1."""
+    lote_id = uuid4()
+    suministro_a = uuid4()
+    suministro_b = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-ML-2", estado=EstadoLote.PENDIENTE, cantidad_registros=2
+        ),
+        consumos_activos=2,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_a, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000"),
+                _historial(suministro_b, lote_id, fecha_inicio=date(2024, 1, 1), kwh="900.000"),
+            ]
+        },
+        metadata_por_lote={
+            lote_id: [
+                _metadata(suministro_a, numero_suministro="SUM-ML-A"),
+                _metadata(suministro_b, numero_suministro="SUM-ML-B"),
+            ]
+        },
+    )
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource(
+            {lote_id: [_fila_valida(suministro_a), _fila_valida(suministro_b)]}
+        ),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+    )
+
+    resultado = await use_case.execute("LOTE-ML-2")
+
+    assert resultado.ml.top_10[0].numero_suministro == "SUM-ML-B"
+    assert resultado.ml.top_10[0].ml_score_0_100 == pytest.approx(100.0)
+    assert resultado.ml.top_10[1].ml_score_0_100 == pytest.approx(0.0)
+    assert resultado.ml.top_10[0].clasificacion == bandear_clasificacion(100.0)
+
+
+async def test_ml_below_threshold_lote_still_gets_scored() -> None:
+    """Etapa 6 runs UNCONDITIONALLY, same "runs regardless of the 95% outcome" policy Etapas 2-5
+    already established (mission directive #8: never gates on/influences `estado_final`)."""
+    lote_id = uuid4()
+    suministro_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-ML-3", estado=EstadoLote.PENDIENTE, cantidad_registros=2
+        ),
+        consumos_activos=2,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_id, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000")
+            ]
+        },
+        metadata_por_lote={lote_id: [_metadata(suministro_id)]},
+    )
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        # Only ONE of the two declared consumos is valid -- Etapa 1's threshold (< 95%) lands
+        # this lote in Error, exactly like the existing Etapa 1 threshold tests above.
+        validacion_source=FakeValidacionDataSource(
+            {lote_id: [_fila_valida(suministro_id), _fila_excluida()]}
+        ),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+    )
+
+    resultado = await use_case.execute("LOTE-ML-3")
+
+    assert resultado.estado_final is EstadoLote.ERROR
+    assert resultado.ml.suministros_scored == 1  # scored anyway, per mission directive #8
+
+
+async def test_ml_empty_vectores_still_clears_stale_predicciones_and_registers_no_model() -> None:
+    """A lote with zero non-excluded suministros (e.g. every one excluded by Etapa 1) has nothing
+    to fit -- no `modelos_ia` row is registered, but `predicciones_repository.reemplazar_lote` is
+    STILL called (with an empty list) so a retry correctly clears any stale rows from a previous
+    attempt (mirrors `SqlPrediccionesRepository`'s own empty-`filas`-still-clears contract)."""
+    lote_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-ML-4", estado=EstadoLote.PENDIENTE, cantidad_registros=1
+        ),
+        consumos_activos=1,
+    )
+    modelos_ia_repository = FakeModelosIaRepository()
+    predicciones_repository = FakePrediccionesRepository()
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource({lote_id: [_fila_excluida()]}),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=FakeFeaturesDataSource(),
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        modelos_ia_repository=modelos_ia_repository,
+        predicciones_repository=predicciones_repository,
+    )
+
+    resultado = await use_case.execute("LOTE-ML-4")
+
+    assert resultado.ml.suministros_scored == 0
+    assert resultado.ml.modelos == ()
+    assert modelos_ia_repository.llamadas == []
+    assert predicciones_repository.llamadas == [(lote_id, [])]
+
+
+async def test_ml_multi_group_wiring_scores_every_suministro_once_with_correct_flat_reindex(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WARNING (reviewer finding) -- multi-group wiring was untested: every Etapa 6 test above
+    stays under `MODELO_POR_CATEGORIA_MINIMO` (1.000 suministros), so `agrupar_para_entrenamiento`
+    always returns a SINGLE `"global"` group in practice, never exercising
+    `_ejecutar_isolation_forest`'s flat-reindexing loop (`resultados_por_grupo`/`indice_global`,
+    `application/procesar_lote.py`) across MORE THAN ONE group. The per-categoria SPLIT math
+    itself is already unit-tested at full 1.000+ scale in `tests/unit/contexts/motor/domain/
+    test_isolation_forest.py`; what is NEW here is proving `ProcesarLote` threads TWO groups'
+    fits/scores back onto the RIGHT suministros end to end.
+
+    `MODELO_POR_CATEGORIA_MINIMO` is impractical to reach in an in-memory wiring test, so this
+    test monkeypatches the `agrupar_para_entrenamiento` NAME `procesar_lote` calls down to
+    `minimo_categoria=5` -- documented here, nowhere else. Patching the MODULE CONSTANT itself
+    would NOT work: `agrupar_para_entrenamiento`'s `minimo_categoria` keyword-only parameter
+    default is bound to `MODELO_POR_CATEGORIA_MINIMO`'s value at function-definition (import)
+    time, so reassigning the module attribute afterwards has no effect on calls that rely on the
+    default. Rebinding the imported name in `procesar_lote`'s own namespace to a `functools.
+    partial` with `minimo_categoria=5` is the actual seam this test needs.
+
+    Two groups: a `"Industrial"` categoria with 5 suministros (>= the patched threshold, gets its
+    OWN model) plus 2 more suministros in a different, small categoria that pools into the
+    `"global"` fallback (< the patched threshold). Every suministro's `kwh` is DISTINCT and
+    strictly increasing across the WHOLE population, smallest in the pooled group, biggest in
+    `"Industrial"` -- `FakeIsolationForestScorer` (`-sum(fila)` per row) turns that into a
+    strictly increasing `ml_score_0_100` by `kwh` (DEC-013: more negative raw score -> higher
+    normalized score), a distinguishable-per-group score PATTERN that would catch a flat-
+    reindexing bug (a suministro receiving another suministro's score or `modelo_ia_id`)."""
+    lote_id = uuid4()
+    categoria_industrial = uuid4()
+    categoria_chica = uuid4()
+
+    industrial_ids = [uuid4() for _ in range(5)]
+    chica_ids = [uuid4() for _ in range(2)]
+    # Strictly increasing kwh across the WHOLE population -- the pooled "global" suministros get
+    # the SMALLEST values, "Industrial" suministros the LARGEST.
+    kwh_chica = ["10.000", "20.000"]
+    kwh_industrial = ["1000.000", "2000.000", "3000.000", "4000.000", "5000.000"]
+
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id,
+            codigo_lote="LOTE-ML-MULTI",
+            estado=EstadoLote.PENDIENTE,
+            cantidad_registros=7,
+        ),
+        consumos_activos=7,
+    )
+    historial = [
+        _historial(sid, lote_id, fecha_inicio=date(2024, 1, 1), kwh=kwh)
+        for sid, kwh in zip(chica_ids, kwh_chica, strict=True)
+    ] + [
+        _historial(sid, lote_id, fecha_inicio=date(2024, 1, 1), kwh=kwh)
+        for sid, kwh in zip(industrial_ids, kwh_industrial, strict=True)
+    ]
+    metadata = [
+        _metadata(
+            sid,
+            categoria_id=categoria_chica,
+            numero_suministro=f"SUM-CHICA-{i}",
+            categoria_tarifaria_nombre="Residencial",
+        )
+        for i, sid in enumerate(chica_ids)
+    ] + [
+        _metadata(
+            sid,
+            categoria_id=categoria_industrial,
+            numero_suministro=f"SUM-IND-{i}",
+            categoria_tarifaria_nombre="Industrial",
+        )
+        for i, sid in enumerate(industrial_ids)
+    ]
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={lote_id: historial}, metadata_por_lote={lote_id: metadata}
+    )
+    validacion_source = FakeValidacionDataSource(
+        {lote_id: [_fila_valida(sid) for sid in chica_ids + industrial_ids]}
+    )
+    modelos_ia_repository = FakeModelosIaRepository()
+    predicciones_repository = FakePrediccionesRepository()
+
+    monkeypatch.setattr(
+        procesar_lote_module,
+        "agrupar_para_entrenamiento",
+        functools.partial(agrupar_para_entrenamiento, minimo_categoria=5),
+    )
+
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=validacion_source,
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        modelos_ia_repository=modelos_ia_repository,
+        predicciones_repository=predicciones_repository,
+    )
+
+    resultado = await use_case.execute("LOTE-ML-MULTI")
+
+    assert resultado.ml.suministros_scored == 7
+
+    # Two separate `modelos_ia` fits -- one per scope, groups sorted by scope ("Industrial" <
+    # "global" lexicographically).
+    assert len(modelos_ia_repository.llamadas) == 2
+    assert len(resultado.ml.modelos) == 2
+    assert resultado.ml.modelos[0].scope == "Industrial"
+    assert resultado.ml.modelos[0].suministros_entrenados == 5
+    assert resultado.ml.modelos[1].scope == SCOPE_GLOBAL
+    assert resultado.ml.modelos[1].suministros_entrenados == 2
+    modelo_industrial_id = resultado.ml.modelos[0].modelo_ia_id
+    modelo_global_id = resultado.ml.modelos[1].modelo_ia_id
+    assert modelo_industrial_id != modelo_global_id
+
+    # A SINGLE `reemplazar_lote` call with exactly 7 rows -- every suministro exactly once.
+    assert len(predicciones_repository.llamadas) == 1
+    lote_llamado, filas = predicciones_repository.llamadas[0]
+    assert lote_llamado == lote_id
+    assert len(filas) == 7
+    por_suministro = {fila.suministro_id: fila for fila in filas}
+    assert set(por_suministro) == set(chica_ids) | set(industrial_ids)
+
+    # Correct group -> modelo threading, un-swapped across groups.
+    for sid in industrial_ids:
+        assert por_suministro[sid].modelo_ia_id == modelo_industrial_id
+    for sid in chica_ids:
+        assert por_suministro[sid].modelo_ia_id == modelo_global_id
+
+    # Distinguishable score pattern: strictly increasing with kwh across the WHOLE population --
+    # proves the flat re-indexing did not swap any suministro's score with another's.
+    ids_por_kwh_creciente = chica_ids + industrial_ids
+    scores_por_kwh_creciente = [por_suministro[sid].score for sid in ids_por_kwh_creciente]
+    assert scores_por_kwh_creciente == sorted(scores_por_kwh_creciente)
+    assert len(set(scores_por_kwh_creciente)) == 7  # every suministro gets a DISTINCT score
+    assert max(por_suministro[sid].score for sid in chica_ids) < min(
+        por_suministro[sid].score for sid in industrial_ids
     )

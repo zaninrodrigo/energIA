@@ -68,6 +68,7 @@ def _metadata(
         fecha_alta=date(2020, 1, 1),
         numero_suministro=numero_suministro,
         estado=estado,
+        categoria_tarifaria_nombre="Residencial",
     )
 
 

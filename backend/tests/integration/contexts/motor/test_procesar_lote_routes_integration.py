@@ -117,6 +117,25 @@ async def test_happy_path_transitions_pendiente_lote_to_procesado(
     assert body["reglas"]["resumen"]["hits_por_regla"]["R5"] == 0
     assert body["reglas"]["resumen"]["hits_por_regla"]["R6"] == 0
     assert body["reglas"]["suministros"] == []
+    # Etapa 6 (US-011/RF-006, AI_ENGINE_SPEC.md §9): 3 identical suministros (small synthetic
+    # population, below MODELO_POR_CATEGORIA_MINIMO) all fall into ONE "global" scope fit.
+    assert body["ml"]["suministros_scored"] == 3
+    assert len(body["ml"]["modelos"]) == 1
+    assert body["ml"]["modelos"][0]["scope"] == "global"
+    assert body["ml"]["modelos"][0]["suministros_entrenados"] == 3
+    assert len(body["ml"]["top_10"]) == 3
+    for prediccion in body["ml"]["top_10"]:
+        assert 0.0 <= prediccion["ml_score_0_100"] <= 100.0
+        assert prediccion["clasificacion"] in {"Normal", "Atención", "Alto Riesgo", "Crítico"}
+    modelo_verificacion = await db_session.execute(
+        text("SELECT count(*) FROM modelos_ia WHERE nombre = 'isolation-forest-global'")
+    )
+    assert modelo_verificacion.scalar_one() == 1
+    predicciones_verificacion = await db_session.execute(
+        text("SELECT count(*) FROM predicciones WHERE lote_id = :lote_id AND deleted_at IS NULL"),
+        {"lote_id": lote_id},
+    )
+    assert predicciones_verificacion.scalar_one() == 3
 
 
 async def test_reprocessing_an_already_procesado_lote_is_conflict(
@@ -714,3 +733,71 @@ async def test_r3_fires_end_to_end_for_a_sudden_spike(
     assert r3["tipo"] == "Incremento Brusco"
     assert r3["severidad"] == "Media"
     assert "300%" in r3["descripcion"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Etapa 6 -- Isolation Forest (US-011/RF-006, AI_ENGINE_SPEC.md §9). End-to-end (real HTTP +
+# `energia_test`), not just the wiring-level fakes in
+# `tests/unit/contexts/motor/application/test_procesar_lote.py`.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_ml_runs_even_when_lote_lands_in_error_and_retry_stays_idempotent(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Mission directive #8 (never gates on `estado_final`) + directive #6 (idempotent retry):
+    a lote below DEC-004's threshold still gets scored, and a retry must leave EXACTLY one
+    `modelos_ia` row for the scope (upserted, not duplicated) and exactly one ACTIVE
+    `predicciones` row per suministro (soft-deleted-then-reinserted, not accumulated -- the
+    PREVIOUS attempt's row is soft-deleted, never physically removed, `infrastructure/
+    predicciones_repository.py`)."""
+    suministro_valido = await insert_suministro(db_session, numero_suministro="SUM-ML-RETRY-OK")
+    lote_id = await insert_lote(db_session, codigo_lote="LOTE-ML-RETRY", cantidad_registros=2)
+    await _import_lectura_y_consumo(
+        db_session,
+        suministro_id=suministro_valido,
+        lote_id=lote_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("100.000"),
+    )
+    suministro_invalido = await insert_suministro(db_session, numero_suministro="SUM-ML-RETRY-BAD")
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_invalido,
+        lote_id=lote_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("50.000"),
+    )
+
+    primera = await motor_client.post("/api/v1/motor/lotes/LOTE-ML-RETRY/procesar")
+    assert primera.status_code == 200
+    assert primera.json()["estado_final"] == "Error"
+    assert primera.json()["ml"]["suministros_scored"] == 1  # scored despite landing in Error
+
+    segunda = await motor_client.post("/api/v1/motor/lotes/LOTE-ML-RETRY/procesar")
+    assert segunda.status_code == 200
+    assert segunda.json()["estado_final"] == "Error"
+
+    conteo_modelos = await db_session.execute(
+        text("SELECT count(*) FROM modelos_ia WHERE nombre = 'isolation-forest-global'")
+    )
+    assert conteo_modelos.scalar_one() == 1  # upserted, not duplicated across the retry
+
+    conteo_predicciones = await db_session.execute(
+        text("SELECT count(*) FROM predicciones WHERE lote_id = :lote_id AND deleted_at IS NULL"),
+        {"lote_id": lote_id},
+    )
+    assert conteo_predicciones.scalar_one() == 1  # replaced, not accumulated across the retry
+
+    conteo_predicciones_eliminadas = await db_session.execute(
+        text(
+            "SELECT count(*) FROM predicciones WHERE lote_id = :lote_id AND deleted_at IS NOT NULL"
+        ),
+        {"lote_id": lote_id},
+    )
+    # The FIRST attempt's row is soft-deleted, never physically removed (DATABASE_DESIGN.md §10).
+    assert conteo_predicciones_eliminadas.scalar_one() == 1

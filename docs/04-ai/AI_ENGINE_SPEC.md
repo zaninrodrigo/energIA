@@ -160,6 +160,20 @@ aislamiento en worker que describe el párrafo anterior sigue siendo el objetivo
 cambia); se activa cuando aterricen las etapas CPU-bound (3-6: features, estadística, Isolation
 Forest) — la única etapa implementada hoy no lo necesita.
 
+**Etapa 6, esta implementación (2026-07-15): `asyncio.to_thread`, no un worker dedicado —
+compromiso explícito de v1.** `infrastructure/isolation_forest_scorer.py` (`SklearnIsolationForestScorer`)
+ejecuta el ajuste + scoring de `RobustScaler`/`IsolationForest` dentro del MISMO proceso de la API,
+en un hilo (`asyncio.to_thread`) en lugar de bloquear el event loop — evita que el fit de un lote
+detenga temporalmente OTRAS requests concurrentes que este mismo proceso está sirviendo, pero NO
+le da a esta etapa aislamiento de CPU/proceso propio: los hilos de Python siguen compitiendo por el
+mismo GIL dentro del mismo proceso (ADR-002), y un fit particularmente pesado todavía consume CPU
+del proceso de la API. Esto es exactamente el disparador que este §2.4 ya documentaba para mover
+el motor al worker dedicado de ADR-006: la mitigación en hilo es el compromiso pragmático de v1
+mientras los volúmenes reales son pequeños (dataset sintético, cientos de suministros); el worker
+separado (proceso/contenedor propio) sigue pendiente como el destino cuando los volúmenes se
+acerquen a RNF-007 (hasta 500.000 suministros) — momento en el que el costo de fit/scoring deja de
+ser negligible frente a la latencia de otras requests del mismo proceso.
+
 ### 2.5 Semántica de fallo
 
 | Situación | Qué persiste | Estado resultante |
@@ -764,6 +778,54 @@ Cada corrida escribe una fila en `modelos_ia` (o referencia la versión activa) 
 versión (RD-022: "debe registrarse la versión del modelo utilizada"). Las métricas de evaluación
 van en `metricas_modelo` cuando existan etiquetas para calcularlas (v2; §13).
 
+> **Distinción de `clasificacion` (implementación, 2026-07-15) — `predicciones.clasificacion` NO
+> es `resultados_ia.clasificacion`.** La Etapa 6 banda `predicciones.clasificacion` aplicando las
+> bandas de DEC-015 (§10.2: 0-20 Normal / 21-40 Atención / 41-70 Alto Riesgo / 71-100 Crítico)
+> directamente sobre `ml_score_0_100` (el score normalizado ×100, §9.3) — este es el **veredicto
+> preliminar propio de la rama de ML**, aislado, sin ver las otras dos ramas (reglas, estadística).
+> `resultados_ia.clasificacion` (Etapa 7, todavía no implementada) bandea en cambio el **IRE
+> compuesto** (§10.1), donde el score de IA es apenas uno de los 8 factores (peso 0.30) junto con
+> historial, persistencia de anomalías, variación porcentual, IEE, etc. Un mismo suministro puede
+> tener `predicciones.clasificacion = "Crítico"` (su score de IA aislado es extremo) y terminar con
+> `resultados_ia.clasificacion = "Atención"` (los otros 7 factores lo moderan), o viceversa — no es
+> un error de cómputo, es la diferencia de ALCANCE entre "lo que dice el modelo de IA solo" y "lo
+> que dice el IRE compuesto". El API_SPEC.md documenta este campo explícitamente por esta razón.
+
+> **Semántica de `estado` en `modelos_ia` (implementación, 2026-07-15).** DOMAIN_MODEL.md §10.5
+> lista los estados (`Activo`/`Obsoleto`/`Experimental`/`Retirado`) pero no define una regla de
+> negocio explícita (RD-0xx) que exija un único `Activo` por `nombre` — la implementación adopta
+> esa invariante de todos modos, razonando desde la semántica del propio estado (`"Activo"` se lee
+> como "la versión vigente para este `nombre`", no "una entre varias vigentes a la vez") más
+> RD-048 ("toda versión debe conservarse"): cada fit nuevo se inserta `Activo` y el/los fit(s)
+> `Activo` previos del MISMO `nombre` (scope) pasan a `Obsoleto` (nunca se eliminan, nunca pasan a
+> `Retirado` — ese estado se reserva para una decisión operativa manual de `desactivar()`, no para
+> el reemplazo automático por-lote de DEC-018). RD-049 ("debe registrarse la configuración
+> utilizada") sigue sin columna dedicada (brecha de esquema #3, §16, sin cerrar): en v1 la
+> configuración es siempre la misma (constantes DEC-011/DEC-012/DEC-013), así que es recuperable
+> del código aunque ninguna fila la registre explícitamente.
+
+> **Corrección (revisión, CRÍTICO, 2026-07-15) — condición de carrera del único `Activo` entre
+> lotes concurrentes.** El upsert + flip de `registrar_fit` corría sin ningún lock: dos
+> transacciones concurrentes de lotes DISTINTOS, ambas ajustando el MISMO `nombre` (scope), podían
+> insertar cada una su propia versión `Activo` sin que ninguna viera la fila (todavía no
+> confirmada) de la otra bajo `READ COMMITTED` — el `UPDATE` de flip de cada transacción no
+> encontraba nada que voltear, y el commit de ambas dejaba DOS filas `Activo` para el mismo
+> `nombre`, rompiendo la invariante de arriba. La corrección toma un advisory lock
+> **transaccional** (`SELECT pg_advisory_xact_lock(hashtext('modelos_ia:' || :nombre))`) al
+> comienzo de `registrar_fit`, ANTES del upsert+flip: serializa las llamadas a `registrar_fit` que
+> comparten el mismo `nombre` (la segunda espera a que la primera confirme o revierta la
+> transacción completa), sin bloquear lotes que ajustan un `nombre` DISTINTO. Se libera solo al
+> terminar la transacción (commit o rollback) — no requiere un `UNLOCK` explícito ni un bloque
+> `try/finally` propio. Ver `infrastructure/modelos_ia_repository.py`.
+
+> **Ancho de `version` (implementación, 2026-07-15).** `modelos_ia.version` es `varchar(30)`
+> mientras que `lotes.codigo_lote` es `varchar(50)` — concatenar `codigo_lote` literal (con o sin
+> sufijo de scope) puede exceder ese límite. La implementación deriva `version` de un hash SHA-256
+> de `codigo_lote` (determinístico, acotado a 30 caracteres sin importar el largo de
+> `codigo_lote`), con un prefijo legible truncado para no ser completamente opaco; `nombre` ya
+> codifica el `scope` completo (`isolation-forest-{scope}`), así que `version` no necesita
+> repetirlo para satisfacer `UNIQUE (nombre, version)`.
+
 ### 9.5 Reentrenamiento
 
 **Política v1: modelo (re)ajustado por lote sobre la ventana histórica vigente, sin supervisión.**
@@ -771,6 +833,62 @@ El pipeline completo de Aprendizaje Continuo (DOMAIN_MODEL §10: feedback → da
 reentrenamiento supervisado → publicación) es **v2**, porque depende de inspecciones finalizadas
 que aún no existen (RD-045; ADR-005 cold-start). En v1 no hay `feedback_modelo` ni
 `datasets_etiquetados` poblados. Ver **DEC-018**.
+
+### 9.6 Implementación (estado, 2026-07-15)
+
+Etapa 6 está **implementada**: `domain/isolation_forest.py` (funciones puras: matriz de features,
+agrupamiento por estrategia de entrenamiento DEC-010, normalización DEC-013, banding DEC-015,
+naming determinístico de `modelos_ia.nombre`/`.version`), `infrastructure/
+isolation_forest_scorer.py` (`SklearnIsolationForestScorer`, el único componente no puro — ajusta
+`RobustScaler` + `IsolationForest` en un hilo, `asyncio.to_thread`, §2.4), `infrastructure/
+modelos_ia_repository.py` (upsert por `(nombre, version)` + flip a `Obsoleto`, con un advisory
+lock transaccional por `nombre` que serializa el flip entre lotes concurrentes, §9.4),
+`infrastructure/predicciones_repository.py` (soft-delete-then-insert por `lote_id`, `predicciones`
+no tiene clave natural), integradas en `ProcesarLote._ejecutar_isolation_forest`
+(`application/procesar_lote.py`). Dependencias nuevas: `scikit-learn`, `numpy`
+(`backend/pyproject.toml`).
+
+Desviaciones honestas frente a la redacción original de este documento:
+
+- **Matriz de features:** las 21 keys numéricas/booleanas de `feature_vectors.features` (las 17
+  de §6.1 más `is_cold_start`/`has_conflicted_periods`/`zscore_self`/`percentile_peer`/
+  `iqr_outlier_flag`), EXCLUYENDO `categoria_tarifaria` (string) — la estrategia por-categoría
+  (DEC-010) ya hace redundante usarla como feature de entrada del modelo. Orden de columnas fijo,
+  ordenado alfabéticamente (`NUMERIC_FEATURE_KEYS`), para reproducibilidad exacta entre corridas.
+  Nulos se imputan con la MEDIANA de la cohorte — la población de entrenamiento de ESE modelo
+  (grupo por-categoría o global), no todo el lote cuando ambos coexisten.
+- **Normalización, caso degenerado:** cuando todos los scores crudos de un lote son idénticos
+  (`max == min`), la fórmula de min-max invertido divide por cero — se decidió devolver `0.5` para
+  cada suministro (ni "definitivamente normal" ni "definitivamente anómalo": no hay señal
+  diferenciadora), documentado en `domain/isolation_forest.py`.
+- **Ancho de `modelos_ia.version`:** ver la nota de §9.4 arriba — el patrón ilustrativo
+  `'v1-{codigo_lote}[-{scope}]'` de la misión original excede `varchar(30)` para un `codigo_lote`
+  realista; se reemplazó por un hash determinístico acotado.
+- **`predicciones` — reproceso idempotente:** la tabla no tiene clave única natural más allá de su
+  `id` propio (`docker/postgres/init/01_schema.sql`) — el reproceso de un lote en `Error` hace un
+  soft-delete (`UPDATE ... SET deleted_at = now() WHERE lote_id = :lote_id AND deleted_at IS
+  NULL`) seguido de un INSERT masivo, dentro de la MISMA transacción, en vez de un `ON CONFLICT`
+  (que `feature_vectors`/`modelos_ia` sí pueden usar por tener una clave única). **Corrección
+  (revisión, CRÍTICO, 2026-07-15):** la implementación original hacía un `DELETE` físico — el
+  único de todo `src/` — violando DATABASE_DESIGN.md §10 ("ningún DELETE físico") y, además,
+  reproduciendo un futuro bloqueo: en cuanto la Etapa 7 escriba `resultados_ia.prediccion_id`
+  (`FOREIGN KEY` con regla `NO ACTION` por defecto), reprocesar un lote cuya fila de
+  `predicciones` ya esté referenciada violaría esa FK, dejando el lote sin poder reprocesarse
+  nunca. Se reemplazó por soft-delete (la tabla ya tiene `deleted_at`, igual que el resto del
+  esquema): ninguna fila se elimina físicamente, así que una referencia futura de
+  `resultados_ia.prediccion_id` sigue siendo válida entre reprocesos — seguro ante FK — y queda
+  alineado con la misma convención de auditoría del resto del esquema. Ver
+  `infrastructure/predicciones_repository.py`.
+- **`resultados_ia` no se toca en esta etapa** (Etapa 7, todavía no implementada): el score crudo
+  (`score_crudo` en `domain.isolation_forest.PrediccionSuministro`) queda disponible en memoria
+  dentro de la MISMA ejecución de `ProcesarLote.execute()` para que una futura Etapa 7 lo consuma
+  sin tener que recalcularlo ni volver a persistirlo por separado — no requiere una columna nueva
+  porque Etapa 7, cuando exista, correrá dentro del mismo pipeline atómico (§3), no como una
+  request separada.
+- **Etapa 6 corre incondicionalmente**, sin importar si el lote termina `Procesado` o `Error` por
+  el umbral de DEC-004 — la misma política que Etapas 2-5 ya establecieron. Nunca influye
+  `estado_final`.
+- **Calibración v1 con datos sintéticos:** ver §13.2.
 
 ---
 
@@ -984,6 +1102,67 @@ Falsos positivos sobre 94 sanos (último lote): 1 zscore, 5 IQR, 6 percentile.
 meses calendario, §6.4) de la revisión del 2026-07-15 — ambos pueden desplazar estos números (en
 particular la columna IQR, y cualquier detección que dependa de `trend_slope`). Se remedirá con la
 Etapa 6 (Isolation Forest, §9), cuando exista el pipeline completo contra el que comparar.
+
+### 13.2 Calibración ML v1 (datos sintéticos, seed 42, 2026-07-15)
+
+Con la Etapa 6 ya implementada, se corrieron los 24 lotes mensuales (2022-01 a 2023-12, dataset
+`small`/`seed 42`, 100 suministros, 2.321 evaluaciones) contra una API real (`energia_scratch_ml`,
+base de datos descartable, `energia`/`energia_test` sin tocar). Cada lote cayó por debajo del
+umbral de `MODELO_POR_CATEGORIA_MINIMO` (1.000, DEC-010): las 24 corridas entrenaron un único
+modelo `scope = "global"` (100 % de los suministros analizados) — el camino por-categoría queda
+cubierto por los tests unitarios con matrices sintéticas (`tests/unit/contexts/motor/domain/
+test_isolation_forest.py`), no por esta corrida. `modelos_ia`: 24 filas (una por lote), 23
+`Obsoleto` + 1 `Activo` (la del último lote procesado) — confirma el flip single-Activo-por-
+`nombre` de §9.4. `predicciones`: 2.321 filas, exactamente una por evaluación.
+
+**Rank y score de cada anomalía plantada, en su mes de inicio (`ml_score_0_100`, 0 = menos
+anómalo, 100 = más anómalo; rank 1 = más anómalo de los 100 suministros del lote):**
+
+| suministro | tipo plantado | `ml_score_0_100` | `clasificacion` (banda ML) | rank / 100 | limpios que rankean arriba (de 94) |
+|---|---|---|---|---|---|
+| SYN-S42-SUM-00005 | spike_leve | 83.16 | Crítico | 3 | 1 |
+| SYN-S42-SUM-00014 | sudden_drop | 78.86 | Crítico | 4 | 3 |
+| SYN-S42-SUM-00024 | spike | 100.00 | Crítico | **1** | 0 |
+| SYN-S42-SUM-00032 | sudden_drop_leve | 77.70 | Crítico | 5 | 4 |
+| SYN-S42-SUM-00049 | zero_consumption_streak | 100.00 | Crítico | **1** | 0 |
+| SYN-S42-SUM-00073 | gradual_decline | 3.07 | Normal | 90 | 84 |
+
+**Pregunta central 1 — ¿`spike_leve`/`sudden_drop_leve`/`gradual_decline` (invisibles para las
+reglas, DEC-009) rankean en el top ~10?** Sí para dos de los tres: `spike_leve` (rank 3) y
+`sudden_drop_leve` (rank 5) — exactamente el resultado que ADR-005 promete del híbrido: R2/R3 (§8)
+nunca disparan para estos dos por diseño (están bajo sus umbrales a propósito, ver
+`backend/src/energia/tools/synthetic/anomalies.py`), pero Isolation Forest sí captura la señal
+multivariada (peer_ratio, deviation_from_baseline, percentile_peer, etc. combinados) que ninguna
+regla aislada ve. **`gradual_decline` NO** — rank 90/100 en su mes de inicio, prácticamente
+indistinguible de un suministro sano (`ml_score_0_100 = 3.07`, banda "Normal"): el modelo tampoco
+lo ve al arrancar la caída, la misma brecha que ya documentaba el detector ingenuo de §13.1 ("no
+visible recién 6+ meses después del inicio"). Reportado honestamente: v1 NO cierra esta brecha
+específica en el mes de inicio.
+
+**Pregunta central 2 — ¿el rank de `gradual_decline` MEJORA mes a mes a medida que la caída se
+profundiza?** Sí, con ruido. Los 3 lotes sucesivos pedidos (mes de inicio + 2 siguientes,
+2023-05/06/07): rank **90 → 33 → 47**. Extendiendo a toda la ventana de 8 meses de la caída
+(`duration_months: 8` en el manifiesto sintético): 90, 33, 47, 14, 16, 28, 14, 18 — la tendencia
+de fondo es una mejora clara (de "prácticamente invisible" a "consistentemente en el 15-30 % más
+anómalo"), pero NO es monótona mes a mes (sube y baja dentro de ese rango): el score del suministro
+compite con el ruido normal de los OTROS 99 suministros del lote en cada corrida independiente
+(cada lote reentrena su propio modelo desde cero, DEC-018), así que un mes con más variabilidad
+ajena puede empujar el rank hacia atrás incluso si la caída propia sigue profundizándose.
+
+**Presión de falsos positivos.** La anomalía peor rankeada es `gradual_decline` en su mes de
+inicio: 84 de los 94 suministros sanos del lote rankean POR ENCIMA de ella — un analista que
+siguiera el ranking de ML estrictamente de arriba hacia abajo revisaría 84 suministros sanos antes
+de llegar a esta anomalía real, ese mes. Para las otras 5 anomalías la presión es mínima a nula (0
+a 4 limpios por encima) — el ranking del modelo las coloca casi siempre en el podio del lote.
+
+**Conclusión honesta.** El baseline ML v1 (Isolation Forest + RobustScaler, hiperparámetros fijos
+DEC-011/DEC-012, sin calibración contra datos reales todavía) detecta con fuerza 5 de las 6
+anomalías plantadas en su mes de inicio (incluidas las dos "leve" invisibles para las reglas — la
+contribución real y medible de la rama de ML que ADR-005 predice), y falla igual que el detector
+ingenuo de §13.1 en el mismo punto ciego: una caída gradual reciente, todavía chica en magnitud
+absoluta, no se distingue de ruido normal hasta que se acumula. `contamination`/`n_estimators`/
+`max_samples` (DEC-011/DEC-012) son candidatos de recalibración explícitos frente a esta evidencia,
+no verdades definitivas — la misma cláusula que ya aplica a los umbrales de reglas (§8, DEC-009).
 
 ---
 

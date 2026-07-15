@@ -110,9 +110,39 @@ class InformeReglasSchema(BaseModel):
     suministros: list[ReglasSuministroSchema]
 
 
+class ModeloEntrenadoSchema(BaseModel):
+    scope: str
+    modelo_ia_id: str
+    version: str
+    suministros_entrenados: int
+
+
+class PrediccionResumenSchema(BaseModel):
+    suministro_id: str
+    numero_suministro: str
+    ml_score_0_100: float
+    clasificacion: str
+
+
+class DistribucionScoreSchema(BaseModel):
+    minimo: float
+    p50: float
+    p95: float
+    maximo: float
+
+
+class InformeMLSchema(BaseModel):
+    lote_id: str
+    modelos: list[ModeloEntrenadoSchema]
+    suministros_scored: int
+    distribucion: DistribucionScoreSchema | None
+    top_10: list[PrediccionResumenSchema]
+
+
 class ProcesarLoteResponseSchema(BaseModel):
     estado_final: str
     informe: InformeValidacionSchema
     duplicidades: InformeDuplicidadesSchema
     features: ResumenFeaturesSchema
     reglas: InformeReglasSchema
+    ml: InformeMLSchema

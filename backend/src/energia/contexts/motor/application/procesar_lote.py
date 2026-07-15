@@ -60,6 +60,7 @@ when (e) raises `LoteModificadoError`.
 """
 
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -77,13 +78,31 @@ from energia.contexts.motor.domain.features import (
     resumir_features,
 )
 from energia.contexts.motor.domain.informe_validacion import InformeValidacion, construir_informe
+from energia.contexts.motor.domain.isolation_forest import (
+    ALGORITMO_ISOLATION_FOREST,
+    GrupoEntrenamiento,
+    InformeML,
+    ModeloEntrenadoInfo,
+    PrediccionSuministro,
+    agrupar_para_entrenamiento,
+    bandear_clasificacion,
+    construir_informe_ml,
+    construir_matriz,
+    construir_nombre_modelo,
+    construir_version_modelo,
+    normalizar_scores_min_max_invertido,
+)
 from energia.contexts.motor.domain.lote_estado import EstadoLote
 from energia.contexts.motor.domain.ports import (
     DuplicidadesDataSource,
     FeaturesDataSource,
     FeatureVectorParaGuardar,
     FeatureVectorRepository,
+    IsolationForestScorer,
     LoteProcesamientoPort,
+    ModelosIaRepository,
+    PrediccionesRepository,
+    PrediccionParaGuardar,
     SuministroMetadataRow,
     ValidacionDataSource,
 )
@@ -131,7 +150,7 @@ class LoteNoListoError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ResultadoProcesamiento:
-    """`ProcesarLote.execute()`'s return value: the final estado plus Etapas 1-5's full reports.
+    """`ProcesarLote.execute()`'s return value: the final estado plus Etapas 1-6's full reports.
     `duplicidades` never influences `estado_final` (DEC-005: annotate only, §5); `features`
     (Etapas 3-4, §6-§7) runs unconditionally too, over every NON-EXCLUDED suministro of the lote,
     the same "always runs after Etapa 2, regardless of the 95% outcome" policy `duplicidades`
@@ -139,13 +158,18 @@ class ResultadoProcesamiento:
     reasonable and where it is flagged as a deliberate, honest design note. `reglas` (Etapa 5, §8)
     runs over the SAME non-excluded population that received a `FeatureVector`, reusing it
     (`_evaluar_reglas`'s docstring) -- COMPUTE + REPORT only, no `anomalias` persisted this stage
-    (`domain/reglas.py`'s module docstring)."""
+    (`domain/reglas.py`'s module docstring). `ml` (Etapa 6, US-011/RF-006, §9) ALSO runs over that
+    SAME population, reusing the same vectors (`_ejecutar_isolation_forest`'s docstring) -- unlike
+    `reglas`, this stage DOES persist (`modelos_ia`/`predicciones`, mission directive #6), but
+    still NEVER influences `estado_final` (mission directive #8, same "annotate/compute only"
+    policy every prior stage after Etapa 1 already established)."""
 
     estado_final: EstadoLote
     informe: InformeValidacion
     duplicidades: InformeDuplicidades
     features: ResumenFeatures
     reglas: InformeReglas
+    ml: InformeML
 
 
 class ProcesarLote:
@@ -162,12 +186,18 @@ class ProcesarLote:
         duplicidades_source: DuplicidadesDataSource,
         features_source: FeaturesDataSource,
         feature_vector_repository: FeatureVectorRepository,
+        isolation_forest_scorer: IsolationForestScorer,
+        modelos_ia_repository: ModelosIaRepository,
+        predicciones_repository: PrediccionesRepository,
     ) -> None:
         self._lote_port = lote_port
         self._validacion_source = validacion_source
         self._duplicidades_source = duplicidades_source
         self._features_source = features_source
         self._feature_vector_repository = feature_vector_repository
+        self._isolation_forest_scorer = isolation_forest_scorer
+        self._modelos_ia_repository = modelos_ia_repository
+        self._predicciones_repository = predicciones_repository
 
     async def execute(self, codigo_lote: str) -> ResultadoProcesamiento:
         actual = await self._lote_port.obtener_estado_actual(codigo_lote)
@@ -214,6 +244,9 @@ class ProcesarLote:
         reglas = self._evaluar_reglas(
             actual.id, vectores, historial_por_suministro, metadata_por_suministro
         )
+        ml = await self._ejecutar_isolation_forest(
+            actual.id, actual.codigo_lote, vectores, metadata_por_suministro
+        )
 
         estado_final = EstadoLote.PROCESADO if informe.umbral_cumplido else EstadoLote.ERROR
         movido_final = await self._lote_port.transicionar_estado(
@@ -231,6 +264,7 @@ class ProcesarLote:
             duplicidades=duplicidades,
             features=resumen_features,
             reglas=reglas,
+            ml=ml,
         )
 
     async def _construir_duplicidades(self, lote_id: UUID) -> InformeDuplicidades:
@@ -395,3 +429,112 @@ class ProcesarLote:
             for vector in vectores
         ]
         return construir_informe_reglas(lote_id, entradas, suministros_evaluados=len(vectores))
+
+    async def _ejecutar_isolation_forest(
+        self,
+        lote_id: UUID,
+        codigo_lote: str,
+        vectores: list[FeatureVector],
+        metadata_por_suministro: dict[UUID, SuministroMetadataRow],
+    ) -> InformeML:
+        """Etapa 6 (US-011/RF-006, AI_ENGINE_SPEC.md §9): fit + score Isolation Forest (DEC-011/
+        DEC-012) over the SAME non-excluded population Etapa 5 (`_evaluar_reglas`) just
+        evaluated -- REUSING `vectores`, never recomputing F1-F17/Etapa 4's indicators. NEVER
+        influences `estado_final` (mission directive #8) -- like Etapas 2-5, this is a
+        compute-and-persist stage the 95%-threshold decision (step (i) of the module docstring)
+        never looks at.
+
+        **Training strategy (DEC-010).** `domain.isolation_forest.agrupar_para_entrenamiento`
+        splits `vectores` by categoria tarifaria (>= `MODELO_POR_CATEGORIA_MINIMO` suministros in
+        THIS lote gets its own model; the rest pool into one `"global"` model) -- one
+        `IsolationForestScorer.ajustar_y_puntuar` call, one `modelos_ia` fit
+        (`ModelosIaRepository.registrar_fit`), per group. RAW scores from EVERY group are
+        collected together and normalized ONCE, per lote (DEC-013, not per group) -- see
+        `domain.isolation_forest`'s module docstring for why the normalization scope is the whole
+        lote even though FITTING happens per group.
+
+        **Idempotent Error-retry reprocess (mission directive #6).**
+        `modelos_ia_repository.registrar_fit` upserts by `(nombre, version)` --
+        `construir_version_modelo` is a deterministic function of `codigo_lote` alone, so a retry
+        of the SAME lote reuses the SAME `modelos_ia` row instead of colliding with `uq_modelos_
+        ia_nombre_version`. `predicciones_repository.reemplazar_lote` deletes this lote's
+        previous `predicciones` rows before inserting the fresh set (`predicciones` carries no
+        natural unique key to upsert against, `infrastructure/predicciones_repository.py`'s
+        docstring) -- called even when `vectores` is empty, so a retry that ends up with nothing
+        to score still clears stale rows from a PREVIOUS attempt. Neither write commits here:
+        same single-transaction discipline as every other port this use case calls (§2.5).
+        """
+        if not vectores:
+            await self._predicciones_repository.reemplazar_lote(lote_id, [])
+            return construir_informe_ml(lote_id, modelos=(), predicciones=())
+
+        categoria_nombres = {
+            metadata.categoria_tarifaria_id: metadata.categoria_tarifaria_nombre
+            for metadata in metadata_por_suministro.values()
+        }
+        grupos = agrupar_para_entrenamiento(vectores, categoria_nombres)
+
+        modelos: list[ModeloEntrenadoInfo] = []
+        resultados_por_grupo: list[tuple[GrupoEntrenamiento, UUID, Sequence[float]]] = []
+        scores_crudos: list[float] = []
+        for grupo in grupos:
+            matriz = construir_matriz(grupo.vectores)
+            scores = await self._isolation_forest_scorer.ajustar_y_puntuar(matriz.filas)
+            version = construir_version_modelo(codigo_lote)
+            modelo_ia_id = await self._modelos_ia_repository.registrar_fit(
+                nombre=construir_nombre_modelo(grupo.scope),
+                version=version,
+                algoritmo=ALGORITMO_ISOLATION_FOREST,
+            )
+            modelos.append(
+                ModeloEntrenadoInfo(
+                    scope=grupo.scope,
+                    modelo_ia_id=modelo_ia_id,
+                    version=version,
+                    suministros_entrenados=len(grupo.vectores),
+                )
+            )
+            resultados_por_grupo.append((grupo, modelo_ia_id, scores))
+            scores_crudos.extend(scores)
+
+        # DEC-013: normalized ONCE, across every group's raw scores together -- see this
+        # method's own docstring and `domain.isolation_forest`'s module docstring for why the
+        # normalization scope is the whole lote, not each group.
+        normalizados = normalizar_scores_min_max_invertido(scores_crudos)
+
+        predicciones: list[PrediccionSuministro] = []
+        indice_global = 0
+        for grupo, modelo_ia_id, scores in resultados_por_grupo:
+            for vector, score_crudo in zip(grupo.vectores, scores, strict=True):
+                normalizado = normalizados[indice_global]
+                indice_global += 1
+                ml_score_0_100 = normalizado * 100
+                metadata = metadata_por_suministro[vector.suministro_id]
+                predicciones.append(
+                    PrediccionSuministro(
+                        suministro_id=vector.suministro_id,
+                        numero_suministro=metadata.numero_suministro,
+                        modelo_ia_id=modelo_ia_id,
+                        scope=grupo.scope,
+                        score_crudo=score_crudo,
+                        score_normalizado=normalizado,
+                        ml_score_0_100=ml_score_0_100,
+                        clasificacion=bandear_clasificacion(ml_score_0_100),
+                    )
+                )
+
+        await self._predicciones_repository.reemplazar_lote(
+            lote_id,
+            [
+                PrediccionParaGuardar(
+                    modelo_ia_id=prediccion.modelo_ia_id,
+                    suministro_id=prediccion.suministro_id,
+                    lote_id=lote_id,
+                    score=prediccion.score_normalizado,
+                    clasificacion=prediccion.clasificacion,
+                )
+                for prediccion in predicciones
+            ],
+        )
+
+        return construir_informe_ml(lote_id, modelos=modelos, predicciones=predicciones)

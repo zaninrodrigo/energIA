@@ -127,6 +127,10 @@ async def test_fetch_metadata_suministros_returns_categoria_localidad_fecha_alta
     assert filas[0].categoria_tarifaria_id is not None
     assert filas[0].numero_suministro == "SUM-FEAT-3"
     assert filas[0].estado == "Activo"
+    # Etapa 6 (AI_ENGINE_SPEC.md §9, DEC-010) needs the human-readable categoria name, not just
+    # the UUID, to build `modelos_ia.nombre` -- `insert_suministro`'s default categoria is the
+    # seeded "Residencial" (tests/integration/contexts/motor/conftest.py).
+    assert filas[0].categoria_tarifaria_nombre == "Residencial"
 
 
 async def test_fetch_metadata_suministros_returns_a_non_active_estado(

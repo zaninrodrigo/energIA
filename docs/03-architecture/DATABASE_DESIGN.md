@@ -103,7 +103,7 @@ Esto aplica **solo a identificadores** (nombres de tabla/columna/constraint). Lo
 
 Regla de interpretación aplicada de forma consistente en todo `01_schema.sql`: si `DOMAIN_MODEL.md` titula una sección "Estados" / "Tipos" / "Clasificaciones" / "Prioridades" / "Escala" / "Etiquetas" con una lista cerrada, se traduce a `CHECK IN (...)`. Si el título es "Ejemplos" (lista abierta, no exhaustiva — así lo usa el propio dominio para Hallazgo e, implícitamente, para CategoriaTarifaria) o no hay lista en absoluto, la columna queda sin `CHECK`: inventar valores no documentados sería una decisión de diseño no pedida.
 
-El esquema tiene **34 restricciones `CHECK`** (contadas por `grep -c "CONSTRAINT ck_" docker/postgres/init/01_schema.sql`), más 4 restricciones de unicidad que implementan invariantes de negocio directamente (no son `CHECK`, pero cumplen el mismo rol de integridad):
+El esquema tiene **35 restricciones `CHECK`** (contadas por `grep -c "CONSTRAINT ck_" docker/postgres/init/01_schema.sql`), más 4 restricciones de unicidad que implementan invariantes de negocio directamente (no son `CHECK`, pero cumplen el mismo rol de integridad):
 
 | RD / regla | Tabla.columna | Restricción |
 |---|---|---|
@@ -122,6 +122,7 @@ El esquema tiene **34 restricciones `CHECK`** (contadas por `grep -c "CONSTRAINT
 | RD-040 | `recuperos_economicos.monto_recuperado` | `CHECK (monto_recuperado >= 0)` |
 | RD-048 | `modelos_ia` | `UNIQUE (nombre, version)` |
 | Invariante global §14 / §8.3 | `ire.valor` | `CHECK (valor BETWEEN 0 AND 100)` |
+| AI_ENGINE_SPEC.md §9.3 (reviewer finding, WARNING, 2026-07-15) | `predicciones.score` | `CHECK (score BETWEEN 0 AND 1)` — score normalizado (min-max invertido por lote, DEC-013), sin cota previamente |
 
 Invariantes **no traducibles a `CHECK`** porque dependen del estado de otra fila en otra tabla (`CHECK` en PostgreSQL no puede leer otras tablas; requeriría un trigger o validación de aplicación):
 

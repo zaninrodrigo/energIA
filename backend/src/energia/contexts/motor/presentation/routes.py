@@ -26,19 +26,30 @@ from energia.contexts.motor.infrastructure.feature_vector_repository import (
     SqlFeatureVectorRepository,
 )
 from energia.contexts.motor.infrastructure.features_data_source import SqlFeaturesDataSource
+from energia.contexts.motor.infrastructure.isolation_forest_scorer import (
+    SklearnIsolationForestScorer,
+)
 from energia.contexts.motor.infrastructure.lote_procesamiento import SqlLoteProcesamientoPort
+from energia.contexts.motor.infrastructure.modelos_ia_repository import SqlModelosIaRepository
+from energia.contexts.motor.infrastructure.predicciones_repository import (
+    SqlPrediccionesRepository,
+)
 from energia.contexts.motor.infrastructure.validacion_data_source import SqlValidacionDataSource
 from energia.contexts.motor.presentation.schemas import (
+    DistribucionScoreSchema,
     DriftLoteSchema,
     ExclusionSchema,
     HallazgoSchema,
     IndicadoresResumenSchema,
     InformeDuplicidadesSchema,
+    InformeMLSchema,
     InformeReglasSchema,
     InformeValidacionSchema,
     LecturaNearDuplicateSchema,
+    ModeloEntrenadoSchema,
     PeriodoConflictivoSchema,
     PeriodosConflictivosSuministroSchema,
+    PrediccionResumenSchema,
     ProcesarLoteResponseSchema,
     ReglaHitSchema,
     ReglasSuministroSchema,
@@ -155,6 +166,38 @@ def _to_response(resultado: ResultadoProcesamiento) -> ProcesarLoteResponseSchem
                 for entrada in resultado.reglas.suministros
             ],
         ),
+        ml=InformeMLSchema(
+            lote_id=str(resultado.ml.lote_id),
+            modelos=[
+                ModeloEntrenadoSchema(
+                    scope=modelo.scope,
+                    modelo_ia_id=str(modelo.modelo_ia_id),
+                    version=modelo.version,
+                    suministros_entrenados=modelo.suministros_entrenados,
+                )
+                for modelo in resultado.ml.modelos
+            ],
+            suministros_scored=resultado.ml.suministros_scored,
+            distribucion=(
+                DistribucionScoreSchema(
+                    minimo=resultado.ml.distribucion.minimo,
+                    p50=resultado.ml.distribucion.p50,
+                    p95=resultado.ml.distribucion.p95,
+                    maximo=resultado.ml.distribucion.maximo,
+                )
+                if resultado.ml.distribucion is not None
+                else None
+            ),
+            top_10=[
+                PrediccionResumenSchema(
+                    suministro_id=str(prediccion.suministro_id),
+                    numero_suministro=prediccion.numero_suministro,
+                    ml_score_0_100=prediccion.ml_score_0_100,
+                    clasificacion=prediccion.clasificacion,
+                )
+                for prediccion in resultado.ml.top_10
+            ],
+        ),
     )
 
 
@@ -183,15 +226,20 @@ async def procesar_lote(
 ) -> ProcesarLoteResponseSchema:
     """Run Etapa 1 (US-006, integrity validation) + Etapa 2 (US-007, duplicidades) + Etapa 3
     (US-008, feature generation) + Etapa 4 (US-009, statistical indicators) + Etapa 5
-    (AI_ENGINE_SPEC.md §8, business rules) over `codigo_lote` and decide its final `estado`
-    (`Procesado` if >= 95% of its suministros pass Etapa 1, `Error` otherwise -- DEC-004; Etapas
-    2-5 never influence this, DEC-005 for Etapa 2, and the same unconditional policy extended to
-    Etapas 3-5 -- see `ProcesarLote._generar_features`'s docstring). `feature_vectors` rows are
-    persisted for every NON-EXCLUDED suministro; the response's `features` field is a summary
-    only (counts), never the full vectors. Etapa 5's rule hits, by contrast, are NOT persisted
-    anywhere (`domain/reglas.py`'s module docstring: `anomalias.resultado_ia_id` is `NOT NULL`,
-    requiring Etapas 6-7's `modelo_ia_id`/`clasificacion` that do not exist yet) -- the `reglas`
-    field of this response is the ONLY place a hit is visible in this implementation.
+    (AI_ENGINE_SPEC.md §8, business rules) + Etapa 6 (US-011/RF-006, AI_ENGINE_SPEC.md §9,
+    Isolation Forest) over `codigo_lote` and decide its final `estado` (`Procesado` if >= 95% of
+    its suministros pass Etapa 1, `Error` otherwise -- DEC-004; Etapas 2-6 never influence this,
+    DEC-005 for Etapa 2, and the same unconditional policy extended to Etapas 3-6 -- see
+    `ProcesarLote._generar_features`'s/`_ejecutar_isolation_forest`'s docstrings). `feature_vectors`
+    rows are persisted for every NON-EXCLUDED suministro; the response's `features` field is a
+    summary only (counts), never the full vectors. Etapa 5's rule hits are NOT persisted anywhere
+    (`domain/reglas.py`'s module docstring: `anomalias.resultado_ia_id` is `NOT NULL`, requiring
+    Etapa 7's `modelo_ia_id`/`clasificacion` that do not exist yet) -- the `reglas` field of this
+    response is the ONLY place a hit is visible in this implementation. Etapa 6, by contrast, DOES
+    persist: one `modelos_ia` row per training scope (upsert by `(nombre, version)`, §9.4) and one
+    `predicciones` row per scored suministro (full lote replacement); the response's `ml` field
+    summarizes that write (model versions/scopes, score distribution, top 10) -- never the full
+    per-suministro list.
 
     A SINGLE commit, after the whole use case returns successfully: `ProcesarLote.execute()`
     itself never commits (see that module's docstring for why a single commit at the very end,
@@ -212,6 +260,9 @@ async def procesar_lote(
         duplicidades_source=SqlDuplicidadesDataSource(session),
         features_source=SqlFeaturesDataSource(session),
         feature_vector_repository=SqlFeatureVectorRepository(session),
+        isolation_forest_scorer=SklearnIsolationForestScorer(),
+        modelos_ia_repository=SqlModelosIaRepository(session),
+        predicciones_repository=SqlPrediccionesRepository(session),
     )
     try:
         resultado = await use_case.execute(codigo_lote)

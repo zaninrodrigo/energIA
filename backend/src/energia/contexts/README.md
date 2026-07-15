@@ -13,7 +13,7 @@ later remains possible without a redesign (ADR-006).
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
 | `consumos` | Gestión de Consumos | **Implemented, all 3 entities** (US-003 `Lectura`, US-005 `Lote de Facturación`, US-004 `Consumo` — Épica 1 complete) |
-| `motor` | Motor de Inteligencia Energética | **Implemented, Etapas 1-4** (US-006 + US-010 trigger, Épica 2 slice 1; US-007 duplicidades, slice 2; US-008 features + US-009 indicadores estadísticos, slice 3; Etapas 5-8 not started) |
+| `motor` | Motor de Inteligencia Energética | **Implemented, Etapas 1-6** (US-006 + US-010 trigger, Épica 2 slice 1; US-007 duplicidades, slice 2; US-008 features + US-009 indicadores estadísticos, slice 3; reglas de negocio R1-R6, slice 4; US-011 Isolation Forest, slice 5; Etapas 7-8 not started) |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
 | `dashboard` | Dashboard Ejecutivo | Not started |
@@ -391,9 +391,10 @@ foreign-key reference the way there is for a numeric average.
 ## The `motor` context
 
 `motor` (DOMAIN_MODEL.md §4.4, "Motor de Inteligencia Energética") is the fourth bounded context
-to land, Épica 2 slices 1-3 (US-006 + US-010 trigger, Etapa 1 — validación de integridad; US-007,
+to land, Épica 2 slices 1-5 (US-006 + US-010 trigger, Etapa 1 — validación de integridad; US-007,
 Etapa 2 — detección de duplicidades; US-008 + US-009, Etapas 3-4 — generación de features +
-indicadores estadísticos; Etapas 5-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not started).
+indicadores estadísticos; reglas de negocio, Etapa 5; US-011, Etapa 6 — Isolation Forest; Etapas
+7-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not started).
 Package name: `motor`, the
 short Spanish domain noun itself (the same naming convention `clientes`/`suministros`/`consumos`
 already established), superseding the `intelligence_engine` placeholder this table used before
@@ -472,6 +473,36 @@ bounded context from `motor` (§4.4), even though both share the same physical `
   layer, BEFORE the kwh history ever reaches `domain/features.py`'s pure functions — every
   `consumo_id` appearing in Etapa 2's `periodos_conflictivos` (both sides of each pair) is
   dropped first.
+- `motor/domain/reglas.py` (Etapa 5, business rules, `AI_ENGINE_SPEC.md` §8) evaluates R1-R6 over
+  the ALREADY-BUILT `FeatureVector` of every non-excluded suministro — pure, no I/O, compute +
+  report only (`anomalias.resultado_ia_id` is `NOT NULL`, requiring a `ResultadoIA` row that does
+  not exist until Etapa 7, so no `anomalias` row is persisted here yet).
+- **Etapa 6 — Isolation Forest (US-011/RF-006, `AI_ENGINE_SPEC.md` §9).**
+  `motor/domain/isolation_forest.py` is the ML branch's pure logic: the numeric feature matrix
+  (every `FeatureVector.features` key except `categoria_tarifaria`), the training-strategy
+  grouping (DEC-010 — one model per categoría tarifaria at ≥ 1.000 analyzed suministros in the
+  lote, pooled `"global"` fallback otherwise), per-lote score normalization (DEC-013, inverted
+  min-max) and classification banding (DEC-015). The ONE non-pure piece is
+  `motor/infrastructure/isolation_forest_scorer.py` (`SklearnIsolationForestScorer`,
+  `RobustScaler` + `IsolationForest`, DEC-011/DEC-012) — fit/scored inside `asyncio.to_thread`
+  (CPU-bound, must never block the event loop; a dedicated worker process, ADR-006, is still the
+  pending destination once real volumes approach RNF-007 — see `AI_ENGINE_SPEC.md` §2.4). Unlike
+  Etapa 5, Etapa 6 WRITES to tables `motor` owns: `motor/infrastructure/modelos_ia_repository.py`
+  (`SqlModelosIaRepository`, upsert by `(nombre, version)` + flips every other `Activo` row of the
+  SAME `nombre` to `Obsoleto` — a single-Activo-per-`nombre` invariant this implementation adds,
+  since DOMAIN_MODEL.md §10.5 lists the states but carries no explicit RD-0xx rule for it — a
+  transaction-scoped advisory lock (`pg_advisory_xact_lock(hashtext('modelos_ia:' || nombre))`,
+  taken before the upsert+flip) serializes `registrar_fit` calls sharing the SAME `nombre`, fixing
+  a reviewer-reproduced race where two concurrent DIFFERENT-lote fits of the SAME scope could each
+  commit their own `Activo` row without seeing the other's, `AI_ENGINE_SPEC.md` §9.4) and
+  `motor/infrastructure/predicciones_repository.py` (`SqlPrediccionesRepository`, soft-delete-then-
+  INSERT by `lote_id` — never a physical `DELETE` (fixed from an earlier physical `DELETE`, the
+  only one in `src/`, which risked an FK violation once Etapa 7's `resultados_ia.prediccion_id`
+  references a row being retried, `AI_ENGINE_SPEC.md` §9.6); `predicciones` has no natural unique
+  key to upsert against, unlike `feature_vectors`/`modelos_ia`). `ProcesarLote._ejecutar_isolation_forest` orchestrates all of
+  the above over the SAME non-excluded, vector-bearing population Etapa 5 already evaluated —
+  reusing those vectors, never recomputing features — and NEVER influences `estado_final`, the
+  same "compute + persist, never gate" policy every stage after Etapa 1 already established.
 
 ### Single-transaction atomicity, no explicit locking
 

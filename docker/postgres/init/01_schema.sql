@@ -434,7 +434,9 @@ CREATE TABLE predicciones (
         FOREIGN KEY (lote_id) REFERENCES lotes (id),
     -- Reutiliza las Clasificaciones de ResultadoIA (§8.1): misma escala conceptual.
     CONSTRAINT ck_predicciones_clasificacion
-        CHECK (clasificacion IN ('Normal', 'Atención', 'Alto Riesgo', 'Crítico'))
+        CHECK (clasificacion IN ('Normal', 'Atención', 'Alto Riesgo', 'Crítico')),
+    -- AI_ENGINE_SPEC.md §9.3: score normalizado a [0,1] (min-max invertido por lote, DEC-013).
+    CONSTRAINT ck_predicciones_score_rango CHECK (score BETWEEN 0 AND 1)
 );
 
 CREATE TRIGGER trg_predicciones_set_updated_at

@@ -37,6 +37,10 @@ __all__ = [
     "FeaturesDataSource",
     "FeatureVectorParaGuardar",
     "FeatureVectorRepository",
+    "IsolationForestScorer",
+    "ModelosIaRepository",
+    "PrediccionParaGuardar",
+    "PrediccionesRepository",
 ]
 
 
@@ -257,7 +261,15 @@ class SuministroMetadataRow:
     negocio): `estado` is R1's "suministro activo" condition (`suministros.estado`, no enumerated
     value list at the DDL level -- exact string match against the seeded default `'Activo'`,
     `domain/reglas.py`'s `ESTADO_SUMINISTRO_ACTIVO`); `numero_suministro` is the natural key the
-    Etapa 5 informe reports hits against (more actionable for an inspector than a bare UUID)."""
+    Etapa 5 informe reports hits against (more actionable for an inspector than a bare UUID).
+
+    `categoria_tarifaria_nombre` was added for Etapa 6 (AI_ENGINE_SPEC.md §9, DEC-010):
+    `domain/isolation_forest.py`'s `agrupar_para_entrenamiento` needs the categoria's human-
+    readable `nombre` (e.g. `"Residencial"`) to build `modelos_ia.nombre`
+    (`isolation-forest-{scope}`) -- `FeatureVector` itself only ever carries the UUID
+    (`categoria_tarifaria_id`; F17 `categoria_tarifaria` in the jsonb is `str(categoria_tarifaria_
+    id)`, not the name), so this is the one place that name is available to the application
+    layer without a separate round trip."""
 
     suministro_id: UUID
     categoria_tarifaria_id: UUID
@@ -265,6 +277,7 @@ class SuministroMetadataRow:
     fecha_alta: date
     numero_suministro: str
     estado: str
+    categoria_tarifaria_nombre: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,5 +339,73 @@ class FeatureVectorRepository(Protocol):
         """Upsert every vector: `INSERT ... ON CONFLICT (suministro_id, lote_id, version) DO
         UPDATE` -- a reprocess (Error -> retry) overwrites the same rows instead of duplicating
         them (mission directive #6). Does not commit: same session/transaction discipline as
+        every other port in this module."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+class IsolationForestScorer(Protocol):
+    """Etapa 6 (AI_ENGINE_SPEC.md §9, DEC-011/DEC-012): fit `RobustScaler` + `IsolationForest`
+    over ONE training group's already-built numeric matrix (`domain/isolation_forest.py`'s
+    `construir_matriz`) and return the RAW `decision_function` score per row, in the SAME order
+    as the input matrix's rows. This is the ONE non-pure piece of Etapa 6 (`domain/
+    isolation_forest.py`'s module docstring) -- sklearn is a third-party ML library, an adapter,
+    exactly like `FeatureVectorRepository` is an adapter around SQL. See
+    `infrastructure/isolation_forest_scorer.py`'s docstring for the `asyncio.to_thread` wrapping
+    (AI_ENGINE_SPEC.md §2.4/§12: CPU-bound, must never block the event loop)."""
+
+    async def ajustar_y_puntuar(self, matriz: Sequence[Sequence[float]]) -> Sequence[float]:
+        """Fit on `matriz` (rows = suministros, columns = `NUMERIC_FEATURE_KEYS`) and return one
+        RAW `decision_function` score per row -- more negative = more anomalous. Never
+        normalized/banded here (`domain/isolation_forest.py` owns that, DEC-013/DEC-015)."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+class ModelosIaRepository(Protocol):
+    """Same-context port: `modelos_ia` (DOMAIN_MODEL.md §8.6/§10.5) -- Etapa 6's model registry
+    write. See `infrastructure/modelos_ia_repository.py`'s docstring for the upsert + single-
+    Activo-per-nombre semantics, and for why `registrar_fit` takes a transaction-scoped advisory
+    lock keyed on `nombre` (serializes concurrent fits of the SAME scope across different lotes,
+    fixing a race where two such fits could each commit their own `Activo` row)."""
+
+    async def registrar_fit(self, *, nombre: str, version: str, algoritmo: str) -> UUID:
+        """Register one scope's fit for this lote: upsert `(nombre, version)` as `Activo`
+        (idempotent across an Error-retry reprocess of the SAME lote, since `domain/
+        isolation_forest.py`'s `construir_version_modelo` is deterministic per `codigo_lote`),
+        then flip every OTHER row sharing `nombre` that is currently `Activo` to `Obsoleto`.
+        Returns the (possibly pre-existing) row's `id`. Does not commit: same session/transaction
+        discipline as every other port in this module."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+@dataclass(frozen=True, slots=True)
+class PrediccionParaGuardar:
+    """The minimal shape `PrediccionesRepository.reemplazar_lote` persists -- deliberately NOT
+    `domain.isolation_forest.PrediccionSuministro` itself (which also carries `numero_suministro`/
+    `scope`, transient reporting-only fields not stored on `predicciones`), mirroring
+    `FeatureVectorParaGuardar`'s own reasoning above."""
+
+    modelo_ia_id: UUID
+    suministro_id: UUID
+    lote_id: UUID
+    score: float
+    clasificacion: str
+
+
+class PrediccionesRepository(Protocol):
+    """Same-context port: `predicciones` (DOMAIN_MODEL.md §8.7) -- Etapa 6's per-suministro
+    scoring write. See `infrastructure/predicciones_repository.py`'s docstring for why this is a
+    soft-delete-then-insert, not an `ON CONFLICT` upsert (unlike `FeatureVectorRepository`/
+    `ModelosIaRepository`): `predicciones` has no natural unique key beyond its surrogate `id`
+    (`docker/postgres/init/01_schema.sql`), and a physical `DELETE` would violate
+    DATABASE_DESIGN.md §10 ("ningún DELETE físico") and risk a future FK violation once Etapa 7's
+    `resultados_ia.prediccion_id` references it (`infrastructure/predicciones_repository.py`'s
+    module docstring)."""
+
+    async def reemplazar_lote(self, lote_id: UUID, filas: Sequence[PrediccionParaGuardar]) -> None:
+        """Idempotent Error-retry reprocess (mission directive #6): soft-delete every existing
+        `predicciones` row for `lote_id` FIRST (`deleted_at = now()`, never a physical `DELETE`),
+        then bulk-insert `filas` -- a retry of the SAME lote never accumulates duplicate ACTIVE
+        rows from a previous attempt, and the previous attempt's rows stay FK-safe for anything
+        that already references them. Does not commit: same session/transaction discipline as
         every other port in this module."""
         ...  # pragma: no cover — Protocol stub, never executed directly
