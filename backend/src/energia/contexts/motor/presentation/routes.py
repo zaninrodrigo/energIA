@@ -34,12 +34,16 @@ from energia.contexts.motor.presentation.schemas import (
     HallazgoSchema,
     IndicadoresResumenSchema,
     InformeDuplicidadesSchema,
+    InformeReglasSchema,
     InformeValidacionSchema,
     LecturaNearDuplicateSchema,
     PeriodoConflictivoSchema,
     PeriodosConflictivosSuministroSchema,
     ProcesarLoteResponseSchema,
+    ReglaHitSchema,
+    ReglasSuministroSchema,
     ResumenFeaturesSchema,
+    ResumenReglasSchema,
 )
 from energia.shared.db import get_db_session
 
@@ -127,6 +131,30 @@ def _to_response(resultado: ResultadoProcesamiento) -> ProcesarLoteResponseSchem
                 percentile_extremos=resultado.features.percentile_extremos,
             ),
         ),
+        reglas=InformeReglasSchema(
+            lote_id=str(resultado.reglas.lote_id),
+            resumen=ResumenReglasSchema(
+                suministros_evaluados=resultado.reglas.resumen.suministros_evaluados,
+                suministros_con_hits=resultado.reglas.resumen.suministros_con_hits,
+                hits_por_regla=resultado.reglas.resumen.hits_por_regla,
+            ),
+            suministros=[
+                ReglasSuministroSchema(
+                    suministro_id=str(entrada.suministro_id),
+                    numero_suministro=entrada.numero_suministro,
+                    hits=[
+                        ReglaHitSchema(
+                            regla=hit.regla,
+                            tipo=hit.tipo,
+                            severidad=hit.severidad,
+                            descripcion=hit.descripcion,
+                        )
+                        for hit in entrada.hits
+                    ],
+                )
+                for entrada in resultado.reglas.suministros
+            ],
+        ),
     )
 
 
@@ -154,12 +182,16 @@ async def procesar_lote(
     session: AsyncSession = Depends(get_db_session),
 ) -> ProcesarLoteResponseSchema:
     """Run Etapa 1 (US-006, integrity validation) + Etapa 2 (US-007, duplicidades) + Etapa 3
-    (US-008, feature generation) + Etapa 4 (US-009, statistical indicators) over `codigo_lote`
-    and decide its final `estado` (`Procesado` if >= 95% of its suministros pass Etapa 1, `Error`
-    otherwise -- DEC-004; Etapas 2-4 never influence this, DEC-005 for Etapa 2, and the same
-    unconditional policy extended to Etapas 3-4 -- see `ProcesarLote._generar_features`'s
-    docstring). `feature_vectors` rows are persisted for every NON-EXCLUDED suministro; the
-    response's `features` field is a summary only (counts), never the full vectors.
+    (US-008, feature generation) + Etapa 4 (US-009, statistical indicators) + Etapa 5
+    (AI_ENGINE_SPEC.md §8, business rules) over `codigo_lote` and decide its final `estado`
+    (`Procesado` if >= 95% of its suministros pass Etapa 1, `Error` otherwise -- DEC-004; Etapas
+    2-5 never influence this, DEC-005 for Etapa 2, and the same unconditional policy extended to
+    Etapas 3-5 -- see `ProcesarLote._generar_features`'s docstring). `feature_vectors` rows are
+    persisted for every NON-EXCLUDED suministro; the response's `features` field is a summary
+    only (counts), never the full vectors. Etapa 5's rule hits, by contrast, are NOT persisted
+    anywhere (`domain/reglas.py`'s module docstring: `anomalias.resultado_ia_id` is `NOT NULL`,
+    requiring Etapas 6-7's `modelo_ia_id`/`clasificacion` that do not exist yet) -- the `reglas`
+    field of this response is the ONLY place a hit is visible in this implementation.
 
     A SINGLE commit, after the whole use case returns successfully: `ProcesarLote.execute()`
     itself never commits (see that module's docstring for why a single commit at the very end,

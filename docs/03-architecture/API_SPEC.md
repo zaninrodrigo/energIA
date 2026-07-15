@@ -481,13 +481,15 @@ Lista paginada de consumos vigentes (excluye soft-deleted, `deleted_at IS NULL`)
 
 ## Contexto: Motor de Inteligencia Energética
 
-Épica 2, slices 1-3 (US-006 "validar la integridad de los datos importados" + US-010, el disparo del motor; US-007 "detección de duplicados"; US-008 "generar features" + US-009 "indicadores estadísticos"). Documenta Etapa 1 (validación de integridad, `docs/04-ai/AI_ENGINE_SPEC.md` §4), Etapa 2 (detección de duplicidades, §5), Etapa 3 (generación de features, §6) y Etapa 4 (indicadores estadísticos, §7); las Etapas 5-8 (reglas de negocio, Isolation Forest, IRE, IEE) no están implementadas todavía.
+Épica 2, slices 1-4 (US-006 "validar la integridad de los datos importados" + US-010, el disparo del motor; US-007 "detección de duplicados"; US-008 "generar features" + US-009 "indicadores estadísticos"; reglas de negocio). Documenta Etapa 1 (validación de integridad, `docs/04-ai/AI_ENGINE_SPEC.md` §4), Etapa 2 (detección de duplicidades, §5), Etapa 3 (generación de features, §6), Etapa 4 (indicadores estadísticos, §7) y Etapa 5 (reglas de negocio, §8); las Etapas 6-8 (Isolation Forest, IRE, IEE) no están implementadas todavía.
 
 ### POST /api/v1/motor/lotes/{codigo_lote}/procesar
 
 Ejecuta la Etapa 1 sobre el lote `codigo_lote`: valida que su carga esté completa (AI_ENGINE_SPEC.md §2.1), corre los 7 chequeos de integridad (V1-V7, §4.1) sobre su cadena importada (`consumos` + `lecturas` + `suministros` + `categorias_tarifarias`) y decide su `estado` final. A continuación corre la Etapa 2 (§5): detecta solapamientos de períodos, near-duplicates de lecturas y drift de conteo entre lotes, y los agrega en el campo `duplicidades` de la respuesta — **anotación únicamente** (DEC-005): nunca cambia el `estado_final`, que sigue decidiéndose solo por la Etapa 1 (DEC-004).
 
 A continuación corren las Etapas 3-4 (§6/§7): genera un `FeatureVector` (17 features F1-F17 + `is_cold_start` + los 3 indicadores estadísticos de Etapa 4) por cada suministro **no excluido** por la Etapa 1, y lo persiste (upsert) en `feature_vectors`. Igual que Etapa 2, corre **incondicionalmente** — nunca cambia `estado_final` (ver AI_ENGINE_SPEC.md §6.4 para esta decisión v1 documentada). El campo `features` de la respuesta es un **resumen** (conteos), nunca el vector completo — ver la nota de tamaño de respuesta más abajo.
+
+Por último corre la Etapa 5 (§8, reglas de negocio): evalúa las 6 reglas R1-R6 sobre el `FeatureVector` **ya construido** de cada suministro no excluido (sin recalcular ninguna feature), y agrega el resultado en el campo `reglas` de la respuesta — **cómputo + reporte únicamente**, igual que la Etapa 1 (§4.2): `anomalias.resultado_ia_id` es `NOT NULL`, así que persistir una anomalía exige una fila de `ResultadoIA` (Etapas 6-7, todavía no implementadas); esta implementación no la fabrica. `reglas` tampoco cambia `estado_final`.
 
 **Disparador corregido (STEP 0, AI_ENGINE_SPEC.md §2.1-§2.2, 2026-07-14):** este endpoint actúa sobre un lote `Pendiente` (o `Error`, reintento) — es el propio motor quien lo transiciona a `Procesando` y luego a `Procesado`/`Error`, nunca al revés. La versión previa de esta especificación (todavía sin implementar) describía el disparo sobre un lote ya `Procesado`, una inconsistencia interna corregida junto con esta implementación (ver AI_ENGINE_SPEC.md §2 para el detalle completo).
 
@@ -566,13 +568,35 @@ A continuación corren las Etapas 3-4 (§6/§7): genera un `FeatureVector` (17 f
       "iqr_outliers": 0,
       "percentile_extremos": 0
     }
+  },
+  "reglas": {
+    "lote_id": "5b1b6e0e-...-...",
+    "resumen": {
+      "suministros_evaluados": 3,
+      "suministros_con_hits": 1,
+      "hits_por_regla": { "R1": 1, "R2": 0, "R3": 0, "R4": 0, "R5": 0, "R6": 0 }
+    },
+    "suministros": [
+      {
+        "suministro_id": "8f2c...-...",
+        "numero_suministro": "SUM-00123",
+        "hits": [
+          {
+            "regla": "R1",
+            "tipo": "Persistencia Anómala",
+            "severidad": "Alta",
+            "descripcion": "R1: racha de 4 períodos consecutivos con consumo cero (umbral 3), suministro en estado Activo"
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
 | Campo | Tipo | Notas |
 |---|---|---|
-| `estado_final` | string | `"Procesado"` (`fraccion_valida >= 0.95`, DEC-004) o `"Error"` (por debajo del umbral) — decidido únicamente por `informe` (Etapa 1); `duplicidades` (Etapa 2) y `features` (Etapas 3-4) nunca lo influyen (DEC-005 para Etapa 2, misma política extendida a Etapas 3-4 — ver AI_ENGINE_SPEC.md §6.4) |
+| `estado_final` | string | `"Procesado"` (`fraccion_valida >= 0.95`, DEC-004) o `"Error"` (por debajo del umbral) — decidido únicamente por `informe` (Etapa 1); `duplicidades` (Etapa 2), `features` (Etapas 3-4) y `reglas` (Etapa 5) nunca lo influyen (DEC-005 para Etapa 2, misma política extendida a Etapas 3-5 — ver AI_ENGINE_SPEC.md §6.4/§8.1) |
 | `informe.lote_id` | UUID | — |
 | `informe.total_suministros` | integer | Suministros distintos con al menos un consumo activo en el lote |
 | `informe.suministros_excluidos` | integer | Suministros con al menos un hallazgo V1-V7 (DEC-003: excluir + anotar, no abortar el lote) |
@@ -590,6 +614,12 @@ A continuación corren las Etapas 3-4 (§6/§7): genera un `FeatureVector` (17 f
 | `features.indicadores.zscore_extremos` | integer | Cuántos vectores tienen `\|zscore_self\| >= 3` (§7) |
 | `features.indicadores.iqr_outliers` | integer | Cuántos vectores tienen `iqr_outlier_flag = true` (§7) |
 | `features.indicadores.percentile_extremos` | integer | Cuántos vectores tienen `percentile_peer >= 0.99` (§7) |
+| `reglas.lote_id` | UUID | — |
+| `reglas.resumen.suministros_evaluados` | integer | Suministros con vector sobre los que se evaluaron las reglas R1-R6 (AI_ENGINE_SPEC.md §8) |
+| `reglas.resumen.suministros_con_hits` | integer | Cuántos de ellos dispararon al menos una regla |
+| `reglas.resumen.hits_por_regla` | object | Conteo de disparos por regla: `{ "R1": n, ..., "R6": n }` — un suministro puede disparar varias reglas a la vez |
+| `reglas.suministros` | array | Uno por suministro con al menos un hit, ordenado por `numero_suministro`: `{ "suministro_id": "...", "numero_suministro": "...", "hits": [...] }` |
+| `reglas.suministros[].hits` | array | Cada hit: `{ "regla": "R2", "tipo": "Caída Brusca", "severidad": "Alta", "descripcion": "..." }` — `tipo`/`severidad` usan los literales exactos del CHECK de `anomalias`; `descripcion` lleva la evidencia numérica (RN-012). No se persisten en esta etapa: convergen en el `ResultadoIA` de la Etapa 7 (ver AI_ENGINE_SPEC.md §8) |
 
 **Persistencia (implementación v1, ver AI_ENGINE_SPEC.md §4.2/§5 para el detalle completo):** ni `informe` ni `duplicidades` se persisten en base de datos — `resultados_ia` exige `modelo_ia_id`/`clasificacion` (`NOT NULL`), que no existen hasta la etapa de scoring (§9). El único efecto persistente de este endpoint sobre esas dos etapas es la transición de `lotes.estado`. Las Etapas 3-4, en cambio, SÍ persisten: cada `FeatureVector` no resumido se escribe (upsert) en `feature_vectors` (`suministro_id`, `lote_id`, `version = "v1"`, `features` jsonb con las 17 features + `is_cold_start` + `has_conflicted_periods` + los 3 indicadores de Etapa 4) — `features` en la respuesta HTTP es solo un resumen de conteos, nunca el vector completo, por tamaño de respuesta (un lote puede tener miles de suministros).
 

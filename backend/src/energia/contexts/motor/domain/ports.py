@@ -251,12 +251,20 @@ class SuministroMetadataRow:
     """One suministro's Etapa 3 metadata (categoria/localidad/fecha_alta) -- everything
     `construir_feature_vector` needs besides the kwh history itself (F14 `supply_age_days`, F17
     `categoria_tarifaria`, and the cohort grouping key `categoria_tarifaria_id` x `localidad`,
-    DEC-008)."""
+    DEC-008).
+
+    `numero_suministro`/`estado` were added for Etapa 5 (AI_ENGINE_SPEC.md §8, US-0xx reglas de
+    negocio): `estado` is R1's "suministro activo" condition (`suministros.estado`, no enumerated
+    value list at the DDL level -- exact string match against the seeded default `'Activo'`,
+    `domain/reglas.py`'s `ESTADO_SUMINISTRO_ACTIVO`); `numero_suministro` is the natural key the
+    Etapa 5 informe reports hits against (more actionable for an inspector than a bare UUID)."""
 
     suministro_id: UUID
     categoria_tarifaria_id: UUID
     localidad: str | None
     fecha_alta: date
+    numero_suministro: str
+    estado: str
 
 
 @dataclass(frozen=True, slots=True)

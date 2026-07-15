@@ -36,12 +36,18 @@ Flow (AI_ENGINE_SPEC.md §2.1, STEP 0 correction):
       UNCONDITIONALLY, same "runs regardless of the 95% outcome" policy step (g) already
       established for Etapa 2 (see that method's own docstring for the honest v1 design note).
       Persists via `FeatureVectorRepository.guardar_batch` (upsert, same transaction).
+  (h.1) run Etapa 5 (business rules, `domain.reglas.evaluar_reglas`, AI_ENGINE_SPEC.md §8) over
+      every vector step (h) just built -- REUSING it, never recomputing F1-F17/the Etapa 4
+      indicators (`_evaluar_reglas`'s docstring). COMPUTE + REPORT only: no `anomalias` row is
+      written this stage (that FK requires a `ResultadoIA` row, which requires Etapas 6-7's
+      `modelo_ia_id`/`clasificacion` -- `domain/reglas.py`'s module docstring). Hits live only in
+      the response's `reglas` field.
   (i) transition `Procesando` -> `Procesado` (>= 95% valid) or `Procesando` -> `Error` (< 95%).
       `assert`ed to succeed: under the row lock held since step (c), a `False` return here would
       mean a broken invariant, not a normal race (protects a future refactor that might
       accidentally release that lock early, e.g. an intermediate commit).
-  (j) return the full `InformeValidacion` + `InformeDuplicidades` + `ResumenFeatures` plus the
-      final `EstadoLote`.
+  (j) return the full `InformeValidacion` + `InformeDuplicidades` + `ResumenFeatures` +
+      `InformeReglas` plus the final `EstadoLote`.
 
 Nothing here calls `session.commit()` -- see `presentation/routes.py`'s docstring for why a
 SINGLE commit at the very end (after step (h), not after step (c) too) is what keeps this whole
@@ -64,6 +70,7 @@ from energia.contexts.motor.domain.duplicidades import (
 )
 from energia.contexts.motor.domain.features import (
     FeatureConsumoRow,
+    FeatureVector,
     ResumenFeatures,
     construir_feature_vector,
     enriquecer_con_indicadores_cohorte,
@@ -77,7 +84,14 @@ from energia.contexts.motor.domain.ports import (
     FeatureVectorParaGuardar,
     FeatureVectorRepository,
     LoteProcesamientoPort,
+    SuministroMetadataRow,
     ValidacionDataSource,
+)
+from energia.contexts.motor.domain.reglas import (
+    InformeReglas,
+    ReglasSuministro,
+    construir_informe_reglas,
+    evaluar_reglas,
 )
 
 
@@ -117,17 +131,21 @@ class LoteNoListoError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ResultadoProcesamiento:
-    """`ProcesarLote.execute()`'s return value: the final estado plus Etapas 1-4's full reports.
+    """`ProcesarLote.execute()`'s return value: the final estado plus Etapas 1-5's full reports.
     `duplicidades` never influences `estado_final` (DEC-005: annotate only, §5); `features`
     (Etapas 3-4, §6-§7) runs unconditionally too, over every NON-EXCLUDED suministro of the lote,
     the same "always runs after Etapa 2, regardless of the 95% outcome" policy `duplicidades`
     already established -- see `_generar_features`'s docstring for why this v1 choice is
-    reasonable and where it is flagged as a deliberate, honest design note."""
+    reasonable and where it is flagged as a deliberate, honest design note. `reglas` (Etapa 5, §8)
+    runs over the SAME non-excluded population that received a `FeatureVector`, reusing it
+    (`_evaluar_reglas`'s docstring) -- COMPUTE + REPORT only, no `anomalias` persisted this stage
+    (`domain/reglas.py`'s module docstring)."""
 
     estado_final: EstadoLote
     informe: InformeValidacion
     duplicidades: InformeDuplicidades
     features: ResumenFeatures
+    reglas: InformeReglas
 
 
 class ProcesarLote:
@@ -187,7 +205,15 @@ class ProcesarLote:
 
         informe = construir_informe(actual.id, list(filas))
         duplicidades = await self._construir_duplicidades(actual.id)
-        features = await self._generar_features(actual.id, informe, duplicidades)
+        (
+            resumen_features,
+            vectores,
+            historial_por_suministro,
+            metadata_por_suministro,
+        ) = await self._generar_features(actual.id, informe, duplicidades)
+        reglas = self._evaluar_reglas(
+            actual.id, vectores, historial_por_suministro, metadata_por_suministro
+        )
 
         estado_final = EstadoLote.PROCESADO if informe.umbral_cumplido else EstadoLote.ERROR
         movido_final = await self._lote_port.transicionar_estado(
@@ -200,7 +226,11 @@ class ProcesarLote:
         )
 
         return ResultadoProcesamiento(
-            estado_final=estado_final, informe=informe, duplicidades=duplicidades, features=features
+            estado_final=estado_final,
+            informe=informe,
+            duplicidades=duplicidades,
+            features=resumen_features,
+            reglas=reglas,
         )
 
     async def _construir_duplicidades(self, lote_id: UUID) -> InformeDuplicidades:
@@ -223,11 +253,21 @@ class ProcesarLote:
 
     async def _generar_features(
         self, lote_id: UUID, informe: InformeValidacion, duplicidades: InformeDuplicidades
-    ) -> ResumenFeatures:
+    ) -> tuple[
+        ResumenFeatures,
+        list[FeatureVector],
+        dict[UUID, list[FeatureConsumoRow]],
+        dict[UUID, SuministroMetadataRow],
+    ]:
         """Etapa 3 (US-008, §6) + Etapa 4 (US-009, §7): build and persist one `FeatureVector` per
         NON-EXCLUDED suministro of `lote_id` (mission directive #1 -- Etapa 1's `informe.
         exclusiones` are skipped, exactly like the scoring branches downstream would skip them),
         after Etapa 2.
+
+        Besides the `ResumenFeatures` summary, this also returns the cohort-enriched vectors, the
+        FILTERED per-suministro kwh history, and the metadata keyed by suministro_id -- Etapa 5
+        (`_evaluar_reglas`) needs all three to evaluate its rules WITHOUT recomputing anything
+        Etapa 3-4 already computed (mission directive: "do not recompute features").
 
         **Deliberate v1 design note: this runs UNCONDITIONALLY, regardless of `informe.
         umbral_cumplido`.** AI_ENGINE_SPEC.md §3's pipeline draws stages 1->2->3->4->... as one
@@ -311,4 +351,47 @@ class ProcesarLote:
             ]
         )
 
-        return resumir_features(vectores)
+        metadata_por_suministro = {fila.suministro_id: fila for fila in metadata_filas}
+        return (
+            resumir_features(vectores),
+            vectores,
+            historial_por_suministro,
+            metadata_por_suministro,
+        )
+
+    def _evaluar_reglas(
+        self,
+        lote_id: UUID,
+        vectores: list[FeatureVector],
+        historial_por_suministro: dict[UUID, list[FeatureConsumoRow]],
+        metadata_por_suministro: dict[UUID, SuministroMetadataRow],
+    ) -> InformeReglas:
+        """Etapa 5 (business rules, AI_ENGINE_SPEC.md §8): pure, synchronous rule evaluation over
+        every vector Etapa 3-4 (`_generar_features`) just built -- REUSING it, never recomputing
+        F1-F17/the Etapa 4 indicators (mission directive: "do not recompute features"). Runs over
+        exactly the same non-excluded population that received a `FeatureVector` this run --
+        nothing more, nothing less (a suministro Etapa 1 excluded never reaches this method at
+        all, since it never made it into `vectores` to begin with).
+
+        `historial_por_suministro` is the SAME filtered kwh history used to build those vectors
+        (consistent with F5's own source, `domain/reglas.py`'s module docstring) -- passed
+        through unchanged, never re-fetched.
+
+        COMPUTE + REPORT only: no `anomalias` row is written here (`domain/reglas.py`'s module
+        docstring explains why -- the FK to `resultados_ia` requires Etapas 6-7's
+        `modelo_ia_id`/`clasificacion`, which do not exist yet). The hits live only in the
+        `InformeReglas` this method returns.
+        """
+        entradas = [
+            ReglasSuministro(
+                suministro_id=vector.suministro_id,
+                numero_suministro=metadata_por_suministro[vector.suministro_id].numero_suministro,
+                hits=evaluar_reglas(
+                    vector,
+                    historial_por_suministro.get(vector.suministro_id, []),
+                    metadata_por_suministro[vector.suministro_id],
+                ),
+            )
+            for vector in vectores
+        ]
+        return construir_informe_reglas(lote_id, entradas, suministros_evaluados=len(vectores))

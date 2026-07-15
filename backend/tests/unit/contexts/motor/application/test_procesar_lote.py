@@ -573,12 +573,20 @@ async def test_duplicidades_present_regardless_of_estado_final() -> None:
 # ---------------------------------------------------------------------------------------------
 
 
-def _metadata(suministro_id: UUID, *, categoria_id: UUID | None = None) -> SuministroMetadataRow:
+def _metadata(
+    suministro_id: UUID,
+    *,
+    categoria_id: UUID | None = None,
+    numero_suministro: str | None = None,
+    estado: str = "Activo",
+) -> SuministroMetadataRow:
     return SuministroMetadataRow(
         suministro_id=suministro_id,
         categoria_tarifaria_id=categoria_id or uuid4(),
         localidad="Formosa",
         fecha_alta=date(2020, 1, 1),
+        numero_suministro=numero_suministro or f"SUM-{suministro_id}",
+        estado=estado,
     )
 
 
@@ -822,3 +830,144 @@ async def test_conflicted_nonzero_period_still_breaks_the_zero_streak() -> None:
     assert resultado.features.con_periodos_conflictivos == 1
     guardado = repository.guardados[0]
     assert guardado.features["zero_consumption_streak"] == 2
+
+
+# ---------------------------------------------------------------------------------------------
+# Etapa 5 -- reglas de negocio (AI_ENGINE_SPEC.md §8). These are WIRING tests, same discipline as
+# Etapas 3-4's own section above: the rule MATH itself is unit-tested exhaustively in
+# `tests/unit/contexts/motor/domain/test_reglas.py` against hand-computed values -- what matters
+# here is that `ProcesarLote` (a) evaluates every NON-EXCLUDED suministro that received a
+# `FeatureVector` this run, (b) reuses the ALREADY-BUILT vector (never recomputes features), and
+# (c) surfaces the result on `ResultadoProcesamiento.reglas`.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_reglas_reports_zero_hits_for_a_single_period_clean_suministro() -> None:
+    """A single-period (cold-start), nonzero suministro breaches no rule at all -- every rule's
+    own null-guard suppresses it (no `pct_change`, no `percentile_peer`, no `deviation`)."""
+    lote_id = uuid4()
+    suministro_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-1", estado=EstadoLote.PENDIENTE, cantidad_registros=1
+        ),
+        consumos_activos=1,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_id, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000")
+            ]
+        },
+        metadata_por_lote={lote_id: [_metadata(suministro_id)]},
+    )
+    use_case = ProcesarLote(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+    )
+
+    resultado = await use_case.execute("LOTE-1")
+
+    assert resultado.reglas.lote_id == lote_id
+    assert resultado.reglas.resumen.suministros_evaluados == 1
+    assert resultado.reglas.resumen.suministros_con_hits == 0
+    assert resultado.reglas.suministros == ()
+    assert resultado.reglas.resumen.hits_por_regla == {
+        "R1": 0,
+        "R2": 0,
+        "R3": 0,
+        "R4": 0,
+        "R5": 0,
+        "R6": 0,
+    }
+
+
+async def test_reglas_fires_r1_end_to_end_reusing_the_built_vector() -> None:
+    """Three consecutive zero-kwh periods (racha = 3, R1's threshold), suministro `Activo` (the
+    `_metadata` default) -- R1 must fire off the vector Etapa 3-4 already built, with no separate
+    feature recomputation. `numero_suministro` (not just the UUID) must surface in the report."""
+    lote_id = uuid4()
+    suministro_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-1", estado=EstadoLote.PENDIENTE, cantidad_registros=1
+        ),
+        consumos_activos=1,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_id, uuid4(), fecha_inicio=date(2024, 1, 1), kwh="0.000"),
+                _historial(suministro_id, uuid4(), fecha_inicio=date(2024, 2, 1), kwh="0.000"),
+                _historial(suministro_id, lote_id, fecha_inicio=date(2024, 3, 1), kwh="0.000"),
+            ]
+        },
+        metadata_por_lote={
+            lote_id: [_metadata(suministro_id, numero_suministro="SUM-R1", estado="Activo")]
+        },
+    )
+    use_case = ProcesarLote(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+    )
+
+    resultado = await use_case.execute("LOTE-1")
+
+    assert resultado.reglas.resumen.suministros_evaluados == 1
+    assert resultado.reglas.resumen.suministros_con_hits == 1
+    assert resultado.reglas.resumen.hits_por_regla["R1"] == 1
+    assert len(resultado.reglas.suministros) == 1
+    entrada = resultado.reglas.suministros[0]
+    assert entrada.suministro_id == suministro_id
+    assert entrada.numero_suministro == "SUM-R1"
+    assert [hit.regla for hit in entrada.hits] == ["R1"]
+    assert entrada.hits[0].tipo == "Persistencia Anómala"
+    assert entrada.hits[0].severidad == "Alta"
+
+
+async def test_reglas_never_evaluates_a_suministro_excluded_by_etapa_1() -> None:
+    """A suministro Etapa 1 excludes never receives a `FeatureVector` (Etapas 3-4), so Etapa 5
+    never evaluates it either -- it must not count toward `suministros_evaluados` nor appear in
+    `reglas.suministros`, mirroring the Etapas 3-4 exclusion test above."""
+    lote_id = uuid4()
+    suministro_ok = uuid4()
+    suministro_excluido = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-1", estado=EstadoLote.PENDIENTE, cantidad_registros=2
+        ),
+        consumos_activos=2,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_ok, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000"),
+                _historial(
+                    suministro_excluido, lote_id, fecha_inicio=date(2024, 1, 1), kwh="999.000"
+                ),
+            ]
+        },
+        metadata_por_lote={lote_id: [_metadata(suministro_ok), _metadata(suministro_excluido)]},
+    )
+    use_case = ProcesarLote(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource(
+            {lote_id: [_fila_valida(suministro_ok), _fila_excluida(suministro_excluido)]}
+        ),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+    )
+
+    resultado = await use_case.execute("LOTE-1")
+
+    assert resultado.reglas.resumen.suministros_evaluados == 1
+    assert all(
+        entrada.suministro_id != suministro_excluido for entrada in resultado.reglas.suministros
+    )

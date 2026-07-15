@@ -85,8 +85,34 @@ class ResumenFeaturesSchema(BaseModel):
     indicadores: IndicadoresResumenSchema
 
 
+class ReglaHitSchema(BaseModel):
+    regla: str
+    tipo: str
+    severidad: str
+    descripcion: str
+
+
+class ReglasSuministroSchema(BaseModel):
+    suministro_id: str
+    numero_suministro: str
+    hits: list[ReglaHitSchema]
+
+
+class ResumenReglasSchema(BaseModel):
+    suministros_evaluados: int
+    suministros_con_hits: int
+    hits_por_regla: dict[str, int]
+
+
+class InformeReglasSchema(BaseModel):
+    lote_id: str
+    resumen: ResumenReglasSchema
+    suministros: list[ReglasSuministroSchema]
+
+
 class ProcesarLoteResponseSchema(BaseModel):
     estado_final: str
     informe: InformeValidacionSchema
     duplicidades: InformeDuplicidadesSchema
     features: ResumenFeaturesSchema
+    reglas: InformeReglasSchema

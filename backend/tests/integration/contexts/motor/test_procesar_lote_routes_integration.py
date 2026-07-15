@@ -99,6 +99,24 @@ async def test_happy_path_transitions_pendiente_lote_to_procesado(
         {"lote_id": lote_id},
     )
     assert verificacion_vectores.scalar_one() == 3
+    # Etapa 5 (AI_ENGINE_SPEC.md §8, recalibrado 2026-07-15 -- calibración v1.1): none of R1-R6
+    # breach here. Before the recalibration, R5 fired for all 3 on `percentile_peer` alone: with 3
+    # IDENTICAL kwh values in the same cohort (fallback categoria-alone pool, DEC-008, size 3 >=
+    # COHORTE_FALLBACK_MINIMA), every one of them is "at or below" the group's own maximum --
+    # percentile_peer = 1.0 for all three (inclusive by design, §7 FIX 3's note). R5 now ALSO
+    # requires `peer_ratio` >= 2.5 (§8.2's calibration finding: this exact percentile-tie pattern
+    # was 142/144, ~98.6%, of R5's false positives) -- with 3 identical kwh values, peer_ratio =
+    # kwh_actual / cohort median = 100/100 = 1.0, well below the threshold, so R5 correctly does
+    # NOT fire: being tied for the cohort maximum is not, by itself, anomalous.
+    assert body["reglas"]["resumen"]["suministros_evaluados"] == 3
+    assert body["reglas"]["resumen"]["suministros_con_hits"] == 0
+    assert body["reglas"]["resumen"]["hits_por_regla"]["R1"] == 0
+    assert body["reglas"]["resumen"]["hits_por_regla"]["R2"] == 0
+    assert body["reglas"]["resumen"]["hits_por_regla"]["R3"] == 0
+    assert body["reglas"]["resumen"]["hits_por_regla"]["R4"] == 0
+    assert body["reglas"]["resumen"]["hits_por_regla"]["R5"] == 0
+    assert body["reglas"]["resumen"]["hits_por_regla"]["R6"] == 0
+    assert body["reglas"]["suministros"] == []
 
 
 async def test_reprocessing_an_already_procesado_lote_is_conflict(
@@ -593,3 +611,106 @@ async def test_zero_streak_persists_correctly_when_a_conflicted_period_would_bri
     )
     streak_persistido = verificacion.scalar_one()
     assert streak_persistido == "2"
+
+
+# ---------------------------------------------------------------------------------------------
+# Etapa 5 -- reglas de negocio (AI_ENGINE_SPEC.md §8). End-to-end (real HTTP + `energia_test`),
+# not just the wiring-level fakes in `tests/unit/contexts/motor/application/test_procesar_lote.py`.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_r1_fires_end_to_end_for_a_persistent_zero_streak_on_an_active_suministro(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """3 prior zero-kwh periods (racha = R1's threshold) PLUS a 4th, CURRENT zero-kwh period --
+    R1 must fire in the response's `reglas` field, off the REAL vector Etapas 3-4 persisted to
+    `feature_vectors`. Only the CURRENT (April) consumo needs a matching lectura (V1-V7, Etapa 1,
+    only ever evaluates THIS lote's own chain, `fetch_chain(lote_id)`) -- the 3 prior periods
+    never go through `/procesar` at all here: Etapa 3's `fetch_historial_kwh` reads raw `consumos`
+    rows across every lote regardless of whether those OTHER lotes were ever analyzed. Periods use
+    REAL month-end days (Jan 31, Feb 29 -- 2024 is a leap year --, Mar 31) so V4 (period
+    continuity, RD-017) does not itself exclude April's row: V4's window looks at the suministro's
+    FULL cross-lote history, not just the current lote's own chain."""
+    suministro_id = await insert_suministro(db_session, numero_suministro="SUM-R1-E2E")
+    periodos_previos = [
+        ("LOTE-R1-ENE", date(2024, 1, 1), date(2024, 1, 31)),
+        ("LOTE-R1-FEB", date(2024, 2, 1), date(2024, 2, 29)),
+        ("LOTE-R1-MAR", date(2024, 3, 1), date(2024, 3, 31)),
+    ]
+    for codigo, fecha_inicio, fecha_fin in periodos_previos:
+        lote_previo_id = await insert_lote(db_session, codigo_lote=codigo, cantidad_registros=1)
+        await insert_consumo(
+            db_session,
+            suministro_id=suministro_id,
+            lote_id=lote_previo_id,
+            fecha_inicio=fecha_inicio,
+            fecha_fin=fecha_fin,
+            dias_facturados=(fecha_fin - fecha_inicio).days + 1,
+            kwh=Decimal("0.000"),
+        )
+
+    lote_actual_id = await insert_lote(db_session, codigo_lote="LOTE-R1-ABR", cantidad_registros=1)
+    await _import_lectura_y_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_actual_id,
+        fecha_inicio=date(2024, 4, 1),
+        fecha_fin=date(2024, 4, 30),
+        dias_facturados=30,
+        kwh=Decimal("0.000"),
+    )
+
+    response = await motor_client.post("/api/v1/motor/lotes/LOTE-R1-ABR/procesar")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reglas"]["resumen"]["suministros_con_hits"] == 1
+    assert body["reglas"]["resumen"]["hits_por_regla"]["R1"] == 1
+    entrada = body["reglas"]["suministros"][0]
+    assert entrada["numero_suministro"] == "SUM-R1-E2E"
+    reglas_disparadas = {hit["regla"] for hit in entrada["hits"]}
+    assert "R1" in reglas_disparadas
+    r1 = next(hit for hit in entrada["hits"] if hit["regla"] == "R1")
+    assert r1["tipo"] == "Persistencia Anómala"
+    assert r1["severidad"] == "Alta"
+
+
+async def test_r3_fires_end_to_end_for_a_sudden_spike(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A 300% jump vs. the previous period (>= R3's +200% threshold) fires R3 in the response.
+    Only the CURRENT (February) consumo needs a matching lectura -- same reasoning as R1's test
+    above."""
+    suministro_id = await insert_suministro(db_session, numero_suministro="SUM-R3-E2E")
+    lote_previo_id = await insert_lote(db_session, codigo_lote="LOTE-R3-ENE", cantidad_registros=1)
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_previo_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("100.000"),
+    )
+
+    lote_actual_id = await insert_lote(db_session, codigo_lote="LOTE-R3-FEB", cantidad_registros=1)
+    await _import_lectura_y_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_actual_id,
+        fecha_inicio=date(2024, 2, 1),
+        fecha_fin=date(2024, 2, 29),
+        dias_facturados=29,
+        kwh=Decimal("400.000"),  # (400-100)/100 = +300% >= R3's +200%
+    )
+
+    response = await motor_client.post("/api/v1/motor/lotes/LOTE-R3-FEB/procesar")
+
+    assert response.status_code == 200
+    body = response.json()
+    entrada = body["reglas"]["suministros"][0]
+    assert entrada["numero_suministro"] == "SUM-R3-E2E"
+    r3 = next(hit for hit in entrada["hits"] if hit["regla"] == "R3")
+    assert r3["tipo"] == "Incremento Brusco"
+    assert r3["severidad"] == "Media"
+    assert "300%" in r3["descripcion"]

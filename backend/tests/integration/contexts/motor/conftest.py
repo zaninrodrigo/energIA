@@ -98,11 +98,14 @@ async def insert_suministro(
     categoria_tarifaria_id: UUID | None = None,
     localidad: str | None = None,
     fecha_alta: date = date(2024, 1, 1),
+    estado: str = "Activo",
 ) -> UUID:
     """Mirrors `tests.integration.contexts.consumos.conftest.insert_suministro`, extended with
     optional `localidad`/`fecha_alta` (default unchanged from before) -- Etapa 3's feature tests
     (US-008, AI_ENGINE_SPEC.md §6) need control over both: `localidad` for cohort grouping
-    (DEC-008) and `fecha_alta` for F14 `supply_age_days`."""
+    (DEC-008) and `fecha_alta` for F14 `supply_age_days`. `estado` (default `'Activo'`, matching
+    `suministros.estado`'s own DDL default) was added for Etapa 5 (§8): R1's "suministro activo"
+    condition needs a way to seed a NON-active suministro too."""
     if cliente_id is None:
         cliente_id = await insert_cliente(session, numero_cliente=f"cliente-de-{numero_suministro}")
     if categoria_tarifaria_id is None:
@@ -112,9 +115,10 @@ async def insert_suministro(
     await session.execute(
         text(
             "INSERT INTO suministros "
-            "(id, numero_suministro, cliente_id, categoria_tarifaria_id, fecha_alta, localidad) "
+            "(id, numero_suministro, cliente_id, categoria_tarifaria_id, fecha_alta, localidad, "
+            "estado) "
             "VALUES (:id, :numero_suministro, :cliente_id, :categoria_tarifaria_id, "
-            ":fecha_alta, :localidad)"
+            ":fecha_alta, :localidad, :estado)"
         ),
         {
             "id": suministro_id,
@@ -123,6 +127,7 @@ async def insert_suministro(
             "categoria_tarifaria_id": categoria_tarifaria_id,
             "fecha_alta": fecha_alta,
             "localidad": localidad,
+            "estado": estado,
         },
     )
     await session.commit()

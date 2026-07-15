@@ -58,9 +58,14 @@ _FETCH_METADATA_SUMINISTROS_SQL = text(
         s.id AS suministro_id,
         s.categoria_tarifaria_id,
         s.localidad,
-        s.fecha_alta
+        s.fecha_alta,
+        s.numero_suministro,
+        s.estado
     FROM suministros s
     WHERE s.id IN (SELECT suministro_id FROM suministros_del_lote)
+    -- Deterministic order: this row order propagates into InformeReglas.suministros,
+    -- which is surfaced verbatim in the API response.
+    ORDER BY s.numero_suministro
     """
 )
 
@@ -109,6 +114,8 @@ class SqlFeaturesDataSource:
                 categoria_tarifaria_id=row.categoria_tarifaria_id,
                 localidad=row.localidad,
                 fecha_alta=row.fecha_alta,
+                numero_suministro=row.numero_suministro,
+                estado=row.estado,
             )
             for row in result.all()
         ]

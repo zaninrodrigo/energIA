@@ -500,18 +500,219 @@ La **rama de reglas** (ADR-005) codifica los casos conocidos y explícitos: cada
 una regla nombrada, satisfaciendo RN-012 de forma directa. Genera `Anomalías` de tipos concretos
 del catálogo cerrado de §8.2.
 
-| Regla | Condición (aceptada v1, DEC-009) | Tipo de Anomalía (§8.2) | Severidad |
+| Regla | Condición (aceptada v1, DEC-009 — recalibrada 2026-07-15, calibración v1.1) | Tipo de Anomalía (§8.2) | Severidad |
 |---|---|---|---|
 | R1 | `zero_consumption_streak ≥ 3` con suministro activo | `Persistencia Anómala` | Alta |
-| R2 | `pct_change_prev_period ≤ −60 %` sostenida ≥ 2 períodos | `Caída Brusca` | Alta |
+| R2 | `pct_change_prev_period ≤ −60 %` en el período ACTUAL (un solo "cliff", ya no "sostenida ≥ 2 períodos" — ver §8.2) | `Caída Brusca` | Alta |
 | R3 | `pct_change_prev_period ≥ +200 %` en un período | `Incremento Brusco` | Media |
-| R4 | `kwh` bajo el percentil 1 de su cohorte | `Consumo Muy Bajo` | Media |
-| R5 | `kwh` sobre el percentil 99 de su cohorte | `Consumo Muy Alto` | Media |
+| R4 | `percentile_peer ≤ percentil 5` **Y** `peer_ratio ≤ 0,4` de su cohorte (conjunción, ya no percentil solo — ver §8.2) | `Consumo Muy Bajo` | Media |
+| R5 | `percentile_peer ≥ percentil 95` **Y** `peer_ratio ≥ 2,5` de su cohorte (conjunción, ya no percentil solo — ver §8.2) | `Consumo Muy Alto` | Media |
 | R6 | `deviation_from_baseline`, valor absoluto ≥ 3 | `Desvío Estadístico` | Media |
 
-Los umbrales (−60 %, +200 %, 3 períodos, percentiles 1/99) son **candidatos**, no verdades:
-dependen del comportamiento real de los datos. Ver **DEC-009**. `Patrón Irregular` queda como
-tipo reservado para la rama ML (§9), no para reglas.
+Los umbrales (−60 %, +200 %, 3 períodos, percentiles 5/95, peer_ratio 0,4/2,5) son **candidatos**,
+no verdades: dependen del comportamiento real de los datos. Ver **DEC-009**. R2 y R4/R5 fueron
+recalibrados el 2026-07-15 (calibración v1.1) contra evidencia sintética real (§8.2) — siguen
+siendo candidatos, ahora respaldados por una corrida medida en vez de solo teoría. `Patrón
+Irregular` queda como tipo reservado para la rama ML (§9), no para reglas.
+
+> **Persistencia de las anomalías (implementación v1, Etapa 5 aislada — mismo razonamiento que
+> §4.2).** `anomalias.resultado_ia_id` es `NOT NULL` (FK a `resultados_ia`,
+> `docker/postgres/init/01_schema.sql`): persistir una fila de `Anomalía` exige una fila de
+> `ResultadoIA`, que a su vez exige `modelo_ia_id` (`NOT NULL`, FK a `modelos_ia`) y
+> `clasificacion` (`NOT NULL`, CHECK con los 4 valores de §8.1) — ninguno de los dos existe todavía
+> con solo las Etapas 1-5 corridas: no hay modelo IA entrenado (§9), no hay score que clasificar
+> (§10). Escribir una fila de `anomalias` "solo-reglas" implicaría inventar un
+> `modelo_ia_id`/`clasificacion` que no representarían nada real, así que esta implementación no
+> lo hace. **Decisión v1**: Etapa 5 es **cómputo + reporte únicamente**, igual que la Etapa 1
+> (§4.2). Cada disparo de regla (`regla`, `tipo`, `severidad`, `descripcion` con la evidencia
+> numérica que lo originó) se devuelve en el campo `reglas` del cuerpo de la respuesta de
+> `POST /api/v1/motor/lotes/{codigo_lote}/procesar` (`docs/03-architecture/API_SPEC.md`), **sin
+> persistencia en base de datos** — la persistencia de `anomalias` converge en la Etapa 7 (§10),
+> en el mismo escritura atómica de `ResultadoIA` que agrega `modelo_ia_id`/`clasificacion` reales:
+> ver §14 (mapeo etapa → tabla), donde `anomalias` ya aparece asociada a "[5]/[7]" precisamente por
+> esta convergencia. No se fabrican filas de `modelos_ia` ni una `clasificacion` inventada.
+
+### 8.1 Implementación (estado, 2026-07-15)
+
+Etapa 5 está **implementada**: `domain/reglas.py` (funciones puras R1-R6 + `evaluar_reglas` +
+`ResumenReglas`/`InformeReglas`), integrada en `ProcesarLote` (`application/procesar_lote.py`)
+inmediatamente después de la Etapa 4, sobre los suministros **no excluidos** por la Etapa 1 que
+recibieron un `FeatureVector` esta corrida — reutilizando ese vector ya construido, sin recalcular
+ninguna feature ni indicador.
+
+- **R2 recalibrada 2026-07-15 (calibración v1.1) — ya no necesita un segundo período de
+  historia.** La condición original, "sostenida ≥ 2 períodos", exigía el `pct_change` del período
+  INMEDIATAMENTE ANTERIOR además del actual; la corrida empírica de §8.2 midió CERO disparos en
+  2.321 evaluaciones reales, incluyendo la anomalía `sudden_drop` plantada para ejercitarla: una
+  "caída brusca" real es un escalón (un mes de "cliff", luego el consumo se SOSTIENE al nuevo nivel
+  bajo, sin otra caída de −60 % mes a mes), así que el segundo período que la condición exigía
+  nunca aparece. R2 ahora dispara con el `pct_change_prev_period` (F5, §6.1) del período ACTUAL
+  ÚNICAMENTE — igual que R3 para la dirección opuesta —; la intención de "sostenida" (marcar que el
+  nivel bajo persiste) queda cubierta por R6 (`deviation_from_baseline`), que sigue marcando los
+  meses posteriores mientras el consumo se mantenga fuera de la línea base histórica.
+- **Los nulos nunca disparan una regla.** Cada regla narra su propio guard de nulidad (el mismo
+  patrón que `resumir_features` ya usa para leer `features: dict[str, object]`, §6.4): un
+  suministro cold-start (F4/F9/`percentile_peer`/`peer_ratio` nulos por historia insuficiente,
+  DEC-006/DEC-007) no dispara ninguna regla, sin necesidad de un caso especial explícito para
+  `is_cold_start` — la guarda es implícita en cada chequeo de nulidad.
+- **Un mismo suministro puede disparar varias reglas a la vez, sin deduplicar.** Son señales
+  independientes (RN-012): un suministro con racha larga Y percentil extremo Y desvío extremo
+  dispara R1 + R4/R5 + R6, las tres, no solo "la peor".
+- **`suministros.estado` no tiene lista de valores enumerada** (a diferencia de `clientes.estado`,
+  DDL): R1 compara contra el string exacto `'Activo'` (el default sembrado), documentado como el
+  único contrato que existe hoy sobre ese campo.
+- **R4/R5 recalibradas 2026-07-15 (calibración v1.1) — conjunción con `peer_ratio` (F13), ya no
+  percentil solo.** Con una cohorte de fallback de tamaño exactamente `COHORTE_MINIMA_FALLBACK = 3`
+  (DEC-008) y valores empatados o con un máximo/mínimo claro, el miembro con el `kwh` más alto (o
+  más bajo) SIEMPRE cae en `percentile_peer = 1.0` (o `0.0`) por construcción ("fracción del grupo
+  ≤ mi propio valor", inclusivo a propósito, §7) — la corrida empírica de §8.2 midió que esto
+  disparaba R5 en 142 de 144 casos sin que hubiera nada anómalo, solo la posición relativa dentro
+  de un grupo chico, mientras que R4 resultaba estructuralmente inalcanzable (percentil ≤ 1 %
+  exige ≥ 100 miembros en una sola cohorte). Ambas reglas ahora EXIGEN, además del percentil,
+  que `peer_ratio` (`kwh_actual` / mediana de la cohorte) confirme la magnitud relativa — un
+  suministro en el extremo del percentil de una cohorte chica, pero con un consumo similar al
+  resto (`peer_ratio` cercano a 1), ya no dispara; nulo en CUALQUIERA de los dos componentes
+  significa "no evaluable", nunca un disparo. Sigue siendo un candidato a recalibración cuando
+  existan datos reales (`PROJECT_MASTER_SPEC.md` #8), igual que el resto de los umbrales de esta
+  sección.
+
+### 8.2 Calibración empírica (datos sintéticos, seed 42, escala small)
+
+#### 8.2.1 Calibración v1.0 (2026-07-15) — condiciones originales de DEC-009
+
+Corrida real de las 6 reglas contra las 24 lotes mensuales del dataset sintético determinístico
+(seed 42, `backend/src/energia/tools/synthetic/`, mismo dataset de §13.1), sobre las 6 anomalías
+plantadas (manifiesto) — cada suministro evaluado en sus 24 lotes (2.321 evaluaciones
+suministro-lote en total):
+
+| Suministro plantado | Tipo | Mes de inicio | Regla(s) esperada(s) | Resultado medido |
+|---|---|---|---|---|
+| SYN-S42-SUM-00005 | `spike_leve` | 2023-01 | Ninguna (sub-umbral, por diseño) | Ninguna regla de incremento; R5 dispara ese mes (percentil 100 %, cohorte chica) — captura incidental, no por diseño (ver más abajo) |
+| SYN-S42-SUM-00014 | `sudden_drop` | 2023-05 | R2 | **Ninguna regla dispara, en los 24 meses** — ver hallazgo R2 más abajo |
+| SYN-S42-SUM-00024 | `spike` | 2023-07 | R3 | R3 + R5 + R6 disparan juntas, exactamente en 2023-07 (triple señal, sin deduplicar) |
+| SYN-S42-SUM-00032 | `sudden_drop_leve` | 2022-10 | Ninguna (sub-umbral) | Ninguna regla dispara en ningún mes relacionado con la caída (confirmado) |
+| SYN-S42-SUM-00049 | `zero_consumption_streak` | 2022-11 (racha ≥ 3 recién en 2023-01) | R1 | R1 dispara exactamente en 2023-01 (racha=3) y 2023-02 (racha=4) — nunca antes, cuando la racha era < 3 |
+| SYN-S42-SUM-00073 | `gradual_decline` | 2023-05 | Ninguna al inicio | Ninguna regla dispara en ningún mes relacionado con la caída (confirmado) |
+
+**Falsos positivos y hallazgos honestos de calibración (evidencia real, no solo teórica):**
+
+- **R1 y R3 se comportan exactamente como se especifica**: 2/2 disparos de R1 (ambos sobre
+  SUM-00049, ningún falso positivo) y 1/1 disparo de R3 (sobre SUM-00024, ningún falso positivo)
+  en las 2.321 evaluaciones.
+- **R2 nunca dispara, en ningún mes, para ningún suministro del dataset (0 de 2.321
+  evaluaciones).** La condición literal "sostenida ≥ 2 períodos" (`pct_change_prev_period` del
+  período ACTUAL **y** del INMEDIATAMENTE ANTERIOR, ambos ≤ −60 %) no la satisface la forma de
+  `inject_sudden_drop` (`tools/synthetic/anomalies.py`): esa caída ocurre en UN solo mes (una
+  caída abrupta que después se sostiene AL NUEVO NIVEL, sin otra caída pronunciada mes a mes) — el
+  mes siguiente al de la caída no vuelve a mostrar un `pct_change` ≤ −60 % (compara nivel bajo
+  contra nivel bajo, variación normal), así que el segundo período que R2 exige nunca aparece. Esto
+  no es un defecto de implementación: R1/R2/R3 fueron implementadas siguiendo la condición literal
+  de DEC-009 tal como está escrita en la tabla de §8, verificada exhaustivamente con valores
+  calculados a mano (`tests/unit/contexts/motor/domain/test_reglas.py`). Es una **discrepancia real
+  entre la definición de la regla y la forma de la anomalía "caída brusca" que hoy planta el
+  generador sintético** — candidato explícito a revisar en la próxima calibración: o R2 se
+  redefine (p. ej. "el período actual solo, sin exigir el anterior") o el generador sintético gana
+  una variante de caída de dos escalones. Se documenta aquí, no se “arregla” silenciosamente
+  ninguno de los dos lados.
+- **R4 nunca dispara, en ningún mes, para ningún suministro (0 de 2.321 evaluaciones).**
+  Estructuralmente inalcanzable con los tamaños de cohorte de este dataset: el mínimo de una
+  cohorte de tamaño `N` tiene `percentile_peer = 1/N` (definición inclusiva, §7); para que
+  `1/N ≤ 0.01` (R4) se necesita `N ≥ 100` miembros en la MISMA cohorte (categoría × localidad o su
+  fallback de categoría sola, DEC-008) — un tamaño que este dataset (100 suministros repartidos
+  entre varias categorías/localidades) nunca alcanza en una sola cohorte.
+- **R5 dispara exactamente 6 de 100 suministros, en LOS 24 MESES sin excepción** (144 disparos
+  totales) — pero solo 2 de esos 144 disparos coinciden con el mes de inicio de una anomalía
+  plantada (SUM-00005 en 2023-01, SUM-00024 en 2023-07); el resto (142, ≈ 98,6 % de los disparos de
+  R5) caen sobre suministros sin ninguna anomalía plantada ese mes — **falsos positivos
+  estructurales, a una tasa constante del 6 % de la cohorte cada mes**, la contracara exacta del
+  hallazgo de R4: con cohortes chicas, el miembro de mayor consumo SIEMPRE queda en el percentil
+  100 (`percentile_peer` inclusivo, "fracción del grupo ≤ mi propio valor"), sin importar si su
+  consumo es genuinamente anómalo o simplemente el más alto de un grupo de 3-10 suministros. R4 y
+  R5, con el MISMO par de umbrales (1 %/99 %) y el MISMO tamaño mínimo de cohorte (DEC-008), quedan
+  así asimétricos: R4 nunca dispara, R5 dispara siempre — evidencia concreta de que el par
+  1 %/99 % + `COHORTE_FALLBACK_MINIMA = 3` necesita recalibrarse contra el tamaño real de cohorte
+  que exista en producción (`PROJECT_MASTER_SPEC.md` #8), no contra el tamaño sintético de este
+  dataset.
+- **R6 dispara 1/1 vez, coincidiendo exactamente con el disparo de R3 (SUM-00024, 2023-07)** — sin
+  falsos positivos en las 2.321 evaluaciones.
+
+**Reproducibilidad:** corrida completa contra `energia_scratch` (base descartable, nunca
+`energia`/`energia_test`), sembrada vía `python -m energia.tools.synthetic --scale small --seed 42`
+y procesada lote por lote (`POST /api/v1/motor/lotes/{codigo_lote}/procesar`) para los 24
+`LOTE-SYN-S42-YYYY-MM` del dataset.
+
+#### 8.2.2 Calibración v1.1 (2026-07-15) — recalibración de R2 y R4/R5
+
+Misma corrida (mismo dataset determinístico seed 42/escala small, mismo arnés contra
+`energia_scratch`, mismas 2.321 evaluaciones suministro-lote), esta vez con R2 redefinida como
+"cliff" de un solo período y R4/R5 en conjunción con `peer_ratio` (ver §8, §8.1). Objetivo:
+confirmar que R2 ahora captura `sudden_drop` en su mes de inicio y que R5 deja de disparar
+falsamente sobre cohortes chicas, sin introducir falsos positivos nuevos.
+
+| Suministro plantado | Tipo | Mes de inicio | Resultado medido (v1.1) |
+|---|---|---|---|
+| SYN-S42-SUM-00005 | `spike_leve` | 2023-01 | Ninguna regla dispara (antes: R5 disparaba incidentalmente; la conjunción con `peer_ratio` 1,98, sub-umbral, lo corrige) |
+| SYN-S42-SUM-00014 | `sudden_drop` | 2023-05 | **R2 dispara exactamente en 2023-05** (caída de −63 %, mes de inicio) — antes: 0 disparos en 24 meses |
+| SYN-S42-SUM-00024 | `spike` | 2023-07 | R3 + R5 + R6 disparan en 2023-07 (sin cambios); además R2 dispara en 2023-08 — ver nota abajo |
+| SYN-S42-SUM-00032 | `sudden_drop_leve` | 2022-10 | Ninguna regla dispara (confirmado, sub-umbral) |
+| SYN-S42-SUM-00049 | `zero_consumption_streak` | 2022-11 (racha ≥ 3 recién en 2023-01) | R1 dispara en 2023-01 y 2023-02 (sin cambios); R4 dispara en 2022-11, 2022-12, 2023-01 y 2023-02 (4 meses, percentil 4 %, `peer_ratio` 0,00) — antes: 0 disparos de R4 en todo el dataset; además R2 dispara en 2022-11 — ver nota abajo |
+| SYN-S42-SUM-00073 | `gradual_decline` | 2023-05 | Ninguna regla dispara (confirmado) |
+
+**Conteo total (2.321 evaluaciones):** R1 = 2, R2 = 3, R3 = 1, R4 = 4, R5 = 1, R6 = 1 (12 disparos
+en total, 0 duplicados entre reglas más allá de lo esperado por diseño).
+
+**Falsos positivos por regla (disparos sobre suministros SIN ninguna anomalía plantada, en
+CUALQUIER mes):** R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0, R6 = 0 — cero, en las 6 reglas. Todos
+los 12 disparos medidos caen exclusivamente sobre los 6 suministros con una anomalía realmente
+plantada.
+
+**Expectativas confirmadas (ninguna falló):**
+
+- **R1 sin cambios**: 2/2 disparos sobre SUM-00049, exactamente cuando `racha ≥ 3` (2023-01,
+  2023-02) — idéntico a la calibración v1.0.
+- **R2 ahora captura `sudden_drop` en su mes de inicio** (SUM-00014, 2023-05, caída de −63 %) — el
+  hallazgo central que motivó esta recalibración (§8.2.1) queda resuelto: de 0/2.321 a capturar la
+  ÚNICA anomalía que existe para ejercitarla, en el mes correcto.
+- **R3 sin cambios**: 1/1 disparo sobre SUM-00024 (2023-07), sin falsos positivos.
+- **Los "leves" (`spike_leve`, `sudden_drop_leve`) y `gradual_decline` siguen silenciosos**: 0
+  disparos de cualquier regla relacionados con esas 3 anomalías — confirma que el ajuste de R2/R4/
+  R5 no ensanchó los umbrales lo suficiente como para capturar señales deliberadamente
+  sub-umbral (diseño intencional de esas 3 anomalías, `tools/synthetic/anomalies.py`).
+- **R5 colapsa de 142 falsos positivos a 0** (objetivo: "~0-2"): con la conjunción `peer_ratio`, R5
+  dispara UNA sola vez en todo el dataset (SUM-00024, 2023-07, `peer_ratio` 5,07) — exactamente la
+  única vez que el disparo coincide con una anomalía real. Los 142 disparos estructurales sobre
+  cohortes chicas sin nada anómalo (§8.2.1) desaparecen por completo.
+- **R4 deja de estar estructuralmente muerto**: pasa de 0 a 4 disparos, los 4 sobre el mismo
+  suministro (SUM-00049) durante su racha de cero consumo (`percentile_peer` 4 %, `peer_ratio`
+  0,00 — genuinamente el consumo más bajo posible respecto de sus pares) — sin ningún falso
+  positivo.
+
+**Hallazgo honesto adicional (no forzado, no ocultado): R2 dispara 2 veces más allá del caso
+"canónico" `sudden_drop`, ambas sobre suministros que SÍ tienen una anomalía plantada (no son
+falsos positivos), pero de un tipo distinto al que R2 apunta:**
+
+- **SUM-00024 (`spike`), 2023-08**: el mes siguiente al pico (2023-07) revierte de inmediato a la
+  línea base (`inject_spike`'s propio diseño, `tools/synthetic/anomalies.py`: "reverting
+  immediately afterward") — esa reversión ES, en los datos reales, una caída de un solo período de
+  −79 %, un "cliff" genuino según la nueva definición de R2, aunque el manifiesto no lo etiquete
+  como `sudden_drop`. No es un error de R2: es la consecuencia matemática correcta y esperada de
+  que un pico que revierte de golpe ES, visto desde el mes siguiente, una caída brusca real.
+- **SUM-00049 (`zero_consumption_streak`), 2022-11**: el primer mes de la racha de cero
+  (consumo normal → 0) es, por definición, una caída de un solo período del −100 % — otro "cliff"
+  genuino, esta vez producido por el INICIO de una racha de cero en vez de por un `sudden_drop`
+  plantado.
+
+Ambos casos son disparos CORRECTOS de R2 contra caídas de un solo período genuinas en los datos —
+no falsos positivos ni artefactos del ajuste — simplemente no coinciden con el tipo de anomalía
+"canónico" que el manifiesto asocia a cada suministro. Se documentan aquí explícitamente, sin
+forzar ni ocultar el resultado: R2, tal como quedó redefinida, es sensible a CUALQUIER caída de un
+solo período ≥ 60 %, sea cual sea su causa subyacente (una `sudden_drop` plantada, la reversión de
+un `spike`, o el inicio de una racha de cero) — un comportamiento consistente con su definición
+literal, no un bug.
+
+**Reproducibilidad:** mismo arnés que §8.2.1 (`energia_scratch`, nunca `energia`/`energia_test`),
+mismo dataset determinístico (seed 42, escala small, `python -m energia.tools.synthetic`),
+procesado lote por lote contra los `domain/reglas.py` recalibrados de esta sección.
 
 ---
 
@@ -819,7 +1020,7 @@ resolvieron según su recomendación por defecto.
 | DEC-006 | Conjunto de features v1 | Las 17 features de §6.1 con `RobustScaler` | Subconjunto reducido; features derivadas adicionales | Poder de detección; costo de cómputo | Aceptada según recomendación (2026-07-14) |
 | DEC-007 | Ventanas y mínimos de historia | 6/12 meses; mínimo 3 períodos para desvíos | 3/6 meses; mínimos distintos | Cold-start; sensibilidad | Aceptada según recomendación (2026-07-14) |
 | DEC-008 | Peer group de cohorte | Categoría × localidad, fallback a categoría | Solo categoría; categoría × barrio | Comparabilidad (RD-009); tamaño de cohorte | Aceptada según recomendación (2026-07-14) |
-| DEC-009 | Umbrales de las reglas v1 | Los de la tabla §8 (−60 %, +200 %, racha 3, p1/p99) | Umbrales calibrados con datos reales | Falsos positivos de la rama de reglas | Aceptada según recomendación (2026-07-14) |
+| DEC-009 | Umbrales de las reglas v1 | Los de la tabla §8 (−60 %, +200 %, racha 3, p1/p99) | Umbrales calibrados con datos reales | Falsos positivos de la rama de reglas | Aceptada según recomendación (2026-07-14). Recalibrada a v1.1 el 2026-07-15 con evidencia sintética (§8.2): R2 pasa a precipicio de un período; R4/R5 pasan a p5/p95 en conjunción con `peer_ratio` 0.4/2.5 |
 | DEC-010 | Modelo global vs. por categoría | **Por categoría** (≥ 1.000 suministros), fallback global | Único global con categoría como feature | Precisión de cohorte vs. modelos a mantener | Aceptada según recomendación (2026-07-14) |
 | DEC-011 | `contamination` de Isolation Forest | **0.03** | `'auto'`; 0.01–0.05 | Tasa base de anomalías | Aceptada según recomendación (2026-07-14) |
 | DEC-012 | `n_estimators` / `max_samples` | **200 / 256** | 100 / `'auto'`; valores mayores | Precisión vs. tiempo (RNF-001) | Aceptada según recomendación (2026-07-14) |
