@@ -13,7 +13,7 @@ later remains possible without a redesign (ADR-006).
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
 | `consumos` | Gestión de Consumos | **Implemented, all 3 entities** (US-003 `Lectura`, US-005 `Lote de Facturación`, US-004 `Consumo` — Épica 1 complete) |
-| `motor` | Motor de Inteligencia Energética | **Implemented, Etapas 1-2** (US-006 + US-010 trigger, Épica 2 slice 1; US-007 duplicidades, slice 2; Etapas 3-8 not started) |
+| `motor` | Motor de Inteligencia Energética | **Implemented, Etapas 1-4** (US-006 + US-010 trigger, Épica 2 slice 1; US-007 duplicidades, slice 2; US-008 features + US-009 indicadores estadísticos, slice 3; Etapas 5-8 not started) |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
 | `dashboard` | Dashboard Ejecutivo | Not started |
@@ -391,9 +391,10 @@ foreign-key reference the way there is for a numeric average.
 ## The `motor` context
 
 `motor` (DOMAIN_MODEL.md §4.4, "Motor de Inteligencia Energética") is the fourth bounded context
-to land, Épica 2 slices 1-2 (US-006 + US-010 trigger, Etapa 1 — validación de integridad; US-007,
-Etapa 2 — detección de duplicidades; Etapas 3-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not
-started). Package name: `motor`, the
+to land, Épica 2 slices 1-3 (US-006 + US-010 trigger, Etapa 1 — validación de integridad; US-007,
+Etapa 2 — detección de duplicidades; US-008 + US-009, Etapas 3-4 — generación de features +
+indicadores estadísticos; Etapas 5-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not started).
+Package name: `motor`, the
 short Spanish domain noun itself (the same naming convention `clientes`/`suministros`/`consumos`
 already established), superseding the `intelligence_engine` placeholder this table used before
 this context shipped — not `intelligence_engine`, `ai_engine`, or `ia`: the canonical name in
@@ -446,6 +447,31 @@ bounded context from `motor` (§4.4), even though both share the same physical `
   lote (deliberately NOT filtered by Etapa 1's own exclusions — see that module's docstring for
   why: the mark must survive for a FUTURE lote's feature windows, independent of whether THIS
   lote's gate excluded the suministro today).
+- `motor/infrastructure/features_data_source.py` (`SqlFeaturesDataSource`, implementing
+  `FeaturesDataSource`) is Etapa 3's READ-only port (US-008, `docs/04-ai/AI_ENGINE_SPEC.md` §6):
+  three set-based queries (full cross-lote kwh history, suministro metadata, prior anomaly
+  counts), all scoped by the lote being processed — mostly cross-context (`consumos`/
+  `suministros`), except `fetch_prior_anomaly_counts` which reads `anomalias`/`resultados_ia`,
+  tables that DO belong to `motor`'s own bounded context (kept raw SQL anyway, for consistency
+  with the rest of this file — see that module's docstring).
+- `motor/domain/features.py` turns those rows into a `FeatureVector` per suministro (Etapa 3, the
+  17 features of §6.1 + `is_cold_start`) and enriches it with Etapa 4's three statistical
+  indicators (US-009, §7: `zscore_self`, `percentile_peer`, `iqr_outlier_flag`) — pure functions,
+  no I/O, exhaustively unit-tested against hand-computed values
+  (`tests/unit/contexts/motor/domain/test_features.py`).
+- `motor/infrastructure/feature_vector_repository.py` (`SqlFeatureVectorRepository`, implementing
+  `FeatureVectorRepository`) is the FIRST write `motor` performs against a table it actually owns
+  (`feature_vectors`, DOMAIN_MODEL.md §8.5) — unlike every write/read port above, which crosses a
+  context boundary. Still raw SQL (a batched `INSERT ... ON CONFLICT (suministro_id, lote_id,
+  version) DO UPDATE`), for consistency and because the idempotent-reprocess requirement maps
+  directly onto a single upsert statement — see that module's docstring for the full reasoning
+  and why this is a pragmatic choice, not a load-bearing architectural one.
+- `ProcesarLote._generar_features` runs Etapas 3-4 AFTER Etapa 2, unconditionally (same policy as
+  Etapa 2 — see `AI_ENGINE_SPEC.md` §6.4 for this v1 design note), over every suministro NOT
+  excluded by Etapa 1. Conflicted-period exclusion (DEC-005) happens here, in the application
+  layer, BEFORE the kwh history ever reaches `domain/features.py`'s pure functions — every
+  `consumo_id` appearing in Etapa 2's `periodos_conflictivos` (both sides of each pair) is
+  dropped first.
 
 ### Single-transaction atomicity, no explicit locking
 

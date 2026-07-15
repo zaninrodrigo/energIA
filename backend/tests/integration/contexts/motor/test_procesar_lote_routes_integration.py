@@ -88,6 +88,17 @@ async def test_happy_path_transitions_pendiente_lote_to_procesado(
     assert body["duplicidades"]["periodos_conflictivos"] == []
     assert body["duplicidades"]["lecturas_near_duplicate"] == []
     assert body["duplicidades"]["drift_lotes"] == []
+    # Etapas 3-4 (US-008/US-009, AI_ENGINE_SPEC.md §6/§7): every one of the 3 suministros gets a
+    # feature vector (all cold-start -- a single period each) -- a summary only, never the full
+    # vectors (response-size discipline; the vectors themselves live in `feature_vectors`).
+    assert body["features"]["suministros_con_vector"] == 3
+    assert body["features"]["cold_starts"] == 3
+    assert body["features"]["con_periodos_conflictivos"] == 0
+    verificacion_vectores = await db_session.execute(
+        text("SELECT count(*) FROM feature_vectors WHERE lote_id = :lote_id"),
+        {"lote_id": lote_id},
+    )
+    assert verificacion_vectores.scalar_one() == 3
 
 
 async def test_reprocessing_an_already_procesado_lote_is_conflict(
@@ -427,3 +438,158 @@ async def test_consumo_migration_between_lotes_reports_drift_on_the_previous_lot
     assert drift_lotes[0]["cantidad_registros"] == 2
     assert drift_lotes[0]["consumos_activos"] == 1
     assert drift_lotes[0]["diferencia"] == -1
+
+
+# ---------------------------------------------------------------------------------------------
+# Etapas 3-4 -- feature generation + statistical indicators (US-008/US-009, AI_ENGINE_SPEC.md
+# §6/§7).
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_error_lote_retry_upserts_feature_vectors_without_duplicating(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Mission directive #6: a lote that lands in `Error` (below DEC-004's 95% threshold) still
+    gets `feature_vectors` written for its non-excluded suministros (Etapa 3-4 run
+    unconditionally, `_generar_features`'s docstring) -- a retry (`Error -> Procesando`) must
+    upsert the SAME rows, never duplicate them, exactly like a real "fix the data, retry" cycle
+    an operator would run."""
+    suministro_valido = await insert_suministro(db_session, numero_suministro="SUM-FVR-RETRY-OK")
+    lote_id = await insert_lote(db_session, codigo_lote="LOTE-FVR-RETRY", cantidad_registros=2)
+    await _import_lectura_y_consumo(
+        db_session,
+        suministro_id=suministro_valido,
+        lote_id=lote_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("100.000"),
+    )
+    # A second consumo with NO lectura (V1) -- this suministro is excluded, so 1/2 valid (50%)
+    # keeps the lote below DEC-004's 95% threshold -> Error.
+    suministro_invalido = await insert_suministro(db_session, numero_suministro="SUM-FVR-RETRY-BAD")
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_invalido,
+        lote_id=lote_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("50.000"),
+    )
+
+    primera = await motor_client.post("/api/v1/motor/lotes/LOTE-FVR-RETRY/procesar")
+    assert primera.status_code == 200
+    assert primera.json()["estado_final"] == "Error"
+    assert primera.json()["features"]["suministros_con_vector"] == 1  # only the valid one
+
+    conteo_tras_primera = await db_session.execute(
+        text("SELECT count(*) FROM feature_vectors WHERE lote_id = :lote_id"), {"lote_id": lote_id}
+    )
+    assert conteo_tras_primera.scalar_one() == 1
+
+    segunda = await motor_client.post("/api/v1/motor/lotes/LOTE-FVR-RETRY/procesar")
+    assert segunda.status_code == 200
+    assert segunda.json()["estado_final"] == "Error"
+
+    conteo_tras_segunda = await db_session.execute(
+        text("SELECT count(*) FROM feature_vectors WHERE lote_id = :lote_id"), {"lote_id": lote_id}
+    )
+    assert conteo_tras_segunda.scalar_one() == 1  # upserted, not duplicated
+
+
+async def test_zero_streak_persists_correctly_when_a_conflicted_period_would_bridge_it(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """FIX 1 (reviewer finding, CRITICAL), end-to-end reproduction through the REAL wiring
+    (`energia_test`, the full HTTP journey -- not a fake/unit-level double): a suministro billed
+    Jan=0, Feb=500 (double-billed -- TWO overlapping periods, both flagged conflictive by Etapa 2
+    and excluded from Etapa 3's filtered window, DEC-005), Mar=0, Apr=0 (current, this lote). The
+    persisted `feature_vectors.features->>'zero_consumption_streak'` must be `2` (Mar, Apr), NOT
+    `3` (the bug this fix corrects: bridging Jan+Mar+Apr as if Feb's real 500 kWh never happened,
+    reaching R1's Alta-severity trigger `>= 3`, AI_ENGINE_SPEC.md §8, on a false signal)."""
+    suministro_id = await insert_suministro(db_session, numero_suministro="SUM-STREAK-BRIDGE")
+
+    lote_enero_id = await insert_lote(
+        db_session, codigo_lote="LOTE-STREAK-ENE", cantidad_registros=1
+    )
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_enero_id,
+        fecha_inicio=date(2024, 1, 1),
+        fecha_fin=date(2024, 1, 31),
+        dias_facturados=31,
+        kwh=Decimal("0.000"),
+    )
+
+    # Double-billed February: two OVERLAPPING periods for the same suministro -- Etapa 2 flags
+    # BOTH sides conflictive (DEC-005), so BOTH are excluded from Etapa 3's filtered window, even
+    # though each individually carries real, nonzero consumption.
+    lote_febrero_a_id = await insert_lote(
+        db_session, codigo_lote="LOTE-STREAK-FEB-A", cantidad_registros=1
+    )
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_febrero_a_id,
+        fecha_inicio=date(2024, 2, 1),
+        fecha_fin=date(2024, 2, 15),
+        dias_facturados=15,
+        kwh=Decimal("500.000"),
+    )
+    lote_febrero_b_id = await insert_lote(
+        db_session, codigo_lote="LOTE-STREAK-FEB-B", cantidad_registros=1
+    )
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_febrero_b_id,
+        fecha_inicio=date(2024, 2, 10),
+        fecha_fin=date(2024, 2, 29),
+        dias_facturados=19,
+        kwh=Decimal("500.000"),
+    )
+
+    lote_marzo_id = await insert_lote(
+        db_session, codigo_lote="LOTE-STREAK-MAR", cantidad_registros=1
+    )
+    await insert_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_marzo_id,
+        fecha_inicio=date(2024, 3, 1),
+        fecha_fin=date(2024, 3, 31),
+        dias_facturados=31,
+        kwh=Decimal("0.000"),
+    )
+
+    lote_actual_id = await insert_lote(
+        db_session, codigo_lote="LOTE-STREAK-ABR", cantidad_registros=1
+    )
+    await _import_lectura_y_consumo(
+        db_session,
+        suministro_id=suministro_id,
+        lote_id=lote_actual_id,
+        fecha_inicio=date(2024, 4, 1),
+        fecha_fin=date(2024, 4, 30),
+        dias_facturados=30,
+        kwh=Decimal("0.000"),
+    )
+
+    response = await motor_client.post("/api/v1/motor/lotes/LOTE-STREAK-ABR/procesar")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["features"]["suministros_con_vector"] == 1
+    assert body["features"]["con_periodos_conflictivos"] == 1  # Feb's double-billing, marked
+
+    verificacion = await db_session.execute(
+        text(
+            "SELECT features->>'zero_consumption_streak' FROM feature_vectors "
+            "WHERE lote_id = :lote_id AND suministro_id = :suministro_id"
+        ),
+        {"lote_id": lote_actual_id, "suministro_id": suministro_id},
+    )
+    streak_persistido = verificacion.scalar_one()
+    assert streak_persistido == "2"

@@ -1,5 +1,6 @@
 """ProcesarLote: Etapa 1's orchestrating use case (US-006 + US-010 trigger, AI_ENGINE_SPEC.md
-§2-§4), extended with Etapa 2's duplicidades detection (US-007, §5).
+§2-§4), extended with Etapa 2's duplicidades detection (US-007, §5), Etapa 3's feature
+generation (US-008, §6) and Etapa 4's statistical indicators (US-009, §7).
 
 Flow (AI_ENGINE_SPEC.md §2.1, STEP 0 correction):
   (a) the lote must exist and be `Pendiente` or `Error` (retry) -- `Procesando` is a 409
@@ -29,11 +30,18 @@ Flow (AI_ENGINE_SPEC.md §2.1, STEP 0 correction):
       rest of this flow (see the docstring paragraph below), intentional consistency-over-partials
       rather than an accidental side effect of Etapa 2 sharing this transaction -- see
       AI_ENGINE_SPEC.md §2.5's table.
-  (h) transition `Procesando` -> `Procesado` (>= 95% valid) or `Procesando` -> `Error` (< 95%).
+  (h) run Etapa 3 (feature generation, `domain.features.construir_feature_vector`) + Etapa 4
+      (statistical indicators, `domain.features.enriquecer_con_indicadores_cohorte`) over every
+      suministro of THIS lote NOT excluded by step (f) (`_generar_features`'s docstring) --
+      UNCONDITIONALLY, same "runs regardless of the 95% outcome" policy step (g) already
+      established for Etapa 2 (see that method's own docstring for the honest v1 design note).
+      Persists via `FeatureVectorRepository.guardar_batch` (upsert, same transaction).
+  (i) transition `Procesando` -> `Procesado` (>= 95% valid) or `Procesando` -> `Error` (< 95%).
       `assert`ed to succeed: under the row lock held since step (c), a `False` return here would
       mean a broken invariant, not a normal race (protects a future refactor that might
       accidentally release that lock early, e.g. an intermediate commit).
-  (i) return the full `InformeValidacion` + `InformeDuplicidades` plus the final `EstadoLote`.
+  (j) return the full `InformeValidacion` + `InformeDuplicidades` + `ResumenFeatures` plus the
+      final `EstadoLote`.
 
 Nothing here calls `session.commit()` -- see `presentation/routes.py`'s docstring for why a
 SINGLE commit at the very end (after step (h), not after step (c) too) is what keeps this whole
@@ -45,6 +53,7 @@ stuck row the way a two-commit design would. That SAME rollback is what reverts 
 when (e) raises `LoteModificadoError`.
 """
 
+from collections import defaultdict
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -53,10 +62,20 @@ from energia.contexts.motor.domain.duplicidades import (
     InformeDuplicidades,
     construir_informe_duplicidades,
 )
+from energia.contexts.motor.domain.features import (
+    FeatureConsumoRow,
+    ResumenFeatures,
+    construir_feature_vector,
+    enriquecer_con_indicadores_cohorte,
+    resumir_features,
+)
 from energia.contexts.motor.domain.informe_validacion import InformeValidacion, construir_informe
 from energia.contexts.motor.domain.lote_estado import EstadoLote
 from energia.contexts.motor.domain.ports import (
     DuplicidadesDataSource,
+    FeaturesDataSource,
+    FeatureVectorParaGuardar,
+    FeatureVectorRepository,
     LoteProcesamientoPort,
     ValidacionDataSource,
 )
@@ -98,17 +117,24 @@ class LoteNoListoError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class ResultadoProcesamiento:
-    """`ProcesarLote.execute()`'s return value: the final estado plus Etapa 1's + Etapa 2's full
-    reports. `duplicidades` never influences `estado_final` (DEC-005: annotate only, §5)."""
+    """`ProcesarLote.execute()`'s return value: the final estado plus Etapas 1-4's full reports.
+    `duplicidades` never influences `estado_final` (DEC-005: annotate only, §5); `features`
+    (Etapas 3-4, §6-§7) runs unconditionally too, over every NON-EXCLUDED suministro of the lote,
+    the same "always runs after Etapa 2, regardless of the 95% outcome" policy `duplicidades`
+    already established -- see `_generar_features`'s docstring for why this v1 choice is
+    reasonable and where it is flagged as a deliberate, honest design note."""
 
     estado_final: EstadoLote
     informe: InformeValidacion
     duplicidades: InformeDuplicidades
+    features: ResumenFeatures
 
 
 class ProcesarLote:
-    """US-006 + US-010 + US-007: valida la integridad de un lote completo (Etapa 1), detecta
-    duplicidades (Etapa 2, anotación únicamente) y decide el estado final del lote."""
+    """US-006 + US-010 + US-007 + US-008 + US-009: valida la integridad de un lote completo
+    (Etapa 1), detecta duplicidades (Etapa 2, anotación únicamente), genera los feature vectors
+    (Etapa 3) y calcula los indicadores estadísticos (Etapa 4) para cada suministro no excluido,
+    y decide el estado final del lote."""
 
     def __init__(
         self,
@@ -116,10 +142,14 @@ class ProcesarLote:
         lote_port: LoteProcesamientoPort,
         validacion_source: ValidacionDataSource,
         duplicidades_source: DuplicidadesDataSource,
+        features_source: FeaturesDataSource,
+        feature_vector_repository: FeatureVectorRepository,
     ) -> None:
         self._lote_port = lote_port
         self._validacion_source = validacion_source
         self._duplicidades_source = duplicidades_source
+        self._features_source = features_source
+        self._feature_vector_repository = feature_vector_repository
 
     async def execute(self, codigo_lote: str) -> ResultadoProcesamiento:
         actual = await self._lote_port.obtener_estado_actual(codigo_lote)
@@ -157,6 +187,7 @@ class ProcesarLote:
 
         informe = construir_informe(actual.id, list(filas))
         duplicidades = await self._construir_duplicidades(actual.id)
+        features = await self._generar_features(actual.id, informe, duplicidades)
 
         estado_final = EstadoLote.PROCESADO if informe.umbral_cumplido else EstadoLote.ERROR
         movido_final = await self._lote_port.transicionar_estado(
@@ -169,7 +200,7 @@ class ProcesarLote:
         )
 
         return ResultadoProcesamiento(
-            estado_final=estado_final, informe=informe, duplicidades=duplicidades
+            estado_final=estado_final, informe=informe, duplicidades=duplicidades, features=features
         )
 
     async def _construir_duplicidades(self, lote_id: UUID) -> InformeDuplicidades:
@@ -189,3 +220,95 @@ class ProcesarLote:
             lecturas=list(lecturas),
             conteos_lotes=list(conteos_lotes),
         )
+
+    async def _generar_features(
+        self, lote_id: UUID, informe: InformeValidacion, duplicidades: InformeDuplicidades
+    ) -> ResumenFeatures:
+        """Etapa 3 (US-008, §6) + Etapa 4 (US-009, §7): build and persist one `FeatureVector` per
+        NON-EXCLUDED suministro of `lote_id` (mission directive #1 -- Etapa 1's `informe.
+        exclusiones` are skipped, exactly like the scoring branches downstream would skip them),
+        after Etapa 2.
+
+        **Deliberate v1 design note: this runs UNCONDITIONALLY, regardless of `informe.
+        umbral_cumplido`.** AI_ENGINE_SPEC.md §3's pipeline draws stages 1->2->3->4->... as one
+        sequential flow with no "abort after stage 1" gate drawn between stages 2 and 3, and
+        Etapa 2 (`_construir_duplicidades`) already established the precedent of running
+        unconditionally, never gated by Etapa 1's 95% threshold (DEC-005). Mirroring that here
+        keeps `feature_vectors` populated even for a lote that lands in `Error` (DEC-004) -- which
+        matters for a retry: `Error -> Procesando` re-runs Etapa 3-4 over the SAME rows and
+        upserts (never duplicates) the SAME vectors, so a corrected re-import naturally overwrites
+        stale ones instead of leaving the previous attempt's vectors orphaned. Not explicit in
+        AI_ENGINE_SPEC.md §6/§7 either way -- flagged here as an honest, reasoned deviation rather
+        than a silent assumption.
+
+        **Conflicted-period exclusion (DEC-005, §6 note):** every `consumo_id` appearing in
+        `duplicidades.periodos_conflictivos` (both sides of each pair) is dropped from the kwh
+        history BEFORE it ever reaches `construir_feature_vector` -- see `domain/features.py`'s
+        module docstring for why the domain layer itself stays unaware of "conflicted" entirely,
+        **except for F10** (FIX 1, reviewer finding, CRITICAL): the UNFILTERED history (conflicted
+        rows included) is ALSO built here and passed as `historial_suministro_completo`, used by
+        `construir_feature_vector` only to compute `zero_consumption_streak` -- a conflicted period
+        that had real, nonzero consumption must still break a zero-streak, or two zero periods
+        flanking it would look artificially adjacent (see that function's docstring).
+        """
+        excluidos = {exclusion.suministro_id for exclusion in informe.exclusiones}
+        suministros_con_conflicto = {
+            entrada.suministro_id for entrada in duplicidades.periodos_conflictivos
+        }
+        consumos_conflictivos = {
+            periodo.consumo_id
+            for entrada in duplicidades.periodos_conflictivos
+            for periodo in entrada.periodos
+        }
+
+        historial_filas = await self._features_source.fetch_historial_kwh(lote_id)
+        metadata_filas = await self._features_source.fetch_metadata_suministros(lote_id)
+        conteo_filas = await self._features_source.fetch_prior_anomaly_counts(lote_id)
+
+        historial_por_suministro: dict[UUID, list[FeatureConsumoRow]] = defaultdict(list)
+        # FIX 1 (reviewer finding, CRITICAL): the UNFILTERED history -- conflicted rows included
+        # -- built alongside the filtered one above, for F10 `zero_consumption_streak` only (see
+        # `_generar_features`'s docstring and `domain/features.py`'s module docstring).
+        historial_completo_por_suministro: dict[UUID, list[FeatureConsumoRow]] = defaultdict(list)
+        for fila in historial_filas:
+            historial_completo_por_suministro[fila.suministro_id].append(fila)
+            if fila.consumo_id in consumos_conflictivos:
+                continue
+            historial_por_suministro[fila.suministro_id].append(fila)
+
+        conteos_por_suministro = {fila.suministro_id: fila.cantidad for fila in conteo_filas}
+
+        vectores = []
+        for metadata in metadata_filas:
+            if metadata.suministro_id in excluidos:
+                continue
+            vector = construir_feature_vector(
+                suministro_id=metadata.suministro_id,
+                lote_id=lote_id,
+                historial_suministro=historial_por_suministro.get(metadata.suministro_id, []),
+                historial_suministro_completo=historial_completo_por_suministro.get(
+                    metadata.suministro_id, []
+                ),
+                categoria_tarifaria_id=metadata.categoria_tarifaria_id,
+                localidad=metadata.localidad,
+                fecha_alta=metadata.fecha_alta,
+                prior_anomaly_count=conteos_por_suministro.get(metadata.suministro_id, 0),
+                tiene_periodos_conflictivos=metadata.suministro_id in suministros_con_conflicto,
+            )
+            if vector is not None:
+                vectores.append(vector)
+
+        vectores = enriquecer_con_indicadores_cohorte(vectores)
+
+        await self._feature_vector_repository.guardar_batch(
+            [
+                FeatureVectorParaGuardar(
+                    suministro_id=vector.suministro_id,
+                    lote_id=vector.lote_id,
+                    features=vector.features,
+                )
+                for vector in vectores
+            ]
+        )
+
+        return resumir_features(vectores)

@@ -372,6 +372,82 @@ historia). Mapeo a esquema: todo el vector va en `feature_vectors.features` (jso
 identifica la versión del contrato de features (p. ej. `"v1"`), respetando
 `UNIQUE (suministro_id, lote_id, version)`.
 
+### 6.3 Exclusión de períodos conflictivos de las ventanas (nota, DEC-005)
+
+Todo período marcado en `periodos_conflictivos` (Etapa 2, §5) se excluye de **toda** ventana de
+agregación de la Etapa 3 — **ambos lados del par**, no solo el más reciente: DEC-005 no define
+una regla de canonicidad que prefiera un lado sobre el otro (§5), así que esta implementación no
+inventa una. La exclusión ocurre en la capa de aplicación (`ProcesarLote._generar_features`,
+`backend/src/energia/contexts/motor/application/procesar_lote.py`), **antes** de que la historia
+llegue a las funciones puras de dominio (`backend/src/energia/contexts/motor/domain/features.py`):
+el dominio no tiene noción de "conflictivo" en absoluto, simplemente refleja la historia que
+recibe — ver el docstring de ese módulo y
+`test_conflicted_period_exclusion_is_a_prior_filtering_concern`
+(`backend/tests/unit/contexts/motor/domain/test_features.py`).
+
+**Consecuencia, documentada honestamente:** si el ÚNICO período de un suministro en el lote que
+se está procesando es uno de los lados de un par conflictivo, ese suministro no recibe
+`FeatureVector` en esta corrida (no hay período "actual" no conflictivo al cual anclar las
+ventanas) — política v1, no un error.
+
+**Nota (FIX 1, hallazgo de revisión, CRITICAL, 2026-07-15) — F10 `zero_consumption_streak` es la
+ÚNICA excepción a "el dominio no tiene noción de conflictivo".** Excluir de las ventanas un período
+conflictivo pero con consumo REAL Y DISTINTO DE CERO (p. ej. un mes facturado dos veces) puentea el
+hueco que deja: dos períodos en cero que solo quedan adyacentes porque el período real intermedio
+fue eliminado parecen una racha ininterrumpida, inflando `zero_consumption_streak` por encima de lo
+que las lecturas físicas realmente muestran — un `streak` persistido en `3` alcanza el disparador
+de severidad Alta de R1 (`>= 3`, §8) cuando el valor real es `2`. Una racha de cero consumo es un
+enunciado sobre LECTURAS CRUDAS OBSERVADAS: un período conflictivo, aunque se excluya de toda otra
+ventana, sigue evidenciando que el suministro fue facturado con consumo ese período si su propio
+`kwh` es distinto de cero (corta la racha); un período conflictivo cuyo propio `kwh` es cero no
+evidencia nada y la racha continúa a través de él. Por esto, `construir_feature_vector`
+(`backend/src/energia/contexts/motor/domain/features.py`) recibe una SEGUNDA historia, SIN
+filtrar (`historial_suministro_completo`), usada EXCLUSIVAMENTE para F10 — el resto de las
+features (F1-F9, F11-F17) sigue leyendo la historia filtrada sin cambios. Ver el docstring del
+módulo y `test_zero_streak_bridges_conflicted_nonzero_period_using_unfiltered_history`/
+`test_zero_streak_continues_through_a_conflicted_period_that_is_itself_zero`
+(`backend/tests/unit/contexts/motor/domain/test_features.py`).
+
+### 6.4 Implementación (estado, 2026-07-15)
+
+Etapas 3 y 4 (§6/§7) están **implementadas**: `domain/features.py` (funciones puras F1-F17 +
+`is_cold_start` + `zscore_self`), `infrastructure/features_data_source.py` (lecturas set-based),
+`infrastructure/feature_vector_repository.py` (upsert en `feature_vectors`), integradas en
+`ProcesarLote` (`application/procesar_lote.py`). Desviaciones honestas frente a este documento:
+
+- **F1 (`avg_consumption`) y F8 (`moving_avg_12m`) son matemáticamente idénticas** bajo la
+  definición de ventana v1 (ambas son la media de los últimos 12 períodos, incluyendo el actual)
+  — no es un error, es una observación: el documento las nombra para roles distintos (F1 como
+  señal de exposición general para el IRE, §10.1; F8 específicamente como término base de F9),
+  pero ambas claves se escriben igual en el jsonb, tal como exige el contrato de identificadores.
+- **Etapas 3-4 corren incondicionalmente**, sin importar si el lote termina `Procesado` o `Error`
+  por el umbral de DEC-004 — la misma política que Etapa 2 (duplicidades) ya estableció. No
+  estaba explícito en ninguna dirección en este documento; se documenta como una decisión v1
+  razonada, no un supuesto silencioso (ver el docstring de `_generar_features`).
+- **Precisión numérica:** `Decimal` (tipo de `consumos.kwh`) se convierte a `float` en el borde
+  del dominio, antes de cualquier cómputo — jsonb no tiene un tipo decimal de punto fijo. Pérdida
+  de precisión despreciable a esta magnitud (`numeric(12,3)` cabe cómodo en `float64`).
+- **F13/percentile_peer/iqr_outlier_flag** reutilizan el mismo umbral de cohorte (DEC-008,
+  `COHORTE_MINIMA = 10`, `COHORTE_FALLBACK_MINIMA = 3`) — F13 nunca queda `null` por cohorte
+  chica (siempre resuelve contra al menos la categoría propia), a diferencia de los dos
+  indicadores de Etapa 4, que sí quedan `null` bajo `COHORTE_FALLBACK_MINIMA`.
+- **F12 (`seasonality_index`) distingue "sin dato de año anterior" de "media de año anterior
+  igual a cero"** (FIX 2, hallazgo de revisión, WARNING, 2026-07-15): sin ningún período del mismo
+  mes en un año anterior, el valor neutro `1.0` (cold-start, DEC-007) sigue aplicando sin cambios;
+  pero si SÍ existe dato del mismo mes en un año anterior y su media da exactamente `0`, ahora es
+  `null` (división por cero real), no `1.0` — el valor anterior enmascaraba un salto de `0` a
+  varios miles de kWh como "perfectamente estacional".
+- **F11 (`trend_slope`) regresiona contra meses calendario transcurridos desde el primer período
+  de la ventana, no contra la posición en la lista** (FIX 4, hallazgo de revisión, WARNING,
+  2026-07-15): para una ventana mensual contigua el resultado es idéntico al anterior (ambos
+  cuentan "1 unidad" por mes), pero un hueco calendario real entre dos períodos (un suministro sin
+  lectura/facturación por varios meses) ahora pesa proporcionalmente en la pendiente, en vez de
+  tratarse como si fuera simplemente "el siguiente" período contiguo.
+- **F14 (`supply_age_days`) nunca es negativo** (FIX 5(a), hallazgo de revisión, 2026-07-15): si
+  `suministros.fecha_alta` es POSTERIOR al `fecha_inicio` del período evaluado (inconsistencia de
+  datos — un suministro no puede facturar antes de darse de alta), el valor es `null`, no un
+  conteo de días negativo.
+
 ---
 
 ## 7. Etapa 4 — Indicadores estadísticos (US-009)
@@ -392,6 +468,29 @@ recomendación, 2026-07-14):** el peer group es categoría × localidad, con fal
 sola. El umbral exacto de "cohorte chica" que dispara ese fallback se calibra con el tamaño
 típico de cohorte de los datos reales, que hoy se desconocen (staging pendiente,
 PROJECT_MASTER_SPEC #8) — esa calibración numérica queda abierta; la elección del peer group no.
+
+**Implementación (estado, 2026-07-15):** implementado en
+`domain/features.enriquecer_con_indicadores_cohorte` — cohorte = suministros ANALIZADOS del lote
+en curso (no excluidos por Etapa 1), agrupados por categoría × localidad; `percentile_peer` es la
+fracción de la cohorte con `kwh <= kwh_t`; Q1/Q3 (para el IQR) usan interpolación lineal, el mismo
+método de `PERCENTILE_CONT` de PostgreSQL, para que un chequeo manual por psql coincida sin
+corrección. `zscore_self` (§7) se calcula sobre la historia **completa** disponible del propio
+suministro (no solo los últimos 12 meses que usan F1-F9), `null` si tiene menos de 3 períodos
+(DEC-007) — ver §6.4 para las desviaciones honestas compartidas con la Etapa 3.
+
+**Nota (FIX 3, hallazgo de revisión, WARNING, 2026-07-15) — `iqr_outlier_flag` usa cuartiles
+"leave-one-out" (LOO), a diferencia de `percentile_peer`.** Calcular Q1/Q3 INCLUYENDO el propio
+`kwh` del suministro evaluado deja que un pico genuino infle su propio límite superior,
+enmascarando exactamente el outlier que debería marcar: en una cohorte de fallback de 3 miembros
+`[10, 20, 10000]`, los límites inclusivos nunca marcan `10000` (su propio valor arrastra Q3 —y por
+lo tanto el límite superior— hacia arriba), mientras que `percentile_peer` para ese mismo vector
+reporta correctamente `1.0` — una contradicción interna entre ambos indicadores que este ajuste
+resuelve. `percentile_peer` se mantiene inclusivo a propósito (es el estadístico estándar basado
+en rango, correcto tal cual); solo los límites del IQR excluyen al suministro evaluado de su
+propio cálculo. Ver `domain/features.py`'s `enriquecer_con_indicadores_cohorte` y
+`test_iqr_outlier_flag_uses_leave_one_out_bounds_not_masked_by_self`/
+`test_iqr_outlier_flag_none_when_loo_cohort_below_minimum`
+(`backend/tests/unit/contexts/motor/domain/test_features.py`).
 
 ---
 
@@ -659,6 +758,31 @@ anomalías confirmadas) **requieren etiquetas** de inspecciones finalizadas, que
 En v1 el monitoreo se apoya en **proxies no supervisados** (tasa de anomalías, deriva del score,
 tiempo de análisis); las métricas supervisadas se activan cuando el Feedback Loop (§9.5, v2)
 empiece a producir etiquetas.
+
+### 13.1 Línea base v1 (datos sintéticos, seed 42, 2026-07-15)
+
+A falta de etiquetas reales (cold-start, ver arriba), esta es la referencia comprometida que el
+motor debe superar una vez existan las ramas de reglas/IA completas: un detector ingenuo por
+porcentaje de cambio, corrido sobre el dataset sintético determinístico (`seed 42`, ver
+`backend/src/energia/tools/synthetic/`), detecta 5 de 6 anomalías plantadas con 43 falsos positivos
+cada 100 suministros sanos. La tabla siguiente muestra, para cada anomalía plantada, cómo la
+formalizan los indicadores de Etapa 4 (§7) ya implementados, en el mes de inicio de la anomalía:
+
+| suministro | tipo plantado | \|z\|≥3 | IQR | percentile extremo |
+|---|---|---|---|---|
+| SYN-S42-SUM-00005 | spike_leve | no (2.83) | sí | sí (1.0) |
+| SYN-S42-SUM-00014 | sudden_drop | no (-2.02) | sí | no |
+| SYN-S42-SUM-00024 | spike | sí (4.04) | sí | sí (1.0) |
+| SYN-S42-SUM-00032 | sudden_drop_leve | no (-1.05) | sí | no |
+| SYN-S42-SUM-00049 | zero_consumption_streak | no (-1.42) | sí | no |
+| SYN-S42-SUM-00073 | gradual_decline | no | no | no (visible recién 6+ meses después del inicio) |
+
+Falsos positivos sobre 94 sanos (último lote): 1 zscore, 5 IQR, 6 percentile.
+
+**Nota:** esta tabla es anterior a los FIX 3 (IQR leave-one-out, §7) y FIX 4 (`trend_slope` contra
+meses calendario, §6.4) de la revisión del 2026-07-15 — ambos pueden desplazar estos números (en
+particular la columna IQR, y cualquier detección que dependa de `trend_slope`). Se remedirá con la
+Etapa 6 (Isolation Forest, §9), cuando exista el pipeline completo contra el que comparar.
 
 ---
 

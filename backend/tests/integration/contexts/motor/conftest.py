@@ -96,8 +96,13 @@ async def insert_suministro(
     numero_suministro: str,
     cliente_id: UUID | None = None,
     categoria_tarifaria_id: UUID | None = None,
+    localidad: str | None = None,
+    fecha_alta: date = date(2024, 1, 1),
 ) -> UUID:
-    """Mirrors `tests.integration.contexts.consumos.conftest.insert_suministro` exactly."""
+    """Mirrors `tests.integration.contexts.consumos.conftest.insert_suministro`, extended with
+    optional `localidad`/`fecha_alta` (default unchanged from before) -- Etapa 3's feature tests
+    (US-008, AI_ENGINE_SPEC.md §6) need control over both: `localidad` for cohort grouping
+    (DEC-008) and `fecha_alta` for F14 `supply_age_days`."""
     if cliente_id is None:
         cliente_id = await insert_cliente(session, numero_cliente=f"cliente-de-{numero_suministro}")
     if categoria_tarifaria_id is None:
@@ -107,15 +112,17 @@ async def insert_suministro(
     await session.execute(
         text(
             "INSERT INTO suministros "
-            "(id, numero_suministro, cliente_id, categoria_tarifaria_id, fecha_alta) "
-            "VALUES (:id, :numero_suministro, :cliente_id, :categoria_tarifaria_id, :fecha_alta)"
+            "(id, numero_suministro, cliente_id, categoria_tarifaria_id, fecha_alta, localidad) "
+            "VALUES (:id, :numero_suministro, :cliente_id, :categoria_tarifaria_id, "
+            ":fecha_alta, :localidad)"
         ),
         {
             "id": suministro_id,
             "numero_suministro": numero_suministro,
             "cliente_id": cliente_id,
             "categoria_tarifaria_id": categoria_tarifaria_id,
-            "fecha_alta": date(2024, 1, 1),
+            "fecha_alta": fecha_alta,
+            "localidad": localidad,
         },
     )
     await session.commit()

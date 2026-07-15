@@ -31,6 +31,12 @@ __all__ = [
     "LecturaHistorialRow",
     "LoteConteoRow",
     "DuplicidadesDataSource",
+    "FeatureConsumoRow",
+    "SuministroMetadataRow",
+    "PriorAnomalyCountRow",
+    "FeaturesDataSource",
+    "FeatureVectorParaGuardar",
+    "FeatureVectorRepository",
 ]
 
 
@@ -206,4 +212,111 @@ class DuplicidadesDataSource(Protocol):
     async def fetch_conteos_lotes_relacionados(self, lote_id: UUID) -> Sequence[LoteConteoRow]:
         """Return every OTHER lote (`lote_id` excluded) that shares at least one suministro with
         `lote_id`, each with its `cantidad_registros` vs. its current active `consumos` count."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureConsumoRow:
+    """One row of a suministro's FULL active consumo history (every lote, every period ever
+    billed) -- input to `domain.features.construir_feature_vector` (AI_ENGINE_SPEC.md §6, Etapa
+    3 / US-008). Unlike `PeriodoHistorialRow` (Etapa 2), this carries `kwh`/`dias_facturados`:
+    Etapa 3's windows need the actual consumption values, not just the period boundaries.
+
+    Conflicted-period exclusion (DEC-005, AI_ENGINE_SPEC.md §6 note) happens BEFORE this row
+    ever reaches the domain layer: `ProcesarLote._generar_features` (application layer) drops
+    any row whose `consumo_id` appears in Etapa 2's `periodos_conflictivos` (both sides of each
+    pair) before grouping rows by `suministro_id` -- `construir_feature_vector` itself has no
+    notion of "conflicted" at all for F1-F9/F11-F17, it simply reflects whatever history it is
+    given (see that function's docstring and
+    `tests/unit/contexts/motor/domain/test_features.py`'s
+    `test_conflicted_period_exclusion_is_a_prior_filtering_concern`). **F10
+    `zero_consumption_streak` is the one exception** (FIX 1, reviewer finding, CRITICAL):
+    `_generar_features` ALSO builds the unfiltered grouping (conflicted rows included) and passes
+    it as `construir_feature_vector`'s `historial_suministro_completo`, used only for F10 -- see
+    that function's docstring for why a conflicted-but-nonzero period must still break a
+    zero-streak.
+    """
+
+    consumo_id: UUID
+    suministro_id: UUID
+    lote_id: UUID
+    fecha_inicio: date
+    fecha_fin: date
+    dias_facturados: int
+    kwh: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class SuministroMetadataRow:
+    """One suministro's Etapa 3 metadata (categoria/localidad/fecha_alta) -- everything
+    `construir_feature_vector` needs besides the kwh history itself (F14 `supply_age_days`, F17
+    `categoria_tarifaria`, and the cohort grouping key `categoria_tarifaria_id` x `localidad`,
+    DEC-008)."""
+
+    suministro_id: UUID
+    categoria_tarifaria_id: UUID
+    localidad: str | None
+    fecha_alta: date
+
+
+@dataclass(frozen=True, slots=True)
+class PriorAnomalyCountRow:
+    """One suministro's historical anomaly count -- F15 `prior_anomaly_count`. Always `0` today
+    (correct by construction: `anomalias`/`resultados_ia` stay empty until Etapas 6-7 land and
+    start writing them -- see `domain/features.py`'s module docstring)."""
+
+    suministro_id: UUID
+    cantidad: int
+
+
+class FeaturesDataSource(Protocol):
+    """Cross-context port: Etapa 3's set-based reads (AI_ENGINE_SPEC.md §6, US-008) -- full
+    suministro-level kwh history, suministro metadata, and prior anomaly counts, all scoped by
+    the lote currently being processed (see `infrastructure/features_data_source.py`). One query
+    per concern (RNF-001), never a per-suministro loop.
+    """
+
+    async def fetch_historial_kwh(self, lote_id: UUID) -> Sequence[FeatureConsumoRow]:
+        """Return the FULL active consumo history (every lote, ordered by `suministro_id`,
+        `fecha_inicio`) of every suministro that has at least one active consumo in `lote_id`."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def fetch_metadata_suministros(self, lote_id: UUID) -> Sequence[SuministroMetadataRow]:
+        """Return the categoria/localidad/fecha_alta of every suministro that has at least one
+        active consumo in `lote_id`."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def fetch_prior_anomaly_counts(self, lote_id: UUID) -> Sequence[PriorAnomalyCountRow]:
+        """Return the historical `anomalias` count (GROUP BY suministro_id) of every suministro
+        that has at least one active consumo in `lote_id`. A suministro with no matching row has
+        `0` prior anomalies -- the caller defaults missing entries to `0`, this method never
+        returns a zero-count row explicitly (an empty GROUP BY result omits it entirely)."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureVectorParaGuardar:
+    """The minimal shape `FeatureVectorRepository.guardar_batch` persists -- deliberately NOT
+    `domain.features.FeatureVector` itself (which also carries transient, non-persisted cohort-
+    grouping fields like `localidad`/`kwh_actual`, see that module's docstring): keeping this
+    port's own shape here (not importing `domain.features`) avoids a circular import (`domain.
+    features` already imports `FeatureConsumoRow` etc. from this module)."""
+
+    suministro_id: UUID
+    lote_id: UUID
+    features: dict[str, object]
+
+
+class FeatureVectorRepository(Protocol):
+    """Same-context port: `feature_vectors` is the first table Etapas 3-4 actually WRITE that
+    belongs to `motor`'s own bounded context (DOMAIN_MODEL.md §8.5), unlike the cross-context
+    `lotes`/`consumos` reads/writes above -- see `infrastructure/feature_vector_repository.py`'s
+    docstring for why this is still implemented with raw SQL rather than an ORM model.
+    """
+
+    async def guardar_batch(self, vectores: Sequence[FeatureVectorParaGuardar]) -> None:
+        """Upsert every vector: `INSERT ... ON CONFLICT (suministro_id, lote_id, version) DO
+        UPDATE` -- a reprocess (Error -> retry) overwrites the same rows instead of duplicating
+        them (mission directive #6). Does not commit: same session/transaction discipline as
+        every other port in this module."""
         ...  # pragma: no cover — Protocol stub, never executed directly

@@ -72,7 +72,21 @@ class InformeDuplicidadesSchema(BaseModel):
     drift_lotes: list[DriftLoteSchema]
 
 
+class IndicadoresResumenSchema(BaseModel):
+    zscore_extremos: int
+    iqr_outliers: int
+    percentile_extremos: int
+
+
+class ResumenFeaturesSchema(BaseModel):
+    suministros_con_vector: int
+    cold_starts: int
+    con_periodos_conflictivos: int
+    indicadores: IndicadoresResumenSchema
+
+
 class ProcesarLoteResponseSchema(BaseModel):
     estado_final: str
     informe: InformeValidacionSchema
     duplicidades: InformeDuplicidadesSchema
+    features: ResumenFeaturesSchema

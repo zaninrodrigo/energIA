@@ -22,18 +22,24 @@ from energia.contexts.motor.domain.ports import LoteProcesamientoPort
 from energia.contexts.motor.infrastructure.duplicidades_data_source import (
     SqlDuplicidadesDataSource,
 )
+from energia.contexts.motor.infrastructure.feature_vector_repository import (
+    SqlFeatureVectorRepository,
+)
+from energia.contexts.motor.infrastructure.features_data_source import SqlFeaturesDataSource
 from energia.contexts.motor.infrastructure.lote_procesamiento import SqlLoteProcesamientoPort
 from energia.contexts.motor.infrastructure.validacion_data_source import SqlValidacionDataSource
 from energia.contexts.motor.presentation.schemas import (
     DriftLoteSchema,
     ExclusionSchema,
     HallazgoSchema,
+    IndicadoresResumenSchema,
     InformeDuplicidadesSchema,
     InformeValidacionSchema,
     LecturaNearDuplicateSchema,
     PeriodoConflictivoSchema,
     PeriodosConflictivosSuministroSchema,
     ProcesarLoteResponseSchema,
+    ResumenFeaturesSchema,
 )
 from energia.shared.db import get_db_session
 
@@ -111,6 +117,16 @@ def _to_response(resultado: ResultadoProcesamiento) -> ProcesarLoteResponseSchem
                 for drift in duplicidades.drift_lotes
             ],
         ),
+        features=ResumenFeaturesSchema(
+            suministros_con_vector=resultado.features.suministros_con_vector,
+            cold_starts=resultado.features.cold_starts,
+            con_periodos_conflictivos=resultado.features.con_periodos_conflictivos,
+            indicadores=IndicadoresResumenSchema(
+                zscore_extremos=resultado.features.zscore_extremos,
+                iqr_outliers=resultado.features.iqr_outliers,
+                percentile_extremos=resultado.features.percentile_extremos,
+            ),
+        ),
     )
 
 
@@ -137,9 +153,13 @@ async def procesar_lote(
     codigo_lote: str,
     session: AsyncSession = Depends(get_db_session),
 ) -> ProcesarLoteResponseSchema:
-    """Run Etapa 1 (US-006, integrity validation) + Etapa 2 (US-007, duplicidades) over
-    `codigo_lote` and decide its final `estado` (`Procesado` if >= 95% of its suministros pass
-    Etapa 1, `Error` otherwise -- DEC-004; Etapa 2 never influences this, DEC-005).
+    """Run Etapa 1 (US-006, integrity validation) + Etapa 2 (US-007, duplicidades) + Etapa 3
+    (US-008, feature generation) + Etapa 4 (US-009, statistical indicators) over `codigo_lote`
+    and decide its final `estado` (`Procesado` if >= 95% of its suministros pass Etapa 1, `Error`
+    otherwise -- DEC-004; Etapas 2-4 never influence this, DEC-005 for Etapa 2, and the same
+    unconditional policy extended to Etapas 3-4 -- see `ProcesarLote._generar_features`'s
+    docstring). `feature_vectors` rows are persisted for every NON-EXCLUDED suministro; the
+    response's `features` field is a summary only (counts), never the full vectors.
 
     A SINGLE commit, after the whole use case returns successfully: `ProcesarLote.execute()`
     itself never commits (see that module's docstring for why a single commit at the very end,
@@ -158,6 +178,8 @@ async def procesar_lote(
         lote_port=lote_port,
         validacion_source=SqlValidacionDataSource(session),
         duplicidades_source=SqlDuplicidadesDataSource(session),
+        features_source=SqlFeaturesDataSource(session),
+        feature_vector_repository=SqlFeatureVectorRepository(session),
     )
     try:
         resultado = await use_case.execute(codigo_lote)
