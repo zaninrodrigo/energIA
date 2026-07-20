@@ -71,6 +71,11 @@ jobs:
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
+        with:
+          # Pinned explicitly: the action otherwise reads `packageManager` from the repo-root
+          # package.json, which does not exist (the app lives in frontend/). Keep in sync with
+          # frontend/package.json's `packageManager` field.
+          version: 10.14.0
 
       # actions/setup-node's `cache: pnpm` shells out to `pnpm store path`, so pnpm must already
       # be on PATH -- this step must come after "Set up pnpm", not before.
