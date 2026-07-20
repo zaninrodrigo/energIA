@@ -8,6 +8,9 @@ export interface StatCardProps {
   value: ReactNode;
   tone?: StatCardTone;
   icon?: ReactNode;
+  /** Optional one-line clarification shown under the value (e.g. spelling out an acronym in plain
+   *  language for operators who don't know it). */
+  hint?: string;
 }
 
 // Left-accent border per tone, reusing the same risk-scale `-fg` tokens Badge uses for text --
@@ -24,7 +27,7 @@ const ACCENT_CLASSES: Record<StatCardTone, string> = {
 /** KPI tile: a label, a value, an optional icon, and an optional risk-tone accent border (used
  *  by the Ranking de Riesgo dashboard's summary row -- Phase 2 -- to color-code per-nivel
  *  counts using the same scale as `Badge`). */
-export function StatCard({ label, value, tone = "neutral", icon }: StatCardProps) {
+export function StatCard({ label, value, tone = "neutral", icon, hint }: StatCardProps) {
   return (
     <div
       data-tone={tone}
@@ -34,6 +37,7 @@ export function StatCard({ label, value, tone = "neutral", icon }: StatCardProps
       <div>
         <p className="text-sm text-slate-500">{label}</p>
         <p className="text-2xl font-semibold tabular-nums text-slate-900">{value}</p>
+        {hint ? <p className="mt-0.5 text-xs text-slate-400">{hint}</p> : null}
       </div>
     </div>
   );

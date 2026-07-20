@@ -11,6 +11,7 @@ import { LoteSelector } from "./LoteSelector";
 import { NivelFilter } from "./NivelFilter";
 import { RankingSummary } from "./RankingSummary";
 import { RankingTable } from "./RankingTable";
+import { RiskHeatMap } from "./RiskHeatMap";
 
 const RANKING_PAGE_LIMIT = 50;
 // Generous enough to list every Procesado lote a single operator deals with day to day without
@@ -73,7 +74,14 @@ export function RankingPage() {
 
   return (
     <section className="flex flex-col gap-4">
-      <h1 className="text-xl font-semibold text-slate-900">Ranking de Riesgo</h1>
+      <header className="flex flex-col gap-1">
+        <h1 className="text-xl font-semibold text-slate-900">Ranking de Riesgo</h1>
+        <p className="max-w-3xl text-sm text-slate-500">
+          Suministros ordenados por su Índice de Riesgo Energético (IRE), un puntaje de 0 a 100 que
+          prioriza qué medidores inspeccionar primero. Cuanto más alto el IRE, mayor la probabilidad
+          de un consumo anómalo.
+        </p>
+      </header>
       <div className="flex flex-wrap items-end gap-4">
         <LoteSelector lotes={lotes} selected={selectedCodigoLote} onChange={handleSelectLote} />
         <NivelFilter selected={nivel} onChange={handleNivelChange} />
@@ -89,7 +97,15 @@ export function RankingPage() {
           {rankingQuery.data.items.length === 0 ? (
             <EmptyState message="No se encontraron resultados." />
           ) : (
-            <RankingTable items={rankingQuery.data.items} onSelect={setSelectedItem} />
+            <>
+              <div className="flex flex-col gap-2">
+                <h2 className="text-sm font-semibold text-slate-700">
+                  Ubicación de los medidores (mapa de calor por riesgo)
+                </h2>
+                <RiskHeatMap items={rankingQuery.data.items} />
+              </div>
+              <RankingTable items={rankingQuery.data.items} onSelect={setSelectedItem} />
+            </>
           )}
           <Pagination
             total={rankingQuery.data.total}

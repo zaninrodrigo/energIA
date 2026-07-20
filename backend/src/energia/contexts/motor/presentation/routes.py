@@ -422,6 +422,9 @@ async def obtener_resultados_lote(
             ResultadoRankingItemSchema(
                 suministro_id=str(fila.suministro_id),
                 numero_suministro=fila.numero_suministro,
+                rutafolio=fila.rutafolio,
+                latitud=fila.latitud,
+                longitud=fila.longitud,
                 ire_valor=fila.ire_valor,
                 ire_nivel=fila.ire_nivel,
                 clasificacion=fila.clasificacion,

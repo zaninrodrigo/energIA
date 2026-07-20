@@ -44,6 +44,11 @@ export interface Observacion {
 export interface ResultadoRankingItem {
   suministro_id: string;
   numero_suministro: string;
+  /** 11-digit meter identifier ("el DNI del medidor"); null for legacy meters not yet relevados. */
+  rutafolio: string | null;
+  /** Geo-reference of the supply point, for plotting on the map. Null when not relevado. */
+  latitud: number | null;
+  longitud: number | null;
   ire_valor: number;
   ire_nivel: NivelIre;
   clasificacion: Clasificacion;

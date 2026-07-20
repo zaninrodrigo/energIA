@@ -244,6 +244,9 @@ class ObservacionSchema(BaseModel):
 class ResultadoRankingItemSchema(BaseModel):
     suministro_id: str
     numero_suministro: str
+    rutafolio: str | None
+    latitud: float | None
+    longitud: float | None
     ire_valor: int
     ire_nivel: str
     clasificacion: str

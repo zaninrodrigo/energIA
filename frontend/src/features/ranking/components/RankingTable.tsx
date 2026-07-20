@@ -16,6 +16,11 @@ const columns: TableColumn<ResultadoRankingItem>[] = [
     header: "Número de suministro",
     render: (row) => row.numero_suministro,
   },
+  {
+    key: "rutafolio",
+    header: "Rutafolio",
+    render: (row) => <span className="tabular-nums">{row.rutafolio ?? "—"}</span>,
+  },
   { key: "localidad", header: "Localidad", render: (row) => row.localidad ?? "—" },
   {
     key: "categoria_tarifaria",

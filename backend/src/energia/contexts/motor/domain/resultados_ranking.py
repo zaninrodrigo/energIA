@@ -57,6 +57,12 @@ class ResultadoRankingRow:
 
     suministro_id: UUID
     numero_suministro: str
+    # rutafolio: 11-digit meter identifier ("el DNI del medidor", docker/postgres/init/
+    # 01_schema.sql); latitud/longitud: geo-reference for plotting anomalies on a map. All
+    # nullable: legacy/historical meters may not carry them yet.
+    rutafolio: str | None
+    latitud: float | None
+    longitud: float | None
     ire_valor: int
     ire_nivel: str
     clasificacion: str

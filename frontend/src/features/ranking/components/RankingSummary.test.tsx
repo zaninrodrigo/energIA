@@ -43,11 +43,12 @@ describe("RankingSummary", () => {
     expect(screen.getByText("9")).toBeInTheDocument();
   });
 
-  it("renders the suma_iee_kwh KPI formatted with 2 decimals and a kWh suffix", () => {
+  it("renders the suma_iee_kwh KPI in kWh with a plain-language label spelling out IEE", () => {
     render(<RankingSummary resumen={resumen} />);
 
-    expect(screen.getByText("IEE total")).toBeInTheDocument();
-    expect(screen.getByText("16181.36 kWh")).toBeInTheDocument();
+    expect(screen.getByText("Energía no facturada")).toBeInTheDocument();
+    expect(screen.getByText("16181 kWh")).toBeInTheDocument();
+    expect(screen.getByText("Impacto Económico Estimado (IEE)")).toBeInTheDocument();
   });
 
   it("renders zero counts as literal 0, not a falsy dash/blank", () => {

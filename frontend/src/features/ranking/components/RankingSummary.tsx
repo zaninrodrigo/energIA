@@ -25,7 +25,11 @@ export function RankingSummary({ resumen }: RankingSummaryProps) {
         />
       ))}
       <StatCard label="Con anomalías" value={resumen.con_anomalias} />
-      <StatCard label="IEE total" value={`${resumen.suma_iee_kwh.toFixed(2)} kWh`} />
+      <StatCard
+        label="Energía no facturada"
+        value={`${resumen.suma_iee_kwh.toFixed(0)} kWh`}
+        hint="Impacto Económico Estimado (IEE)"
+      />
     </div>
   );
 }
