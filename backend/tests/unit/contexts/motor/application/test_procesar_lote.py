@@ -2,6 +2,7 @@
 plain in-memory fakes of `LoteProcesamientoPort`/`ValidacionDataSource` -- no database."""
 
 import functools
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date
@@ -21,6 +22,7 @@ from energia.contexts.motor.application.procesar_lote import (
 )
 from energia.contexts.motor.domain.isolation_forest import (
     ALGORITMO_ISOLATION_FOREST,
+    CLASIFICACION_CRITICO,
     SCOPE_GLOBAL,
     agrupar_para_entrenamiento,
     bandear_clasificacion,
@@ -37,6 +39,7 @@ from energia.contexts.motor.domain.ports import (
     PeriodoHistorialRow,
     PrediccionParaGuardar,
     PriorAnomalyCountRow,
+    ResultadoIAParaGuardar,
     SuministroMetadataRow,
 )
 
@@ -189,6 +192,23 @@ class FakePrediccionesRepository:
         self.llamadas.append((lote_id, list(filas)))
 
 
+@dataclass
+class FakeResultadosIaRepository:
+    """In-memory fake of `ResultadosIaRepository` (Etapas 7-8, AI_ENGINE_SPEC.md §10/§11/§14) --
+    records every `persistir` call (never touches a database); returns a fresh `UUID` per
+    suministro (this file tests WIRING, not the real upsert/backfill/soft-delete-replace
+    semantics -- those are `tests/integration/contexts/motor/
+    test_resultados_ia_repository_integration.py`'s job, against the real DB)."""
+
+    llamadas: list[tuple[UUID, list[ResultadoIAParaGuardar]]] = field(default_factory=list)
+
+    async def persistir(
+        self, lote_id: UUID, entradas: Sequence[ResultadoIAParaGuardar]
+    ) -> dict[UUID, UUID]:
+        self.llamadas.append((lote_id, list(entradas)))
+        return {entrada.suministro_id: uuid4() for entrada in entradas}
+
+
 def _construir_use_case(
     *,
     lote_port: FakeLoteProcesamientoPort,
@@ -199,11 +219,12 @@ def _construir_use_case(
     isolation_forest_scorer: FakeIsolationForestScorer | None = None,
     modelos_ia_repository: FakeModelosIaRepository | None = None,
     predicciones_repository: FakePrediccionesRepository | None = None,
+    resultados_ia_repository: FakeResultadosIaRepository | None = None,
 ) -> ProcesarLote:
-    """Builds a `ProcesarLote` with sensible Etapa-6 fakes by default, so every Etapa 1-5 test
-    written before Etapa 6 existed keeps working unchanged (only this ONE factory function needed
-    updating when Etapa 6's 3 new constructor dependencies landed, not all 19 call sites) --
-    Etapa-6-focused tests pass their OWN fakes explicitly to inspect what was recorded."""
+    """Builds a `ProcesarLote` with sensible Etapa-6/Etapa-7-8 fakes by default, so every earlier
+    test keeps working unchanged (only this ONE factory function needs updating when a new stage's
+    constructor dependency lands, not every call site) -- stage-focused tests pass their OWN fakes
+    explicitly to inspect what was recorded."""
     return ProcesarLote(
         lote_port=lote_port,
         validacion_source=validacion_source,
@@ -213,6 +234,7 @@ def _construir_use_case(
         isolation_forest_scorer=isolation_forest_scorer or FakeIsolationForestScorer(),
         modelos_ia_repository=modelos_ia_repository or FakeModelosIaRepository(),
         predicciones_repository=predicciones_repository or FakePrediccionesRepository(),
+        resultados_ia_repository=resultados_ia_repository or FakeResultadosIaRepository(),
     )
 
 
@@ -1385,3 +1407,333 @@ async def test_ml_multi_group_wiring_scores_every_suministro_once_with_correct_f
     assert max(por_suministro[sid].score for sid in chica_ids) < min(
         por_suministro[sid].score for sid in industrial_ids
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Etapas 7-8 -- Composición del IRE + Impacto Económico Estimado (AI_ENGINE_SPEC.md §10/§11/§14).
+# THE convergence. These are WIRING tests, same discipline as Etapas 3-6's own sections above: the
+# IRE/IEE MATH itself is unit-tested exhaustively in `tests/unit/contexts/motor/domain/test_ire.py`
+# against hand-computed values -- what matters here is that `ProcesarLote` (a) composes an IRE/IEE
+# for exactly the population Etapa 6 scored, reusing `vectores`/`reglas`/`predicciones` (never
+# recomputing), (b) calls `ResultadosIaRepository.persistir` once for the whole lote with the
+# correct per-suministro payload (score_anomalia/probabilidad/prediccion_id/observaciones/
+# anomalias), (c) applies the ML-only anomaly dedup policy correctly, and (d) never lets Etapas 7-8
+# influence `estado_final`.
+# ---------------------------------------------------------------------------------------------
+
+
+async def test_ire_iee_populates_resultado_and_persists_for_every_scored_suministro() -> None:
+    lote_id = uuid4()
+    suministro_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-IRE-1", estado=EstadoLote.PENDIENTE, cantidad_registros=1
+        ),
+        consumos_activos=1,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_id, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000")
+            ]
+        },
+        metadata_por_lote={lote_id: [_metadata(suministro_id, numero_suministro="SUM-IRE-1")]},
+    )
+    resultados_ia_repository = FakeResultadosIaRepository()
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        resultados_ia_repository=resultados_ia_repository,
+    )
+
+    resultado = await use_case.execute("LOTE-IRE-1")
+
+    assert resultado.ire.lote_id == lote_id
+    assert resultado.ire.suministros_evaluados == 1
+    assert resultado.iee.lote_id == lote_id
+    assert len(resultado.ire.top_10) == 1
+    entrada_informe = resultado.ire.top_10[0]
+    assert entrada_informe.suministro_id == suministro_id
+    assert entrada_informe.numero_suministro == "SUM-IRE-1"
+    assert 0 <= entrada_informe.ire <= 100
+    assert entrada_informe.clasificacion in {"Normal", "Atención", "Alto Riesgo", "Crítico"}
+
+    assert len(resultados_ia_repository.llamadas) == 1
+    lote_llamado, entradas = resultados_ia_repository.llamadas[0]
+    assert lote_llamado == lote_id
+    assert len(entradas) == 1
+    entrada = entradas[0]
+    assert entrada.suministro_id == suministro_id
+    assert entrada.lote_id == lote_id
+    assert 0.0 <= entrada.probabilidad <= 1.0
+    assert entrada.clasificacion == entrada_informe.clasificacion
+    assert entrada.ire_valor == entrada_informe.ire
+    # Single-period (cold-start) suministro -- no IEE (`domain/ire.py`'s `calcular_iee_kwh`), so
+    # the persisted `impacto_economico` factor must be absent (DEC-016: nonzero contributions
+    # only) even though it is always COMPUTED (never null-guarded like historial/variación).
+    assert entrada.iee_kwh is None
+    observaciones = json.loads(entrada.observaciones)
+    assert isinstance(observaciones, list)
+    factores_persistidos = {item["factor"] for item in observaciones}
+    # Single period, zero prior anomalies -- `historial_consumos` (F9 null), `variacion_
+    # porcentual` (F5/F6 both null, no previous period), `impacto_economico` (cold-start, no
+    # IEE) and `persistencia_anomalias` (F15=0, F10=0 -- genuinely zero, not null, but DEC-016
+    # only keeps NONZERO contributions either way) all contribute exactly `0` and are excluded.
+    assert "historial_consumos" not in factores_persistidos
+    assert "variacion_porcentual" not in factores_persistidos
+    assert "impacto_economico" not in factores_persistidos
+    assert "persistencia_anomalias" not in factores_persistidos
+    assert "inspecciones_anteriores" not in factores_persistidos  # v1: always-zero, never emitted
+    # `score_ia` (degenerate single-score ML normalization, `domain/isolation_forest.py`, ->
+    # 50.0) / `consumo_promedio` (degenerate single-vector normalization, `domain/ire.py`, ->
+    # 50.0) / `categoria_tarifaria` (fixed criticidad lookup, always nonzero) DO resolve to a
+    # nonzero value for this exact single-suministro scenario.
+    assert factores_persistidos == {"score_ia", "consumo_promedio", "categoria_tarifaria"}
+    for item in observaciones:
+        assert set(item) == {"factor", "contribution", "reason"}
+        assert isinstance(item["contribution"], int | float)
+        assert item["contribution"] > 0
+        assert isinstance(item["reason"], str) and item["reason"]
+
+
+async def test_ire_never_influences_estado_final() -> None:
+    """Mission directive #8: Etapas 7-8 NEVER affect estado/95% verdict -- a lote landing in
+    Error via Etapa 1's own threshold still gets a fully composed `ire`/`iee`."""
+    lote_id = uuid4()
+    suministro_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-IRE-2", estado=EstadoLote.PENDIENTE, cantidad_registros=2
+        ),
+        consumos_activos=2,
+    )
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_id, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000")
+            ]
+        },
+        metadata_por_lote={lote_id: [_metadata(suministro_id)]},
+    )
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        # Only ONE of the two declared consumos is valid -- Etapa 1's threshold (< 95%) lands
+        # this lote in Error, exactly like the existing Etapa 1/6 threshold tests above.
+        validacion_source=FakeValidacionDataSource(
+            {lote_id: [_fila_valida(suministro_id), _fila_excluida()]}
+        ),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+    )
+
+    resultado = await use_case.execute("LOTE-IRE-2")
+
+    assert resultado.estado_final is EstadoLote.ERROR
+    assert resultado.ire.suministros_evaluados == 1  # composed anyway, per mission directive #8
+
+
+async def test_ire_empty_vectores_still_calls_persistir_with_empty_list() -> None:
+    """Mirrors Etapa 6's own `test_ml_empty_vectores_still_clears_stale_predicciones_and_registers_
+    no_model` contract: an Error-retry that ends up analyzing NOTHING still calls `persistir` (with
+    an empty list) so `SqlResultadosIaRepository` clears stale `anomalias`/`impacto_economico` rows
+    from a previous attempt."""
+    lote_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-IRE-3", estado=EstadoLote.PENDIENTE, cantidad_registros=1
+        ),
+        consumos_activos=1,
+    )
+    resultados_ia_repository = FakeResultadosIaRepository()
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource({lote_id: [_fila_excluida()]}),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=FakeFeaturesDataSource(),
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        resultados_ia_repository=resultados_ia_repository,
+    )
+
+    resultado = await use_case.execute("LOTE-IRE-3")
+
+    assert resultado.ire.suministros_evaluados == 0
+    assert resultado.iee.suministros_con_iee == 0
+    assert resultados_ia_repository.llamadas == [(lote_id, [])]
+
+
+async def test_ml_only_anomaly_generated_when_critico_and_no_rule_fired() -> None:
+    """§8/§10.3's v1 ML-only anomaly policy: a suministro whose ML score alone lands `"Crítico"`
+    AND breaches no R1-R6 rule gets exactly one 'Patrón Irregular' anomaly persisted."""
+    lote_id = uuid4()
+    suministro_normal = uuid4()
+    suministro_critico = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-IRE-4", estado=EstadoLote.PENDIENTE, cantidad_registros=2
+        ),
+        consumos_activos=2,
+    )
+    # Single period each (cold-start) -- no R1-R6 rule can fire (every rule needs history), so any
+    # anomalia persisted here is unambiguously the ML-only 'Patrón Irregular' policy at work.
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(
+                    suministro_normal, lote_id, fecha_inicio=date(2024, 1, 1), kwh="100.000"
+                ),
+                _historial(
+                    suministro_critico, lote_id, fecha_inicio=date(2024, 1, 1), kwh="900.000"
+                ),
+            ]
+        },
+        metadata_por_lote={
+            lote_id: [
+                _metadata(suministro_normal, numero_suministro="SUM-NORMAL"),
+                _metadata(suministro_critico, numero_suministro="SUM-CRITICO"),
+            ]
+        },
+    )
+    resultados_ia_repository = FakeResultadosIaRepository()
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource(
+            {lote_id: [_fila_valida(suministro_normal), _fila_valida(suministro_critico)]}
+        ),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        resultados_ia_repository=resultados_ia_repository,
+    )
+
+    await use_case.execute("LOTE-IRE-4")
+
+    _, entradas = resultados_ia_repository.llamadas[0]
+    por_suministro = {entrada.suministro_id: entrada for entrada in entradas}
+    assert por_suministro[suministro_normal].anomalias == ()
+    anomalias_critico = por_suministro[suministro_critico].anomalias
+    assert len(anomalias_critico) == 1
+    assert anomalias_critico[0].tipo == "Patrón Irregular"
+    assert anomalias_critico[0].severidad == "Crítica"
+    assert "aproximación" in (anomalias_critico[0].descripcion or "")
+
+
+async def test_ml_only_anomaly_not_generated_when_a_rule_already_fired() -> None:
+    """Dedup policy: rule hits are canonical -- a suministro whose R1 already fired must NOT ALSO
+    get a 'Patrón Irregular' ML-only anomaly, even if its ML score independently lands Crítico."""
+    lote_id = uuid4()
+    suministro_id = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-IRE-5", estado=EstadoLote.PENDIENTE, cantidad_registros=1
+        ),
+        consumos_activos=1,
+    )
+    # Three consecutive zero-kwh periods -- fires R1 (racha = 3, `test_reglas_fires_r1_end_to_
+    # end_reusing_the_built_vector`'s own fixture shape). A single suministro's `FakeIsolationForest
+    # Scorer` degenerate case (`normalizar_scores_min_max_invertido`'s all-equal-scores branch,
+    # `domain/isolation_forest.py`) yields `ml_score_0_100 = 50.0`, banded "Alto Riesgo" -- NOT
+    # "Crítico" -- so this scenario alone would not trigger the ML-only policy either way; the
+    # assertion below locks in that R1's OWN anomaly is the only one persisted, regardless.
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(suministro_id, uuid4(), fecha_inicio=date(2024, 1, 1), kwh="0.000"),
+                _historial(suministro_id, uuid4(), fecha_inicio=date(2024, 2, 1), kwh="0.000"),
+                _historial(suministro_id, lote_id, fecha_inicio=date(2024, 3, 1), kwh="0.000"),
+            ]
+        },
+        metadata_por_lote={
+            lote_id: [_metadata(suministro_id, numero_suministro="SUM-R1", estado="Activo")]
+        },
+    )
+    resultados_ia_repository = FakeResultadosIaRepository()
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource({lote_id: [_fila_valida(suministro_id)]}),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        resultados_ia_repository=resultados_ia_repository,
+    )
+
+    await use_case.execute("LOTE-IRE-5")
+
+    _, entradas = resultados_ia_repository.llamadas[0]
+    anomalias = entradas[0].anomalias
+    assert [a.tipo for a in anomalias] == ["Persistencia Anómala"]  # R1 only, no ML duplicate
+
+
+async def test_ml_critico_and_rule_hit_on_the_same_suministro_gets_no_ml_only_duplicate() -> None:
+    """WARNING 5 (reviewer finding): `test_ml_only_anomaly_not_generated_when_a_rule_already_
+    fired` above proves the dedup policy with a SINGLE-suministro lote, where `FakeIsolationForest
+    Scorer`'s degenerate all-equal-scores case (`domain/isolation_forest.py`) always yields
+    `ml_score_0_100 = 50.0` ("Alto Riesgo", never "Crítico") -- so that test never actually
+    exercised a suministro that is BOTH rule-hit AND INDEPENDENTLY ML-Crítico at the same time.
+    This test closes that gap: a multi-suministro lote (a REAL min-max spread, not the degenerate
+    50) where one suministro fires R3 (`Incremento Brusco`, an 800% jump, well over the 200%
+    threshold) AND independently lands `Crítico` on the ML branch alone (asserted directly off
+    the persisted `predicciones` row, not assumed) -- the wiring-level dedup policy
+    (`_componer_ire_e_iee`'s docstring) must still persist EXACTLY the rule's own anomalia, no
+    ADDITIONAL 'Patrón Irregular' ML-only row."""
+    lote_id = uuid4()
+    suministro_estable = uuid4()
+    suministro_pico = uuid4()
+    lote_port = FakeLoteProcesamientoPort(
+        lote=EstadoLoteActual(
+            id=lote_id, codigo_lote="LOTE-IRE-6", estado=EstadoLote.PENDIENTE, cantidad_registros=2
+        ),
+        consumos_activos=2,
+    )
+    # `suministro_pico`: 100 kWh baseline (prior lote) -> 900 kWh this lote -- fires R3 AND, given
+    # `FakeIsolationForestScorer`'s `-sum(fila)` fake (dominated here by the consumption-magnitude
+    # features), lands at the extreme of this lote's min-max spread against the stable peer --
+    # independently `Crítico` on the ML branch alone, asserted below off the real `predicciones`
+    # row.
+    features_source = FakeFeaturesDataSource(
+        historial_por_lote={
+            lote_id: [
+                _historial(
+                    suministro_estable, lote_id, fecha_inicio=date(2024, 3, 1), kwh="100.000"
+                ),
+                _historial(suministro_pico, uuid4(), fecha_inicio=date(2024, 2, 1), kwh="100.000"),
+                _historial(suministro_pico, lote_id, fecha_inicio=date(2024, 3, 1), kwh="900.000"),
+            ]
+        },
+        metadata_por_lote={
+            lote_id: [
+                _metadata(suministro_estable, numero_suministro="SUM-ESTABLE"),
+                _metadata(suministro_pico, numero_suministro="SUM-PICO"),
+            ]
+        },
+    )
+    resultados_ia_repository = FakeResultadosIaRepository()
+    predicciones_repository = FakePrediccionesRepository()
+    use_case = _construir_use_case(
+        lote_port=lote_port,
+        validacion_source=FakeValidacionDataSource(
+            {lote_id: [_fila_valida(suministro_estable), _fila_valida(suministro_pico)]}
+        ),
+        duplicidades_source=FakeDuplicidadesDataSource(),
+        features_source=features_source,
+        feature_vector_repository=FakeFeatureVectorRepository(),
+        resultados_ia_repository=resultados_ia_repository,
+        predicciones_repository=predicciones_repository,
+    )
+
+    await use_case.execute("LOTE-IRE-6")
+
+    # Independently ML-Crítico -- proven off the ACTUAL persisted prediction, never assumed.
+    _, predicciones = predicciones_repository.llamadas[0]
+    prediccion_pico = next(p for p in predicciones if p.suministro_id == suministro_pico)
+    assert prediccion_pico.clasificacion == CLASIFICACION_CRITICO
+    assert prediccion_pico.score * 100 >= 71
+
+    _, entradas = resultados_ia_repository.llamadas[0]
+    anomalias_pico = next(e for e in entradas if e.suministro_id == suministro_pico).anomalias
+    tipos = [a.tipo for a in anomalias_pico]
+    assert "Incremento Brusco" in tipos
+    assert "Patrón Irregular" not in tipos  # the dedup policy: rule hit wins, no ML duplicate

@@ -41,6 +41,9 @@ __all__ = [
     "ModelosIaRepository",
     "PrediccionParaGuardar",
     "PrediccionesRepository",
+    "AnomaliaParaGuardar",
+    "ResultadoIAParaGuardar",
+    "ResultadosIaRepository",
 ]
 
 
@@ -382,8 +385,18 @@ class PrediccionParaGuardar:
     """The minimal shape `PrediccionesRepository.reemplazar_lote` persists -- deliberately NOT
     `domain.isolation_forest.PrediccionSuministro` itself (which also carries `numero_suministro`/
     `scope`, transient reporting-only fields not stored on `predicciones`), mirroring
-    `FeatureVectorParaGuardar`'s own reasoning above."""
+    `FeatureVectorParaGuardar`'s own reasoning above.
 
+    `id` (added for Etapa 7, AI_ENGINE_SPEC.md §14) is CLIENT-generated (`uuid4()`, `domain.
+    isolation_forest.PrediccionSuministro`'s own construction site) rather than left to the
+    column's `gen_random_uuid()` default: Etapa 7's `resultados_ia.prediccion_id` FK needs to
+    know exactly which `predicciones` row belongs to which suministro, in the SAME `ProcesarLote.
+    execute()` run, WITHOUT a second round trip to read it back -- a multi-row `INSERT ...
+    VALUES (...), (...) ... RETURNING id` cannot be safely correlated back to its own input rows
+    by position when issued as a driver-level executemany (no ORDER BY guarantee across drivers),
+    so this repository writes the id it was given instead of asking Postgres to generate one."""
+
+    id: UUID
     modelo_ia_id: UUID
     suministro_id: UUID
     lote_id: UUID
@@ -408,4 +421,63 @@ class PrediccionesRepository(Protocol):
         rows from a previous attempt, and the previous attempt's rows stay FK-safe for anything
         that already references them. Does not commit: same session/transaction discipline as
         every other port in this module."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+
+@dataclass(frozen=True, slots=True)
+class AnomaliaParaGuardar:
+    """One `anomalias` row to persist for a suministro's `ResultadoIA` (Etapa 7, §14) --
+    `tipo`/`severidad` are the EXACT literals `ck_anomalias_tipo`/`ck_anomalias_severidad`
+    (`docker/postgres/init/01_schema.sql`) list, already validated by `domain/reglas.py`'s
+    `ReglaHit`/`domain/ire.py`'s ML-only anomaly policy (`debe_generar_anomalia_ml`) before this
+    dataclass is ever constructed -- this port performs no validation of its own."""
+
+    tipo: str
+    severidad: str
+    descripcion: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResultadoIAParaGuardar:
+    """One suministro's COMPLETE Etapa 7-8 write (the "convergence", AI_ENGINE_SPEC.md §14) --
+    everything `ResultadosIaRepository.persistir` needs to upsert `resultados_ia`, backfill
+    `feature_vectors.resultado_ia_id`, replace `anomalias`, upsert `ire` and upsert/soft-replace
+    `impacto_economico`, all for ONE suministro, in the SAME transaction as every other write.
+
+    `observaciones` is DEC-016's serialized JSON breakdown (`domain/ire.py`'s
+    `FactorContribucion` list, `json.dumps` by the caller -- this port stores the string verbatim,
+    it does not know the JSON's shape). `ire_valor` is the ALREADY-ROUNDED integer (`domain/
+    ire.py`'s `redondear_half_up`). `iee_kwh` is `None` for a cold-start suministro (no IEE
+    computed, `domain/ire.py`'s `calcular_iee_kwh`) -- `None` means "write no `impacto_economico`
+    row for this suministro" (and soft-delete/clear any stale one from a previous attempt), never
+    a fabricated `0.0`."""
+
+    suministro_id: UUID
+    lote_id: UUID
+    modelo_ia_id: UUID
+    prediccion_id: UUID
+    score_anomalia: float
+    probabilidad: float
+    clasificacion: str
+    observaciones: str
+    ire_valor: int
+    iee_kwh: float | None
+    anomalias: tuple[AnomaliaParaGuardar, ...]
+
+
+class ResultadosIaRepository(Protocol):
+    """Same-context port: THE Etapa 7-8 convergence write (AI_ENGINE_SPEC.md §14) -- `resultados_
+    ia`, `feature_vectors.resultado_ia_id` (backfill), `anomalias`, `ire`, `impacto_economico`, all
+    for one lote's analyzed suministros, in ONE call. See `infrastructure/
+    resultados_ia_repository.py`'s docstring for the exact per-table write strategy (upsert vs.
+    soft-delete-then-insert) and the §14 write order this implementation follows."""
+
+    async def persistir(
+        self, lote_id: UUID, entradas: Sequence[ResultadoIAParaGuardar]
+    ) -> dict[UUID, UUID]:
+        """Persist `entradas` (one per analyzed suministro this lote) and return the `suministro_
+        id -> resultados_ia.id` mapping this run produced/refreshed (idempotent Error-retry
+        reprocess, mission directive #6: an upsert by `(suministro_id, lote_id)` reuses the SAME
+        `resultados_ia.id` across a retry, never duplicating it). Does not commit: same session/
+        transaction discipline as every other port in this module."""
         ...  # pragma: no cover — Protocol stub, never executed directly

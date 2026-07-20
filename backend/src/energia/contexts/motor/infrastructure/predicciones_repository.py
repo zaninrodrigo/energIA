@@ -12,6 +12,12 @@ of `ProcesarLote` -- a crash between the two statements rolls back the whole thi
 cleared state persists), the same atomicity guarantee every other write in this bounded context
 relies on (AI_ENGINE_SPEC.md §2.5).
 
+**`id` is CLIENT-generated (Etapa 7 addition, `domain/ports.py`'s `PrediccionParaGuardar`
+docstring).** The `INSERT` now supplies an explicit `id` instead of relying on the column's
+`gen_random_uuid()` default -- Etapa 7 needs to know exactly which `predicciones` row belongs to
+which suministro, in the SAME `ProcesarLote.execute()` run, to fill `resultados_ia.prediccion_id`,
+without a second round trip or an unsafe assumption about multi-row `RETURNING` order.
+
 **FIX (reviewer finding, CRITICAL, 2026-07-15) -- soft delete, not a physical `DELETE`.** This
 repository originally issued `DELETE FROM predicciones WHERE lote_id = :lote_id`, the ONLY
 physical `DELETE` anywhere in `src/` -- violating `DATABASE_DESIGN.md` §10 ("ningún `DELETE`
@@ -48,8 +54,8 @@ _SOFT_DELETE_SQL = text(
 
 _INSERT_SQL = text(
     """
-    INSERT INTO predicciones (modelo_ia_id, suministro_id, lote_id, score, clasificacion)
-    VALUES (:modelo_ia_id, :suministro_id, :lote_id, :score, :clasificacion)
+    INSERT INTO predicciones (id, modelo_ia_id, suministro_id, lote_id, score, clasificacion)
+    VALUES (:id, :modelo_ia_id, :suministro_id, :lote_id, :score, :clasificacion)
     """
 )
 
@@ -72,6 +78,7 @@ class SqlPrediccionesRepository:
             return
         parametros = [
             {
+                "id": fila.id,
                 "modelo_ia_id": fila.modelo_ia_id,
                 "suministro_id": fila.suministro_id,
                 "lote_id": fila.lote_id,

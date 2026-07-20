@@ -348,6 +348,7 @@ def test_construir_version_modelo_differs_for_different_lotes() -> None:
 
 def _prediccion(score_0_100: float, *, numero: str | None = None) -> PrediccionSuministro:
     return PrediccionSuministro(
+        id=uuid4(),
         suministro_id=uuid4(),
         numero_suministro=numero or f"SUM-{score_0_100}",
         modelo_ia_id=uuid4(),

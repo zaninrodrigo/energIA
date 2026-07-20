@@ -137,6 +137,40 @@ async def test_happy_path_transitions_pendiente_lote_to_procesado(
     )
     assert predicciones_verificacion.scalar_one() == 3
 
+    # Etapas 7-8 (AI_ENGINE_SPEC.md §10/§11/§14, THE convergence): one `resultados_ia`/`ire` row
+    # per analyzed suministro, `feature_vectors.resultado_ia_id` backfilled, `ire`/`iee` response
+    # sections populated.
+    assert body["ire"]["suministros_evaluados"] == 3
+    assert len(body["ire"]["top_10"]) == 3
+    for entrada in body["ire"]["top_10"]:
+        assert 0 <= entrada["ire"] <= 100
+        assert entrada["nivel"] in {"Muy Bajo", "Bajo", "Medio", "Alto", "Crítico"}
+        assert entrada["clasificacion"] in {"Normal", "Atención", "Alto Riesgo", "Crítico"}
+    assert sum(body["ire"]["conteo_por_nivel"].values()) == 3
+    assert body["iee"]["lote_id"] == str(lote_id)
+    assert body["iee"]["suministros_con_iee"] == 0  # 3 cold-start (single period) suministros
+
+    resultados_ia_verificacion = await db_session.execute(
+        text("SELECT count(*) FROM resultados_ia WHERE lote_id = :lote_id"), {"lote_id": lote_id}
+    )
+    assert resultados_ia_verificacion.scalar_one() == 3
+    ire_verificacion = await db_session.execute(
+        text(
+            "SELECT count(*) FROM ire i JOIN resultados_ia r ON i.resultado_ia_id = r.id "
+            "WHERE r.lote_id = :lote_id"
+        ),
+        {"lote_id": lote_id},
+    )
+    assert ire_verificacion.scalar_one() == 3
+    feature_vectors_backfill = await db_session.execute(
+        text(
+            "SELECT count(*) FROM feature_vectors "
+            "WHERE lote_id = :lote_id AND resultado_ia_id IS NOT NULL"
+        ),
+        {"lote_id": lote_id},
+    )
+    assert feature_vectors_backfill.scalar_one() == 3
+
 
 async def test_reprocessing_an_already_procesado_lote_is_conflict(
     motor_client: AsyncClient, db_session: AsyncSession

@@ -67,6 +67,7 @@ async def test_reemplazar_lote_inserts_rows(db_session: AsyncSession) -> None:
         lote_id,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_id,
                 lote_id=lote_id,
@@ -108,6 +109,7 @@ async def test_reemplazar_lote_retry_soft_deletes_previous_rows_first(
         lote_id,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_a,
                 lote_id=lote_id,
@@ -115,6 +117,7 @@ async def test_reemplazar_lote_retry_soft_deletes_previous_rows_first(
                 clasificacion="Normal",
             ),
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_b,
                 lote_id=lote_id,
@@ -132,6 +135,7 @@ async def test_reemplazar_lote_retry_soft_deletes_previous_rows_first(
         lote_id,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_a,
                 lote_id=lote_id,
@@ -173,6 +177,7 @@ async def test_reemplazar_lote_does_not_touch_other_lotes(db_session: AsyncSessi
         lote_a,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_a,
                 lote_id=lote_a,
@@ -185,6 +190,7 @@ async def test_reemplazar_lote_does_not_touch_other_lotes(db_session: AsyncSessi
         lote_b,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_b,
                 lote_id=lote_b,
@@ -200,6 +206,7 @@ async def test_reemplazar_lote_does_not_touch_other_lotes(db_session: AsyncSessi
         lote_a,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_a,
                 lote_id=lote_a,
@@ -232,6 +239,7 @@ async def test_reemplazar_lote_empty_filas_still_clears_previous_rows(
         lote_id,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_id,
                 lote_id=lote_id,
@@ -270,6 +278,7 @@ async def test_reemplazar_lote_retry_with_a_referencing_resultados_ia_row_does_n
         lote_id,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_id,
                 lote_id=lote_id,
@@ -313,6 +322,7 @@ async def test_reemplazar_lote_retry_with_a_referencing_resultados_ia_row_does_n
         lote_id,
         [
             PrediccionParaGuardar(
+                id=uuid4(),
                 modelo_ia_id=modelo_id,
                 suministro_id=suministro_id,
                 lote_id=lote_id,

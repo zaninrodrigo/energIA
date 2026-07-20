@@ -235,6 +235,14 @@ nunca al revés.
 Las etapas 4, 5 y 6 son las **tres ramas** del híbrido (ADR-005; TO-BE de BUSINESS_ANALYSIS §5).
 Convergen en la etapa 7.
 
+> **Nota de implementación (orden de cómputo, 2026-07-20).** El diagrama numera las TABLAS/etapas
+> 7 (`ire`) antes que 8 (`impacto_economico`), pero el IEE es uno de los 8 factores que compone el
+> IRE (peso 0.10, §10.1) — el CÓMPUTO en memoria corre 8 → 7 (`domain/ire.py`'s módulo docstring),
+> no 7 → 8: primero `calcular_iee_kwh`/`normalizar_iee_lote` (Etapa 8), después `componer_ire`
+> (Etapa 7) consume ese resultado ya normalizado. La numeración de las TABLAS/el mapeo etapa→tabla
+> (§14) no cambia; la persistencia sigue siendo atómica al final de todos modos (misma
+> transacción), independientemente del orden de cómputo interno.
+
 ---
 
 ## 4. Etapa 1 — Validación de integridad (US-006)
@@ -545,6 +553,32 @@ Irregular` queda como tipo reservado para la rama ML (§9), no para reglas.
 > en el mismo escritura atómica de `ResultadoIA` que agrega `modelo_ia_id`/`clasificacion` reales:
 > ver §14 (mapeo etapa → tabla), donde `anomalias` ya aparece asociada a "[5]/[7]" precisamente por
 > esta convergencia. No se fabrican filas de `modelos_ia` ni una `clasificacion` inventada.
+
+> **Política v1 de anomalía solo-ML (implementación, 2026-07-20) — `'Patrón Irregular'`, §10.3.**
+> Con la convergencia ya implementada (Etapa 7), cada disparo de regla R1-R6 se persiste como su
+> propia fila de `anomalias` (canónica, causalmente explicable, RN-012). ADEMÁS, se genera UNA
+> anomalía `'Patrón Irregular'` (el tipo que este catálogo reserva para la rama ML, nota de arriba)
+> cuando **ambas** condiciones se cumplen: (a) el veredicto preliminar de la rama ML SOLA
+> (`predicciones.clasificacion`, bandas de DEC-015 sobre `ml_score_0_100`, §9.4) es `"Crítico"`, Y
+> (b) NINGUNA regla R1-R6 disparó para ese suministro en ese lote. **Regla de deduplicación:** las
+> reglas son canónicas — un suministro cuya anomalía YA la explica una regla nunca recibe TAMBIÉN
+> la anomalía solo-ML para la misma señal (evita duplicar la misma detección con dos niveles de
+> explicabilidad distintos). `severidad = "Crítica"`; `descripcion` es honesta sobre la naturaleza
+> aproximada de la atribución de Isolation Forest (mismo texto que el factor `score_ia` del
+> desglose de explicabilidad, §10.3): `"Score de anomalía del modelo {scope}: {ml_score_0_100:.0f}
+> /100 (aproximación por atribución de features)"`. Implementado en `domain/ire.py`'s
+> `debe_generar_anomalia_ml` (umbral: reutiliza `BANDA_ALTO_RIESGO_MAX` de DEC-015, single source
+> of truth con `bandear_clasificacion`). **Hallazgo de calibración (§13.3):** sobre el dataset
+> sintético (seed 42, escala small, 24 lotes, 2.321 evaluaciones), esta política generó 199
+> anomalías solo-ML — casi 17× más que las 12 de la rama de reglas — porque la normalización
+> min-max invertida POR LOTE (DEC-013) fuerza a que, en cada lote de ~100 suministros, el/los
+> suministro(s) relativamente más atípicos del grupo aterricen cerca de 100 sin importar si la
+> anomalía es genuinamente severa en términos absolutos; con `MODELO_POR_CATEGORIA_MINIMO` (1.000)
+> nunca alcanzado en este dataset, cada lote entrena un único modelo `"global"` sobre sus ~100
+> suministros, así que "el más atípico de 100" cruza la banda Crítico (> 70) con más frecuencia de
+> la que un umbral fijo sugeriría. **Candidato explícito de recalibración** (igual que los
+> umbrales de reglas, DEC-009): el umbral de 70 fue heredado de DEC-015 sin re-derivarlo para este
+> propósito específico; PROJECT_MASTER_SPEC.md #8 (calibración pendiente contra datos reales).
 
 ### 8.1 Implementación (estado, 2026-07-15)
 
@@ -947,6 +981,15 @@ bandas. El diseño debe respetarlas exactamente:
 > `71-100 → Crítico`. La alternativa (colapsar Muy Bajo+Bajo → Normal y Medio → Atención) queda
 > descartada. Impacto: semántica del semáforo que ve el analista (US-012).
 
+**Realidad de doble etiqueta, intencional (no una contradicción).** Un `ire.valor` entre 71 y 80 es
+SIMULTÁNEAMENTE `ire.nivel = "Alto"` (columna generada, 5 bandas, tabla de arriba) Y
+`resultados_ia.clasificacion = "Crítico"` (DEC-015, 4 bandas, `71-100 → Crítico`). Son dos escalas
+DISTINTAS con distinta granularidad, no un error de mapeo: `ire.nivel` bandea en 5 franjas fijas de
+20 puntos definidas al nivel de esquema; `clasificacion` es el puente de 4 valores que el analista
+consume (US-012). Cualquier UI que muestre ambas para el mismo suministro debe presentarlas como
+COMPLEMENTARIAS (una banda más fina de 5, una clasificación operativa de 4), nunca como
+contradictorias entre sí.
+
 ### 10.3 Contrato de explicabilidad (RN-012, RF-013)
 
 RN-012 exige que toda decisión automática sea explicable; RF-013 obliga a "mostrar la explicación
@@ -974,6 +1017,63 @@ nula, más una razón legible por cada `Anomalía` (`anomalias.descripcion`).
 > `resultados_ia.observaciones` (text) con el JSON serializado en v1, y se evaluará agregar una
 > columna jsonb dedicada cuando el frontend lo consuma (US-013). Alternativa descartada:
 > reconstruir el desglose on-demand desde `feature_vectors`. Impacto: ver §16 (brecha de esquema).
+
+### 10.4 Normalización por factor (implementación v1)
+
+§10.1 exige normalizar cada factor a [0,100], pero no define CÓMO — como con los umbrales de
+reglas (DEC-009, §8) y de cohorte (DEC-008, §7), esta implementación fija constantes v1 explícitas,
+documentadas como **candidatas de calibración, no verdades** (`PROJECT_MASTER_SPEC.md` #8):
+
+| Factor (§10.1) | Fuente | Fórmula v1 (`domain/ire.py`) | Null → |
+|---|---|---|---|
+| `score_ia` | `ml_score_0_100` (§9.3, ya 0-100) | Passthrough directo, sin transformación | nunca null (Etapa 6 corre sobre toda la población) |
+| `historial_consumos` | `deviation_from_baseline` (F9, z-score) | `min(\|z\|, 5) × 20` — el tope 5 escala a 100 | factor `0`, excluido del desglose (F9 nulo en cold-start, §6.2) |
+| `persistencia_anomalias` | `prior_anomaly_count` (F15) + `zero_consumption_streak` (F10) | `min(F15×25 + F10×10, 100)` — satura rápido (4+ anomalías previas ya topea) | nunca null (F15/F10 nunca nulos) |
+| `variacion_porcentual` | `max(\|F5\|, \|F6\|)` (mayor valor absoluto entre `pct_change_prev_period`/`pct_change_yoy`) | `min(\|pct\|, 3.0) / 3.0 × 100` — tope 300% escala a 100 | factor `0`, excluido, si AMBOS (F5 y F6) son null |
+| `impacto_economico` | IEE normalizado por lote (§11, min-max sobre IEEs no-cero) | Ver `normalizar_iee_lote` más abajo | factor `0`, excluido, si IEE es `0`/`None` (cold-start) |
+| `inspecciones_anteriores` | `feedback_modelo` (v1: siempre 0, sin datos) | Constante `0` — peso redistribuido (§10.1's nota) | siempre excluido del desglose (contribución `0×peso=0`) |
+| `consumo_promedio` | `avg_consumption` (F1) | Min-max simple de F1 ENTRE TODOS los suministros analizados del lote (mismo estilo que DEC-013 para el score ML); degenerado (todos iguales) → `50` (neutro) | nunca null (F1 nunca nulo) |
+| `categoria_tarifaria` | Nombre de la categoría tarifaria (no hay `precio_kwh`/criticidad en el esquema) | Tabla fija v1: `Grandes Demandas=100, Industrial=90, Comercial=60, Residencial=30, Alumbrado Público=20`; nombre desconocido → `50` (neutro) | nunca null (toda categoría tiene nombre) |
+
+**`impacto_economico`, normalización (`normalizar_iee_lote`):** min-max **solo sobre los IEEs
+NO-CERO** del lote — `factor = (iee - min_no_cero) / (max_no_cero - min_no_cero) × 100`; un
+suministro con IEE `0`/`None` recibe factor `0` directamente (no entra al min-max). Caso
+degenerado (todos los IEEs no-cero son idénticos, incluido un único valor no-cero) → `100` para
+todos ellos — decisión DISTINTA de la del ML (`0.5`/neutro): un IEE no-cero, aunque empatado,
+representa pérdida CONFIRMADA, no ausencia de señal, así que se reporta al tope de la escala en
+vez de a un punto medio neutro (ver el docstring de `normalizar_iee_lote`, `domain/ire.py`).
+
+**Redistribución de pesos (§10.1's nota explícita, `redistribuir_pesos`):** genérica, no
+hardcodeada a "inspecciones anteriores" — dado un conjunto de claves con peso `0`, cada peso
+restante se escala por `1 / (1 - Σ pesos_cero)`. Para v1 (`PESOS_EFECTIVOS_V1`, `claves_cero =
+{"inspecciones_anteriores"}`, masa cero = 0.08): `score_ia = 0.30/0.92 ≈ 0.3261`, `historial_
+consumos = persistencia_anomalias = variacion_porcentual = 0.15/0.92 ≈ 0.1630` (cada uno),
+`impacto_economico = 0.10/0.92 ≈ 0.1087`, `consumo_promedio = 0.04/0.92 ≈ 0.0435`, `categoria_
+tarifaria = 0.03/0.92 ≈ 0.0326` — suman `1.0` exacto.
+
+**Redondeo (`redondear_half_up`):** `ire.valor` es `numeric(5,2)` (admite decimales), pero esta
+implementación persiste siempre un ENTERO — decisión v1 documentada: las bandas de `ire.nivel`
+(columna generada, §10.2) y el puente DEC-015 están definidos sobre rangos enteros, así que
+redondear una sola vez, antes de persistir, evita ambigüedad en ambas lecturas derivadas. Half-up
+(`floor(x + 0.5)`), no el "round half to even" (banker's rounding) de Python's `round()` nativo.
+
+> **Nota de recalibración (`PROJECT_MASTER_SPEC.md` #15).** La calibración integral v1 (§13.3)
+> encontró, con datos sintéticos, que estos pesos y normalizaciones rankean las anomalías sutiles
+> PEOR que el score de ML aislado — ver ese ítem para el detalle cuantificado y el seguimiento.
+
+### 10.5 Implementación (estado, 2026-07-20)
+
+Etapa 7 está **implementada**: `domain/ire.py` (`componer_ire` + los 8 factores puros + `redistribuir_
+pesos` + `redondear_half_up` + `bandear_nivel_ire`, este último un espejo deliberado de la columna
+generada `ire.nivel`, §10.2 — mismo patrón de duplicación autocontenida que `domain/isolation_
+forest.py`'s propio `_percentil`), `infrastructure/resultados_ia_repository.py`
+(`SqlResultadosIaRepository`, THE convergencia — ver §14), integrada en `ProcesarLote.
+_componer_ire_e_iee` (`application/procesar_lote.py`), reusando `vectores`/`reglas`/`predicciones`
+ya construidos por las Etapas 3-6, sin recalcular nada. `resultados_ia.clasificacion` reusa
+`bandear_clasificacion` (Etapa 6, DEC-015) directamente — single source of truth con `predicciones.
+clasificacion`, aunque aplicado sobre el IRE compuesto, no sobre `ml_score_0_100` aislado (§9.4's
+nota de distinción). Calibración real contra el dataset sintético (seed 42, escala small, 24
+lotes): §13.3.
 
 ---
 
@@ -1033,6 +1133,35 @@ de esquema, porque las columnas ya existen con los tipos correctos.
 > inventado en configuración cuando no existe una fuente real de tarifas. Impacto: §16 (brecha de
 > esquema, reencuadrada); los reportes económicos (US-017, US-022) quedan en términos de energía
 > hasta v2.
+
+### 11.4 Implementación (estado, 2026-07-20)
+
+Etapa 8 está **implementada**: `domain/ire.py`'s `calcular_iee_kwh` + `normalizar_iee_lote`,
+integrada en `ProcesarLote._componer_ire_e_iee` (`application/procesar_lote.py`), persistida por
+`infrastructure/resultados_ia_repository.py` (ver §14). Desviación honesta frente a la redacción
+original de §11.1:
+
+- **`kwh_esperado` NO cae a la mediana de cohorte cuando no hay historia — cae a NADA.** El texto
+  original de §11.1 decía "línea base propia del suministro (`moving_avg_12m`, F8) o la mediana de
+  su cohorte cuando no hay historia". La implementación en cambio: `moving_avg_12m`, con fallback a
+  `moving_avg_6m` (F7) si F8 fuera null (nunca ocurre bajo `domain/features.py` actual — F8 siempre
+  resuelve a algún valor, aunque sea el promedio de un solo período — guarda defensivo, igual que
+  otros "unreachable" ya documentados en este contexto), y si un suministro es **cold-start**
+  (`is_cold_start`, menos de `MINIMO_PERIODOS_DESVIO` = 3 períodos, `domain/features.py`), **no
+  recibe IEE en absoluto** (`None`, sin fila en `impacto_economico`) — nunca una mediana de
+  cohorte. Motivo: con menos de 3 períodos de historia propia, no hay base suficiente para
+  declarar ningún nivel "esperado" con confianza, ni siquiera vía cohorte; se prefiere "sin dato"
+  a un valor fabricado. Ver mission directive #2 del apply de Etapas 7-8: decisión v1 explícita,
+  no un supuesto silencioso.
+- **Normalización para el factor IRE (§10.4):** min-max sobre los IEEs NO-CERO del lote — ver
+  §10.4 para la fórmula y el caso degenerado.
+- **Persistencia condicional:** `impacto_economico` recibe soft-delete-then-CONDITIONAL-insert
+  (`SqlResultadosIaRepository`, §14) — un suministro sin IEE simplemente no tiene fila, y un
+  reintento cuyo suministro PIERDE su IEE (edge case teórico, la historia no debería cambiar entre
+  reintentos del MISMO lote) queda correctamente sin fila activa tras el reintento.
+- **Calibración real contra el dataset sintético** (seed 42, escala small, 24 lotes, 2.321
+  evaluaciones): §13.3 — 2.121 de las 2.321 evaluaciones (91.4%) recibieron un IEE (las 200
+  restantes son cold-start, suministros nuevos con menos de 3 períodos de historia).
 
 ---
 
@@ -1164,6 +1293,164 @@ absoluta, no se distingue de ruido normal hasta que se acumula. `contamination`/
 `max_samples` (DEC-011/DEC-012) son candidatos de recalibración explícitos frente a esta evidencia,
 no verdades definitivas — la misma cláusula que ya aplica a los umbrales de reglas (§8, DEC-009).
 
+### 13.3 Calibración integral v1 (Etapas 7-8, datos sintéticos, seed 42, 2026-07-20)
+
+Con Etapas 7-8 (composición del IRE + IEE) ya implementadas, se corrieron los 24 lotes mensuales
+(2022-01 a 2023-12, dataset `small`/`seed 42`, 100 suministros, 2.321 evaluaciones) contra una API
+real (`energia_scratch_e7e8`, base descartable, `energia`/`energia_test` sin tocar — verificado
+por lectura directa antes y después: `energia` mantiene `resultados_ia`/`ire`/`anomalias`/
+`impacto_economico`/`feature_vectors`/`predicciones`/`modelos_ia` en `0` filas, la corrida entera
+quedó aislada en la base descartable).
+
+**Conteos de persistencia (24/24 lotes `Procesado`, las 2.321 evaluaciones):**
+
+| Tabla | Filas |
+|---|---|
+| `resultados_ia` | 2.321 (una por evaluación, upsert por `(suministro_id, lote_id)`) |
+| `ire` | 2.321 (1:1 con `resultados_ia`, TODA evaluación recibe un IRE — ningún factor bloquea el cómputo) |
+| `feature_vectors` con `resultado_ia_id` no nulo | 2.321 / 2.321 (backfill completo, §14) |
+| `predicciones` activas | 2.321 |
+| `modelos_ia` | 24 (una por lote — cada uno cae bajo `MODELO_POR_CATEGORIA_MINIMO` = 1.000, un único scope `"global"` por lote, igual que §13.2) |
+| `impacto_economico` activas | 2.121 / 2.321 (91,4 %) — las 200 restantes son evaluaciones cold-start sin IEE (§11.4) |
+| `anomalias` activas | 211 — **12 de la rama de reglas** (R1=2, R2=3, R3=1, R4=4, R5=1, R6=1: idénticos a los conteos de §8.2.2, la recalibración v1.1 no cambió con Etapas 7-8) **+ 199 `'Patrón Irregular'` solo-ML** (§8's nota de política v1, más abajo) |
+
+**IRE/nivel/clasificación/rank de cada anomalía plantada, en su mes de inicio:**
+
+| suministro | tipo plantado | mes de inicio | `ire.valor` | `ire.nivel` | `resultados_ia.clasificacion` | rank / 100 |
+|---|---|---|---|---|---|---|
+| SYN-S42-SUM-00005 | spike_leve | 2023-01 | 42 | Medio | Alto Riesgo | 10 |
+| SYN-S42-SUM-00014 | sudden_drop | 2023-05 | 38 | Bajo | Atención | 11 |
+| SYN-S42-SUM-00024 | spike | 2023-07 | 62 | Alto | Alto Riesgo | **1** |
+| SYN-S42-SUM-00032 | sudden_drop_leve | 2022-10 | 38 | Bajo | Atención | 10 |
+| SYN-S42-SUM-00049 | zero_consumption_streak | 2023-01 (racha ≥ 3) | 65 | Alto | Alto Riesgo | **1** |
+| SYN-S42-SUM-00073 | gradual_decline | 2023-05 | 7 | Muy Bajo | Normal | 61 |
+
+**Precisión/recall del top-5 por IRE, por lote de inicio, contra el manifiesto:**
+
+| Lote de inicio | Plantadas ese mes | Capturadas en el top-5 (con empates) | Recall | Precisión (aciertos / tamaño del top-5-con-empates) |
+|---|---|---|---|---|
+| 2022-10 | SUM-00032 (rank 10) | Ninguna | 0/1 | 0/6 |
+| 2023-01 | SUM-00005 (rank 10), SUM-00049 (rank 1) | SUM-00049 | 1/2 | 1/5 |
+| 2023-05 | SUM-00014 (rank 11), SUM-00073 (rank 61) | Ninguna | 0/2 | 0/6 |
+| 2023-07 | SUM-00024 (rank 1) | SUM-00024 | 1/1 | 1/6 |
+| **Total** | **6 instancias plantadas** | **2 (SUM-00049, SUM-00024)** | **33 %** | **2/23 ≈ 8,7 %** |
+
+**Hallazgo honesto:** el IRE compuesto (8 factores, IA con peso dominante 0.30 mas NO exclusivo)
+SÍ prioriza con fuerza las 2 anomalías donde una señal única y extrema domina todos los factores a
+la vez (`SUM-00024`/`spike`: R3+R5+R6 disparan Y el score ML es 100/100; `SUM-00049`/racha de cero:
+R1+R4 disparan Y persistencia_anomalias satura) — ambas rankean **#1** de 100 en su lote. Pero
+para las 4 anomalías "sutiles" (los dos "leve" deliberadamente sub-umbral, `sudden_drop` real pero
+con impacto compuesto moderado, y `gradual_decline` que ningún branch ve al inicio) el top-5 por
+IRE NO las captura — el peso combinado de los otros 7 factores (persistencia sin historial previo,
+variación moderada, consumo promedio no extremo, categoría no crítica) diluye una señal que el
+score de ML aislado sí rankeaba razonablemente bien para 2 de esas 4 (`spike_leve` rank 3,
+`sudden_drop_leve` rank 5 en la calibración ML pura de §13.2) — el IRE compuesto, precisamente por
+diseño (RN-006/RN-007: "no depende solo del score de IA"), MODERA esa señal aislada con el resto
+del negocio, y en este dataset chico (100 suministros/lote) el resultado neto es un recall del
+top-5 menor al que el ranking de ML puro por sí solo lograba para esos casos. Esto no es un error
+de implementación: es la consecuencia esperada y medible de DEC-014 (pesos calibración-pendiente,
+`PROJECT_MASTER_SPEC.md` #8) — candidato explícito de recalibración una vez existan datos reales
+de inspecciones confirmadas. Este hallazgo (recall del top-5 2/6 vs 5/6 del ranking de ML puro,
+causas cuantificadas) queda trackeado como ítem accionable en `PROJECT_MASTER_SPEC.md` #15.
+
+**Volumen de `'Patrón Irregular'` solo-ML (199 disparos, ver también la nota de política en §8):**
+con `MODELO_POR_CATEGORIA_MINIMO` nunca alcanzado, cada lote normaliza (DEC-013, min-max invertido)
+sus ~100 suministros SOLOS entre sí — el más atípico relativo de CADA lote aterriza cerca de 100
+sin importar la magnitud absoluta de su desvío, empujando a varios suministros por lote sobre el
+umbral 71 ("Crítico") con más frecuencia de lo que un umbral fijo, pensado para una población
+grande y estable, sugeriría. Candidato de recalibración explícito (§8's nota), no una verdad fija.
+
+**Prueba de F15 vivo (`prior_anomaly_count`, la memoria del motor):** `SYN-S42-SUM-00049` disparó
+R1 (`Persistencia Anómala`) en 2023-01/02 y R4 (`Consumo Muy Bajo`) en 2022-11/12/2023-01/02 —
+cuatro lotes que persistieron `anomalias`. El `feature_vectors.features->>'prior_anomaly_count'`
+de ESE MISMO suministro en lotes POSTERIORES crece exactamente reflejando esas filas acumuladas:
+
+| Lote | F15 (`prior_anomaly_count`) |
+|---|---|
+| 2022-08 a 2022-11 | 0 |
+| 2022-12 | 2 |
+| 2023-01 | 3 |
+| 2023-02 | 5 |
+| 2023-03 | 7 |
+| 2023-04 | 8 |
+| ... | (sigue creciendo monótonamente) |
+| 2023-12 | 14 |
+
+Prueba directa, medida, de que Etapa 4 (`fetch_prior_anomaly_counts`) lee `anomalias` de lotes YA
+procesados por Etapa 7 en corridas ANTERIORES de la MISMA ejecución secuencial — el motor
+efectivamente "recuerda" entre lotes. Hallazgo colateral, también honesto: la fórmula v1 de
+`persistencia_anomalias` (§10.4, `min(F15×25 + F10×10, 100)`) SATURA con apenas 4 anomalías previas
+(`4×25 = 100`) — la contribución de este factor a `SUM-00049` es idéntica (16.30 puntos, el peso
+efectivo completo) en 2023-01 (F15=3, racha=3 → `3×25+3×10=105→100`) y en 2023-12 (F15=14, racha=0
+→ `14×25=350→100`): el factor deja de diferenciar entre "algo persistente" y "muy persistente"
+mucho antes de lo que el rango completo de F15 permitiría — candidato de recalibración explícito
+(la constante `25`/`10`/tope `100` son v1, `PROJECT_MASTER_SPEC.md` #8), no una verdad definitiva.
+
+**Ejemplo completo del desglose de explicabilidad (`resultados_ia.observaciones`, DEC-016) —
+`SYN-S42-SUM-00049` en su mes de inicio (`LOTE-SYN-S42-2023-01`, `ire.valor = 65`):**
+
+```json
+[
+  {
+    "factor": "score_ia",
+    "reason": "Score del modelo de IA: 100.0/100 (aproximación por atribución de features)",
+    "contribution": 32.6087
+  },
+  {
+    "factor": "historial_consumos",
+    "reason": "Desviación de -0.89 desvíos estándar respecto de la línea base histórica",
+    "contribution": 2.8965
+  },
+  {
+    "factor": "persistencia_anomalias",
+    "reason": "3 anomalía(s) previa(s) registrada(s) y racha actual de 3 período(s) consecutivos en cero consumo",
+    "contribution": 16.3043
+  },
+  {
+    "factor": "impacto_economico",
+    "reason": "Impacto económico estimado: 658.9 kWh no facturados",
+    "contribution": 10.8696
+  },
+  {
+    "factor": "consumo_promedio",
+    "reason": "Consumo promedio de 658.9 kWh (percentil 70 respecto del lote)",
+    "contribution": 0.1968
+  },
+  {
+    "factor": "categoria_tarifaria",
+    "reason": "Categoría tarifaria Comercial (criticidad 60/100)",
+    "contribution": 1.9565
+  }
+]
+```
+
+Suma de contribuciones = 65.00 (redondeo half-up del crudo 64.997...) = `ire.valor` persistido.
+`"inspecciones_anteriores"` no aparece (peso redistribuido a 0, DEC-016 filtra contribución no
+nula) y `"variacion_porcentual"` tampoco (F5/F6 ambos null para este suministro este mes) — ambos
+casos correctos por diseño, no una omisión.
+
+**Corrección honesta (2026-07-20, RN-012).** El `reason` de `consumo_promedio` citaba antes el
+score min-max normalizado (`normalizar_consumo_promedio_lote`, el que efectivamente impulsa la
+`contribution`) como si fuera un percentil — para este mismo ejemplo decía "percentil 5" cuando el
+percentil REAL de `SUM-00049` en este lote era ~70 (una diferencia de ~65 puntos, persistida y
+visible al analista, contradiciendo RN-012). El texto ahora cita el percentil REAL, calculado por
+separado (`calcular_percentil_real_consumo_promedio_lote`, `domain/ire.py`) exclusivamente para
+esta explicación — la `contribution` no cambia, sigue impulsada por el min-max.
+
+**Comparación honesta contra §13.1/§13.2:** las Etapas 7-8 no reemplazan ni "arreglan" los puntos
+ciegos ya documentados (`gradual_decline` sigue invisible al inicio, §13.1/§13.2) — los COMPONEN
+con el resto del negocio, con el resultado neto medido arriba: 2 de 6 anomalías plantadas quedan en
+el top-5 por IRE de su lote de inicio, las 2 donde múltiples señales coinciden. El baseline "ranking
+de ML puro" de §13.2 (spike_leve rank 3, sudden_drop_leve rank 5) capturaba MÁS de las "sutiles" que
+el IRE compuesto en el top-5 — un trade-off esperado de DEC-014 (pesos), no un defecto de
+implementación, y el candidato de recalibración más concreto que esta corrida deja para la próxima
+iteración (`PROJECT_MASTER_SPEC.md` #8).
+
+**Reproducibilidad:** `energia_scratch_e7e8` (base descartable, creada/dropeada en esta validación,
+nunca `energia`/`energia_test`), sembrada vía `python -m energia.tools.synthetic --scale small
+--seed 42` y procesada lote por lote (`POST /api/v1/motor/lotes/{codigo_lote}/procesar`) para los
+24 `LOTE-SYN-S42-YYYY-MM`, mismo arnés que §8.2/§13.2.
+
 ---
 
 ## 14. Mapeo etapa → tabla (contrato de persistencia)
@@ -1181,6 +1468,15 @@ no verdades definitivas — la misma cláusula que ya aplica a los umbrales de r
 Orden de escritura: `feature_vectors` (con `resultado_ia_id` nulo) → `predicciones` →
 `resultados_ia` → backfill de `feature_vectors.resultado_ia_id` → `anomalias` / `ire` /
 `impacto_economico`. La FK nullable `feature_vectors.resultado_ia_id` habilita este orden.
+
+**Implementado (2026-07-20), exactamente en este orden.** `infrastructure/
+resultados_ia_repository.py`'s `SqlResultadosIaRepository.persistir` ejecuta las cinco escrituras
+de esta tabla en el orden exacto de arriba, dentro de la MISMA transacción que el resto de
+`ProcesarLote.execute()` (§2.5) — `resultados_ia` se upsertea fila por fila (`RETURNING id`, una
+llamada por suministro, mismo patrón que `modelos_ia_repository.py`'s `registrar_fit`, ya que un
+`INSERT` multi-fila con `RETURNING` vía `executemany` no correlaciona sus filas de vuelta a las de
+entrada de forma confiable entre drivers) para poder resolver el `id` (nuevo o preexistente) que
+el backfill y las tres escrituras siguientes necesitan. Ver §13.3 para la calibración integral.
 
 ---
 

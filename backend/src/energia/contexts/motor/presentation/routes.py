@@ -34,17 +34,25 @@ from energia.contexts.motor.infrastructure.modelos_ia_repository import SqlModel
 from energia.contexts.motor.infrastructure.predicciones_repository import (
     SqlPrediccionesRepository,
 )
+from energia.contexts.motor.infrastructure.resultados_ia_repository import (
+    SqlResultadosIaRepository,
+)
 from energia.contexts.motor.infrastructure.validacion_data_source import SqlValidacionDataSource
 from energia.contexts.motor.presentation.schemas import (
+    DistribucionIRESchema,
     DistribucionScoreSchema,
     DriftLoteSchema,
     ExclusionSchema,
     HallazgoSchema,
+    IeeSuministroResumenSchema,
     IndicadoresResumenSchema,
     InformeDuplicidadesSchema,
+    InformeIEESchema,
+    InformeIRESchema,
     InformeMLSchema,
     InformeReglasSchema,
     InformeValidacionSchema,
+    IreSuministroResumenSchema,
     LecturaNearDuplicateSchema,
     ModeloEntrenadoSchema,
     PeriodoConflictivoSchema,
@@ -55,6 +63,7 @@ from energia.contexts.motor.presentation.schemas import (
     ReglasSuministroSchema,
     ResumenFeaturesSchema,
     ResumenReglasSchema,
+    TopFactorSchema,
 )
 from energia.shared.db import get_db_session
 
@@ -198,6 +207,49 @@ def _to_response(resultado: ResultadoProcesamiento) -> ProcesarLoteResponseSchem
                 for prediccion in resultado.ml.top_10
             ],
         ),
+        ire=InformeIRESchema(
+            lote_id=str(resultado.ire.lote_id),
+            suministros_evaluados=resultado.ire.suministros_evaluados,
+            distribucion=(
+                DistribucionIRESchema(
+                    minimo=resultado.ire.distribucion.minimo,
+                    p50=resultado.ire.distribucion.p50,
+                    p95=resultado.ire.distribucion.p95,
+                    maximo=resultado.ire.distribucion.maximo,
+                )
+                if resultado.ire.distribucion is not None
+                else None
+            ),
+            conteo_por_nivel=resultado.ire.conteo_por_nivel,
+            top_10=[
+                IreSuministroResumenSchema(
+                    suministro_id=str(entrada.suministro_id),
+                    numero_suministro=entrada.numero_suministro,
+                    ire=entrada.ire,
+                    nivel=entrada.nivel,
+                    clasificacion=entrada.clasificacion,
+                    top_factores=[
+                        TopFactorSchema(factor=factor.factor, contribution=factor.contribution)
+                        for factor in entrada.top_factores
+                    ],
+                )
+                for entrada in resultado.ire.top_10
+            ],
+            anomalias_persistidas_por_tipo=resultado.ire.anomalias_persistidas_por_tipo,
+        ),
+        iee=InformeIEESchema(
+            lote_id=str(resultado.iee.lote_id),
+            total_kwh_estimado=resultado.iee.total_kwh_estimado,
+            suministros_con_iee=resultado.iee.suministros_con_iee,
+            top_5=[
+                IeeSuministroResumenSchema(
+                    suministro_id=str(entrada.suministro_id),
+                    numero_suministro=entrada.numero_suministro,
+                    iee_kwh=entrada.iee_kwh,
+                )
+                for entrada in resultado.iee.top_5
+            ],
+        ),
     )
 
 
@@ -263,6 +315,7 @@ async def procesar_lote(
         isolation_forest_scorer=SklearnIsolationForestScorer(),
         modelos_ia_repository=SqlModelosIaRepository(session),
         predicciones_repository=SqlPrediccionesRepository(session),
+        resultados_ia_repository=SqlResultadosIaRepository(session),
     )
     try:
         resultado = await use_case.execute(codigo_lote)

@@ -365,14 +365,18 @@ class PrediccionSuministro:
     """One suministro's Etapa 6 outcome -- the FULL per-suministro detail (mirrors
     `domain/reglas.py`'s `ReglasSuministro`/`domain/features.py`'s `FeatureVector` role: computed
     once, reused both for persistence -- `infrastructure/predicciones_repository.py` -- and for
-    `construir_informe_ml`'s bounded summary, never recomputed twice). `score_crudo` is the RAW
-    `decision_function` value (kept for a FUTURE Etapa 7's `resultados_ia.score_anomalia`, §9.3 --
-    not persisted by THIS stage, `resultados_ia` stays untouched here); `score_normalizado` is the
-    `[0,1]` DEC-013 value persisted verbatim to `predicciones.score`; `ml_score_0_100` is
+    `construir_informe_ml`'s bounded summary, never recomputed twice). `id` is this row's
+    CLIENT-generated `predicciones.id` (added for Etapa 7 -- `domain/ports.py`'s
+    `PrediccionParaGuardar` docstring explains why, rather than the column's server default).
+    `score_crudo` is the RAW `decision_function` value (consumed by Etapa 7's
+    `resultados_ia.score_anomalia`, §9.3 -- not persisted by THIS stage, `resultados_ia` stays
+    untouched here); `score_normalizado` is the `[0,1]` DEC-013 value persisted verbatim to
+    `predicciones.score` AND to Etapa 7's `resultados_ia.probabilidad` (§9.3); `ml_score_0_100` is
     `score_normalizado * 100`, the informe/display value; `clasificacion` is DEC-015's banding of
     `ml_score_0_100` -- persisted to `predicciones.clasificacion` (module docstring, "Banding",
     for why this is NOT `resultados_ia.clasificacion`)."""
 
+    id: UUID
     suministro_id: UUID
     numero_suministro: str
     modelo_ia_id: UUID

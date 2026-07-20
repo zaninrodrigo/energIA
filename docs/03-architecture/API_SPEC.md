@@ -482,7 +482,7 @@ Lista paginada de consumos vigentes (excluye soft-deleted, `deleted_at IS NULL`)
 
 ## Contexto: Motor de Inteligencia Energética
 
-Épica 2, slices 1-5 (US-006 "validar la integridad de los datos importados" + US-010, el disparo del motor; US-007 "detección de duplicados"; US-008 "generar features" + US-009 "indicadores estadísticos"; reglas de negocio; US-011 "aplicar Isolation Forest"). Documenta Etapa 1 (validación de integridad, `docs/04-ai/AI_ENGINE_SPEC.md` §4), Etapa 2 (detección de duplicidades, §5), Etapa 3 (generación de features, §6), Etapa 4 (indicadores estadísticos, §7), Etapa 5 (reglas de negocio, §8) y Etapa 6 (Isolation Forest, §9); las Etapas 7-8 (composición del IRE, Impacto Económico Estimado) no están implementadas todavía.
+Épica 2 completa (6 slices: US-006 "validar la integridad de los datos importados" + US-010, el disparo del motor; US-007 "detección de duplicados"; US-008 "generar features" + US-009 "indicadores estadísticos"; reglas de negocio; US-011 "aplicar Isolation Forest"; composición del IRE + Impacto Económico Estimado). Documenta Etapa 1 (validación de integridad, `docs/04-ai/AI_ENGINE_SPEC.md` §4), Etapa 2 (detección de duplicidades, §5), Etapa 3 (generación de features, §6), Etapa 4 (indicadores estadísticos, §7), Etapa 5 (reglas de negocio, §8), Etapa 6 (Isolation Forest, §9), Etapa 7 (composición del IRE, §10) y Etapa 8 (Impacto Económico Estimado, §11) — THE convergencia (§14): todas implementadas.
 
 ### POST /api/v1/motor/lotes/{codigo_lote}/procesar
 
@@ -614,6 +614,38 @@ Por último corre la Etapa 6 (§9, Isolation Forest, US-011/RF-006): agrupa los 
         "clasificacion": "Crítico"
       }
     ]
+  },
+  "ire": {
+    "lote_id": "5b1b6e0e-...-...",
+    "suministros_evaluados": 3,
+    "distribucion": { "minimo": 10, "p50": 45.0, "p95": 88.0, "maximo": 90 },
+    "conteo_por_nivel": { "Muy Bajo": 1, "Bajo": 0, "Medio": 1, "Alto": 0, "Crítico": 1 },
+    "top_10": [
+      {
+        "suministro_id": "8f2c...-...",
+        "numero_suministro": "SUM-00123",
+        "ire": 90,
+        "nivel": "Crítico",
+        "clasificacion": "Crítico",
+        "top_factores": [
+          { "factor": "score_ia", "contribution": 32.61 },
+          { "factor": "persistencia_anomalias", "contribution": 16.30 },
+          { "factor": "impacto_economico", "contribution": 10.87 }
+        ]
+      }
+    ],
+    "anomalias_persistidas_por_tipo": {
+      "Consumo Muy Bajo": 0, "Consumo Muy Alto": 0, "Caída Brusca": 0, "Incremento Brusco": 0,
+      "Patrón Irregular": 1, "Persistencia Anómala": 1, "Desvío Estadístico": 0
+    }
+  },
+  "iee": {
+    "lote_id": "5b1b6e0e-...-...",
+    "total_kwh_estimado": 658.9,
+    "suministros_con_iee": 1,
+    "top_5": [
+      { "suministro_id": "8f2c...-...", "numero_suministro": "SUM-00123", "iee_kwh": 658.9 }
+    ]
   }
 }
 ```
@@ -652,9 +684,25 @@ Por último corre la Etapa 6 (§9, Isolation Forest, US-011/RF-006): agrupa los 
 | `ml.distribucion` | object \| null | `{ "minimo", "p50", "p95", "maximo" }` de `ml_score_0_100` (0-100) entre todos los suministros scoreados este lote; `null` cuando `ml.suministros_scored == 0` |
 | `ml.top_10` | array | Los 10 suministros de mayor `ml_score_0_100` este lote (orden descendente): `{ "suministro_id", "numero_suministro", "ml_score_0_100", "clasificacion" }` |
 | `ml.top_10[].ml_score_0_100` | number | Score normalizado (DEC-013, min-max invertido **por lote**, entre TODOS los grupos de entrenamiento juntos) × 100 — 0 = menos anómalo, 100 = más anómalo |
-| `ml.top_10[].clasificacion` | string | Bandas de DEC-015 (0-20 Normal / 21-40 Atención / 41-70 Alto Riesgo / 71-100 Crítico) aplicadas a `ml_score_0_100` — **es el veredicto preliminar de la rama de ML SOLA, no el `clasificacion` que persistirá `resultados_ia`** (Etapa 7, deriva del IRE compuesto con 8 factores, §10.1; ver la nota de AI_ENGINE_SPEC.md §9.4 para la distinción completa) |
+| `ml.top_10[].clasificacion` | string | Bandas de DEC-015 (0-20 Normal / 21-40 Atención / 41-70 Alto Riesgo / 71-100 Crítico) aplicadas a `ml_score_0_100` — **es el veredicto preliminar de la rama de ML SOLA, no el `clasificacion` que persiste `resultados_ia`** (Etapa 7, deriva del IRE compuesto con 8 factores, §10.1; ver la nota de AI_ENGINE_SPEC.md §9.4 para la distinción completa) |
+| `ire.lote_id` | UUID | — |
+| `ire.suministros_evaluados` | integer | La MISMA población que `ml.suministros_scored` (Etapa 7 corre sobre exactamente los mismos suministros que Etapa 6 scoreó) |
+| `ire.distribucion` | object \| null | `{ "minimo", "p50", "p95", "maximo" }` del `ire.valor` (0-100, entero) entre todos los suministros de este lote; `null` cuando `ire.suministros_evaluados == 0` |
+| `ire.conteo_por_nivel` | object | Conteo por cada una de las 5 bandas de `ire.nivel` (columna generada, §10.2): `{ "Muy Bajo": n, "Bajo": n, "Medio": n, "Alto": n, "Crítico": n }` |
+| `ire.top_10` | array | Los 10 suministros de mayor `ire.valor` este lote (orden descendente): `{ "suministro_id", "numero_suministro", "ire", "nivel", "clasificacion", "top_factores" }` |
+| `ire.top_10[].ire` | integer | El IRE compuesto (§10.1), YA REDONDEADO (half-up) a entero — `ire.valor` en base de datos admite decimales (`numeric(5,2)`), pero esta implementación persiste siempre un entero (implementación v1, documentada en `AI_ENGINE_SPEC.md` §10.4) |
+| `ire.top_10[].nivel` | string | Las 5 bandas de la columna generada `ire.nivel` (§10.2) — NO es lo mismo que `clasificacion` (DEC-015, 4 bandas): ver `AI_ENGINE_SPEC.md` §10.2's nota puente |
+| `ire.top_10[].clasificacion` | string | DEC-015 aplicado al IRE COMPUESTO (no al score de ML aislado, a diferencia de `ml.top_10[].clasificacion`) — este es el valor que persiste `resultados_ia.clasificacion` |
+| `ire.top_10[].top_factores` | array | Los 3 factores de mayor `contribution` (de los hasta 7 con contribución no nula, DEC-016 — "inspecciones anteriores" nunca aparece, siempre 0 en v1) que componen este `ire`: `{ "factor", "contribution" }` |
+| `ire.anomalias_persistidas_por_tipo` | object | Conteo, para TODO el lote, de las `anomalias` que Etapa 7 persistió este run, por los 7 tipos del catálogo cerrado (§8.2) — incluye tanto las de la rama de reglas como las `"Patrón Irregular"` solo-ML (§8/§10.3) |
+| `iee.lote_id` | UUID | — |
+| `iee.total_kwh_estimado` | number | Suma del IEE (§11, kWh) de todos los suministros de este lote — un suministro cold-start (sin IEE) contribuye `0` |
+| `iee.suministros_con_iee` | integer | Cuántos suministros tienen IEE ESTRICTAMENTE positivo (excluye tanto los `0` genuinos como los cold-start sin IEE) |
+| `iee.top_5` | array | Los 5 suministros de mayor IEE este lote (orden descendente, excluye los cold-start sin IEE): `{ "suministro_id", "numero_suministro", "iee_kwh" }` |
 
-**Persistencia (implementación v1, ver AI_ENGINE_SPEC.md §4.2/§5 para el detalle completo):** ni `informe` ni `duplicidades` se persisten en base de datos — `resultados_ia` exige `modelo_ia_id`/`clasificacion` (`NOT NULL`), que no existen hasta la Etapa 7 (composición del IRE, todavía no implementada). El único efecto persistente de este endpoint sobre esas dos etapas es la transición de `lotes.estado`. Las Etapas 3-4, en cambio, SÍ persisten: cada `FeatureVector` no resumido se escribe (upsert) en `feature_vectors` (`suministro_id`, `lote_id`, `version = "v1"`, `features` jsonb con las 17 features + `is_cold_start` + `has_conflicted_periods` + los 3 indicadores de Etapa 4) — `features` en la respuesta HTTP es solo un resumen de conteos, nunca el vector completo, por tamaño de respuesta (un lote puede tener miles de suministros). La Etapa 6 (§9) TAMBIÉN persiste: una fila en `modelos_ia` por `scope` entrenado (upsert por `(nombre, version)`, idempotente ante reintento) y una fila en `predicciones` por suministro scoreado (reemplazo completo — `DELETE` + `INSERT` — de las filas del lote, ya que `predicciones` no tiene clave natural sobre la que hacer upsert). `resultados_ia` sigue sin tocarse (Etapa 7).
+**Persistencia (implementación v1, ver AI_ENGINE_SPEC.md §4.2/§5/§14 para el detalle completo):** ni `informe` ni `duplicidades` se persisten en base de datos — ninguna de las dos etapas escribe una tabla propia (la persistencia de su intención converge en Etapa 7, más abajo). El único efecto persistente de este endpoint sobre esas dos etapas es la transición de `lotes.estado`. Las Etapas 3-4, en cambio, SÍ persisten: cada `FeatureVector` no resumido se escribe (upsert) en `feature_vectors` (`suministro_id`, `lote_id`, `version = "v1"`, `features` jsonb con las 17 features + `is_cold_start` + `has_conflicted_periods` + los 3 indicadores de Etapa 4) — `features` en la respuesta HTTP es solo un resumen de conteos, nunca el vector completo, por tamaño de respuesta (un lote puede tener miles de suministros). La Etapa 6 (§9) TAMBIÉN persiste: una fila en `modelos_ia` por `scope` entrenado (upsert por `(nombre, version)`, idempotente ante reintento) y una fila en `predicciones` por suministro scoreado (reemplazo completo — soft-delete + `INSERT` — de las filas del lote, ya que `predicciones` no tiene clave natural sobre la que hacer upsert).
+
+**Etapas 7-8 (§10/§11/§14) — THE convergencia, ahora implementada.** Por cada suministro analizado, en la MISMA transacción: upsert de `resultados_ia` (por `(suministro_id, lote_id)`, RD-023 — `score_anomalia` crudo, `probabilidad` normalizada [0,1] de Etapa 6, `clasificacion` del IRE compuesto vía DEC-015, `observaciones` con el desglose de explicabilidad DEC-016 serializado en JSON), backfill de `feature_vectors.resultado_ia_id` (la FK nullable que Etapa 3-4 dejó en `NULL`), reemplazo (soft-delete + insert) de `anomalias` (una fila por hit de regla R1-R6 más, cuando aplica, una `"Patrón Irregular"` solo-ML, §8/§10.3), upsert de `ire` (`valor` entero redondeado half-up; `nivel` es la columna generada) y reemplazo condicional (soft-delete + insert solo si hay IEE) de `impacto_economico` (`monto_estimado` en **kWh**, `moneda = 'kWh'`, convención v1 de §11.2 — NO es un monto en ARS). Reintentar un lote (`Error` → `Procesando`) es idempotente en las cinco tablas: `resultados_ia` conserva su `id` (upsert, nunca duplica), `anomalias`/`impacto_economico` reflejan exactamente el set del intento MÁS RECIENTE (las filas del intento anterior quedan soft-deleted, nunca `DELETE` físico, `DATABASE_DESIGN.md` §10).
 
 **Pendiente:** no existe todavía un `GET` para consultar los `feature_vectors`/`predicciones` de un suministro/lote — queda para cuando el frontend (o un consumidor de calibración) lo necesite; hoy la única forma de inspeccionar un vector o una predicción completa es una consulta directa a la tabla.
 

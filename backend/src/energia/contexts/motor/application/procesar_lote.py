@@ -59,10 +59,11 @@ stuck row the way a two-commit design would. That SAME rollback is what reverts 
 when (e) raises `LoteModificadoError`.
 """
 
+import json
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from energia.contexts.motor.domain.completitud import ResultadoCompletitud, evaluar_completitud
 from energia.contexts.motor.domain.duplicidades import (
@@ -78,6 +79,19 @@ from energia.contexts.motor.domain.features import (
     resumir_features,
 )
 from energia.contexts.motor.domain.informe_validacion import InformeValidacion, construir_informe
+from energia.contexts.motor.domain.ire import (
+    InformeIEE,
+    InformeIRE,
+    ResultadoSuministroParaInforme,
+    calcular_iee_kwh,
+    calcular_percentil_real_consumo_promedio_lote,
+    componer_ire,
+    construir_informe_iee,
+    construir_informe_ire,
+    debe_generar_anomalia_ml,
+    normalizar_consumo_promedio_lote,
+    normalizar_iee_lote,
+)
 from energia.contexts.motor.domain.isolation_forest import (
     ALGORITMO_ISOLATION_FOREST,
     GrupoEntrenamiento,
@@ -94,6 +108,7 @@ from energia.contexts.motor.domain.isolation_forest import (
 )
 from energia.contexts.motor.domain.lote_estado import EstadoLote
 from energia.contexts.motor.domain.ports import (
+    AnomaliaParaGuardar,
     DuplicidadesDataSource,
     FeaturesDataSource,
     FeatureVectorParaGuardar,
@@ -103,6 +118,8 @@ from energia.contexts.motor.domain.ports import (
     ModelosIaRepository,
     PrediccionesRepository,
     PrediccionParaGuardar,
+    ResultadoIAParaGuardar,
+    ResultadosIaRepository,
     SuministroMetadataRow,
     ValidacionDataSource,
 )
@@ -162,7 +179,13 @@ class ResultadoProcesamiento:
     SAME population, reusing the same vectors (`_ejecutar_isolation_forest`'s docstring) -- unlike
     `reglas`, this stage DOES persist (`modelos_ia`/`predicciones`, mission directive #6), but
     still NEVER influences `estado_final` (mission directive #8, same "annotate/compute only"
-    policy every prior stage after Etapa 1 already established)."""
+    policy every prior stage after Etapa 1 already established). `ire`/`iee` (Etapas 7-8, §10/§11,
+    THE convergence) compose the 8-factor IRE and the IEE over that SAME population one final
+    time, reusing `vectores`/`reglas`/`ml`'s already-computed outputs (`_componer_ire_e_iee`'s
+    docstring) -- persists `resultados_ia`/`anomalias`/`ire`/`impacto_economico` atomically
+    (`infrastructure/resultados_ia_repository.py`), backfills `feature_vectors.resultado_ia_id`,
+    and -- like every stage after Etapa 1 -- NEVER influences `estado_final` (mission directive
+    #8)."""
 
     estado_final: EstadoLote
     informe: InformeValidacion
@@ -170,6 +193,8 @@ class ResultadoProcesamiento:
     features: ResumenFeatures
     reglas: InformeReglas
     ml: InformeML
+    ire: InformeIRE
+    iee: InformeIEE
 
 
 class ProcesarLote:
@@ -189,6 +214,7 @@ class ProcesarLote:
         isolation_forest_scorer: IsolationForestScorer,
         modelos_ia_repository: ModelosIaRepository,
         predicciones_repository: PrediccionesRepository,
+        resultados_ia_repository: ResultadosIaRepository,
     ) -> None:
         self._lote_port = lote_port
         self._validacion_source = validacion_source
@@ -198,6 +224,7 @@ class ProcesarLote:
         self._isolation_forest_scorer = isolation_forest_scorer
         self._modelos_ia_repository = modelos_ia_repository
         self._predicciones_repository = predicciones_repository
+        self._resultados_ia_repository = resultados_ia_repository
 
     async def execute(self, codigo_lote: str) -> ResultadoProcesamiento:
         actual = await self._lote_port.obtener_estado_actual(codigo_lote)
@@ -244,8 +271,11 @@ class ProcesarLote:
         reglas = self._evaluar_reglas(
             actual.id, vectores, historial_por_suministro, metadata_por_suministro
         )
-        ml = await self._ejecutar_isolation_forest(
+        ml, predicciones = await self._ejecutar_isolation_forest(
             actual.id, actual.codigo_lote, vectores, metadata_por_suministro
+        )
+        ire_informe, iee_informe = await self._componer_ire_e_iee(
+            actual.id, vectores, metadata_por_suministro, reglas, predicciones
         )
 
         estado_final = EstadoLote.PROCESADO if informe.umbral_cumplido else EstadoLote.ERROR
@@ -265,6 +295,8 @@ class ProcesarLote:
             features=resumen_features,
             reglas=reglas,
             ml=ml,
+            ire=ire_informe,
+            iee=iee_informe,
         )
 
     async def _construir_duplicidades(self, lote_id: UUID) -> InformeDuplicidades:
@@ -436,7 +468,7 @@ class ProcesarLote:
         codigo_lote: str,
         vectores: list[FeatureVector],
         metadata_por_suministro: dict[UUID, SuministroMetadataRow],
-    ) -> InformeML:
+    ) -> tuple[InformeML, tuple[PrediccionSuministro, ...]]:
         """Etapa 6 (US-011/RF-006, AI_ENGINE_SPEC.md §9): fit + score Isolation Forest (DEC-011/
         DEC-012) over the SAME non-excluded population Etapa 5 (`_evaluar_reglas`) just
         evaluated -- REUSING `vectores`, never recomputing F1-F17/Etapa 4's indicators. NEVER
@@ -463,10 +495,17 @@ class ProcesarLote:
         docstring) -- called even when `vectores` is empty, so a retry that ends up with nothing
         to score still clears stale rows from a PREVIOUS attempt. Neither write commits here:
         same single-transaction discipline as every other port this use case calls (§2.5).
+
+        Returns the `InformeML` (response summary) PLUS the full `PrediccionSuministro` tuple --
+        Etapa 7 (`_componer_ire_e_iee`) needs the per-suministro `modelo_ia_id`/`score_crudo`/
+        `score_normalizado`/`clasificacion`/`id` this method already computed, and must not
+        recompute or re-fetch any of it (same "reuse, never recompute" discipline as every prior
+        stage). `id` (added for Etapa 7) is generated HERE, client-side, once per suministro --
+        see `domain/ports.py`'s `PrediccionParaGuardar` docstring for why.
         """
         if not vectores:
             await self._predicciones_repository.reemplazar_lote(lote_id, [])
-            return construir_informe_ml(lote_id, modelos=(), predicciones=())
+            return construir_informe_ml(lote_id, modelos=(), predicciones=()), ()
 
         categoria_nombres = {
             metadata.categoria_tarifaria_id: metadata.categoria_tarifaria_nombre
@@ -512,6 +551,7 @@ class ProcesarLote:
                 metadata = metadata_por_suministro[vector.suministro_id]
                 predicciones.append(
                     PrediccionSuministro(
+                        id=uuid4(),
                         suministro_id=vector.suministro_id,
                         numero_suministro=metadata.numero_suministro,
                         modelo_ia_id=modelo_ia_id,
@@ -527,6 +567,7 @@ class ProcesarLote:
             lote_id,
             [
                 PrediccionParaGuardar(
+                    id=prediccion.id,
                     modelo_ia_id=prediccion.modelo_ia_id,
                     suministro_id=prediccion.suministro_id,
                     lote_id=lote_id,
@@ -537,4 +578,144 @@ class ProcesarLote:
             ],
         )
 
-        return construir_informe_ml(lote_id, modelos=modelos, predicciones=predicciones)
+        return (
+            construir_informe_ml(lote_id, modelos=modelos, predicciones=predicciones),
+            tuple(predicciones),
+        )
+
+    async def _componer_ire_e_iee(
+        self,
+        lote_id: UUID,
+        vectores: list[FeatureVector],
+        metadata_por_suministro: dict[UUID, SuministroMetadataRow],
+        reglas: InformeReglas,
+        predicciones: tuple[PrediccionSuministro, ...],
+    ) -> tuple[InformeIRE, InformeIEE]:
+        """Etapas 7-8 (AI_ENGINE_SPEC.md §10/§11) -- THE convergence. Reuses `vectores` (Etapa
+        3-4), `reglas` (Etapa 5) and `predicciones` (Etapa 6) -- never recomputes a feature, a
+        rule hit, or an ML score.
+
+        **Computation order: 8 -> 7 (`domain/ire.py`'s module docstring).** The IEE is one of the
+        IRE's own 8 factors (weight 0.10, §10.1) -- `calcular_iee_kwh`/`normalizar_iee_lote` run
+        FIRST, THEN `componer_ire` consumes their normalized output. §3's pipeline diagram still
+        numbers the STAGES/tables 7 (`ire`) then 8 (`impacto_economico`) -- only the in-memory
+        computation is reordered, persistence stays atomic at the end either way.
+
+        **Anomalias dedup policy (§8/§10.3, `domain/ire.py`'s `debe_generar_anomalia_ml`).** Every
+        R1-R6 rule hit (Etapa 5) becomes its own `anomalias` row (canonical, causally explicable,
+        RN-012); an ADDITIONAL ML-only `'Patrón Irregular'` anomaly is generated ONLY when the ML
+        branch's OWN preliminary verdict (`predicciones.clasificacion`) is `"Crítico"` AND no rule
+        already fired for that suministro this lote -- never both for the same signal.
+
+        **Persistence (§14, mission directive #6) is ONE call** to `ResultadosIaRepository.
+        persistir` for the WHOLE lote (not per-suministro) -- that repository owns the exact
+        per-table write order (upsert `resultados_ia` -> backfill `feature_vectors.resultado_
+        ia_id` -> replace `anomalias` -> upsert `ire` -> upsert/soft-replace `impacto_economico`),
+        all in the SAME transaction as every other write this use case makes. Called even when
+        `vectores` is empty (mirrors `_ejecutar_isolation_forest`'s own always-call-to-clear-stale-
+        rows contract) so an Error-retry that ends up analyzing nothing still clears a previous
+        attempt's rows for this lote.
+        """
+        predicciones_por_suministro = {
+            prediccion.suministro_id: prediccion for prediccion in predicciones
+        }
+        suministros_con_hits = {entrada.suministro_id for entrada in reglas.suministros}
+        hits_por_suministro = {
+            entrada.suministro_id: entrada.hits for entrada in reglas.suministros
+        }
+
+        # Etapa 8 first (module docstring): per-suministro IEE, then the two per-lote
+        # normalizations `componer_ire` (Etapa 7) needs as precomputed inputs.
+        iees_por_suministro = {
+            vector.suministro_id: calcular_iee_kwh(vector) for vector in vectores
+        }
+        iees_normalizados = normalizar_iee_lote(iees_por_suministro)
+        consumo_promedio_normalizado = normalizar_consumo_promedio_lote(vectores)
+        # RN-012 fix: the TRUE percentile (`consumo_promedio` factor's explicability TEXT only,
+        # `domain/ire.py`'s `_factor_consumo_promedio` docstring) -- a SEPARATE per-lote
+        # normalization from `consumo_promedio_normalizado` above, which keeps driving the
+        # factor's WEIGHT unchanged.
+        consumo_promedio_percentil_real = calcular_percentil_real_consumo_promedio_lote(vectores)
+
+        entradas_persistencia: list[ResultadoIAParaGuardar] = []
+        entradas_informe: list[ResultadoSuministroParaInforme] = []
+        for vector in vectores:
+            suministro_id = vector.suministro_id
+            prediccion = predicciones_por_suministro[suministro_id]
+            metadata = metadata_por_suministro[suministro_id]
+
+            composicion = componer_ire(
+                vector,
+                ml_score_0_100=prediccion.ml_score_0_100,
+                iee_kwh=iees_por_suministro[suministro_id],
+                iee_normalizado_0_100=iees_normalizados[suministro_id],
+                consumo_promedio_normalizado_0_100=consumo_promedio_normalizado[suministro_id],
+                consumo_promedio_percentil_real=consumo_promedio_percentil_real[suministro_id],
+                categoria_nombre=metadata.categoria_tarifaria_nombre,
+            )
+
+            anomalias = [
+                AnomaliaParaGuardar(
+                    tipo=hit.tipo, severidad=hit.severidad, descripcion=hit.descripcion
+                )
+                for hit in hits_por_suministro.get(suministro_id, ())
+            ]
+            if debe_generar_anomalia_ml(
+                prediccion.clasificacion,
+                tiene_hits_reglas=suministro_id in suministros_con_hits,
+            ):
+                anomalias.append(
+                    AnomaliaParaGuardar(
+                        tipo="Patrón Irregular",
+                        severidad="Crítica",
+                        descripcion=(
+                            f"Score de anomalía del modelo {prediccion.scope}: "
+                            f"{prediccion.ml_score_0_100:.0f}/100 "
+                            "(aproximación por atribución de features)"
+                        ),
+                    )
+                )
+
+            observaciones = json.dumps(
+                [
+                    {
+                        "factor": factor.factor,
+                        "contribution": round(factor.contribution, 4),
+                        "reason": factor.reason,
+                    }
+                    for factor in composicion.factores
+                ],
+                ensure_ascii=False,
+            )
+
+            entradas_persistencia.append(
+                ResultadoIAParaGuardar(
+                    suministro_id=suministro_id,
+                    lote_id=lote_id,
+                    modelo_ia_id=prediccion.modelo_ia_id,
+                    prediccion_id=prediccion.id,
+                    score_anomalia=prediccion.score_crudo,
+                    probabilidad=prediccion.score_normalizado,
+                    clasificacion=composicion.clasificacion,
+                    observaciones=observaciones,
+                    ire_valor=composicion.ire_valor,
+                    iee_kwh=iees_por_suministro[suministro_id],
+                    anomalias=tuple(anomalias),
+                )
+            )
+            entradas_informe.append(
+                ResultadoSuministroParaInforme(
+                    suministro_id=suministro_id,
+                    numero_suministro=metadata.numero_suministro,
+                    composicion=composicion,
+                    iee_kwh=iees_por_suministro[suministro_id],
+                    anomalia_tipos=tuple(anomalia.tipo for anomalia in anomalias),
+                )
+            )
+
+        await self._resultados_ia_repository.persistir(lote_id, entradas_persistencia)
+
+        return (
+            construir_informe_ire(lote_id, entradas_informe),
+            construir_informe_iee(lote_id, entradas_informe),
+        )

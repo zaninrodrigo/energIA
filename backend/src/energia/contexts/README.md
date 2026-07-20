@@ -13,7 +13,7 @@ later remains possible without a redesign (ADR-006).
 | `clientes` | Gestión de Clientes | **Implemented** (US-001) |
 | `suministros` | Gestión de Suministros | **Implemented** (US-002) |
 | `consumos` | Gestión de Consumos | **Implemented, all 3 entities** (US-003 `Lectura`, US-005 `Lote de Facturación`, US-004 `Consumo` — Épica 1 complete) |
-| `motor` | Motor de Inteligencia Energética | **Implemented, Etapas 1-6** (US-006 + US-010 trigger, Épica 2 slice 1; US-007 duplicidades, slice 2; US-008 features + US-009 indicadores estadísticos, slice 3; reglas de negocio R1-R6, slice 4; US-011 Isolation Forest, slice 5; Etapas 7-8 not started) |
+| `motor` | Motor de Inteligencia Energética | **Implemented, Etapas 1-8 (Épica 2 complete)** (US-006 + US-010 trigger, slice 1; US-007 duplicidades, slice 2; US-008 features + US-009 indicadores estadísticos, slice 3; reglas de negocio R1-R6, slice 4; US-011 Isolation Forest, slice 5; composición del IRE + Impacto Económico Estimado (IEE), THE convergence, slice 6) |
 | `risk` | Gestión del Riesgo | Not started |
 | `inspections` | Gestión de Inspecciones | Not started |
 | `dashboard` | Dashboard Ejecutivo | Not started |
@@ -391,10 +391,11 @@ foreign-key reference the way there is for a numeric average.
 ## The `motor` context
 
 `motor` (DOMAIN_MODEL.md §4.4, "Motor de Inteligencia Energética") is the fourth bounded context
-to land, Épica 2 slices 1-5 (US-006 + US-010 trigger, Etapa 1 — validación de integridad; US-007,
-Etapa 2 — detección de duplicidades; US-008 + US-009, Etapas 3-4 — generación de features +
-indicadores estadísticos; reglas de negocio, Etapa 5; US-011, Etapa 6 — Isolation Forest; Etapas
-7-8 of `docs/04-ai/AI_ENGINE_SPEC.md` §3 are not started).
+to land, Épica 2 complete, all 6 slices (US-006 + US-010 trigger, Etapa 1 — validación de
+integridad; US-007, Etapa 2 — detección de duplicidades; US-008 + US-009, Etapas 3-4 — generación
+de features + indicadores estadísticos; reglas de negocio, Etapa 5; US-011, Etapa 6 — Isolation
+Forest; composición del IRE (Etapa 7) + Impacto Económico Estimado (Etapa 8), the convergence,
+`docs/04-ai/AI_ENGINE_SPEC.md` §3/§10/§11/§14).
 Package name: `motor`, the
 short Spanish domain noun itself (the same naming convention `clientes`/`suministros`/`consumos`
 already established), superseding the `intelligence_engine` placeholder this table used before
@@ -503,6 +504,35 @@ bounded context from `motor` (§4.4), even though both share the same physical `
   the above over the SAME non-excluded, vector-bearing population Etapa 5 already evaluated —
   reusing those vectors, never recomputing features — and NEVER influences `estado_final`, the
   same "compute + persist, never gate" policy every stage after Etapa 1 already established.
+- **Etapas 7-8 — Composición del IRE + Impacto Económico Estimado (`AI_ENGINE_SPEC.md` §10/§11/
+  §14) — THE convergence.** `motor/domain/ire.py` is pure: the IEE (`calcular_iee_kwh`, kWh, DEC-
+  017) and its per-lote min-max normalization run FIRST (`normalizar_iee_lote`), THEN the 8-factor
+  IRE composition (`componer_ire`, §10.1) consumes it — the IEE is one of the IRE's own factors
+  (weight 0.10), so it must be computed before, not after, despite §3's diagram numbering the
+  STAGES the other way around (persistence stays atomic either way). The "inspecciones anteriores"
+  factor (weight 0.08, always 0 in v1 — no `feedback_modelo` data exists yet) has its weight
+  redistributed PROPORTIONALLY among the other 7 (`redistribuir_pesos`), per §10.1's own explicit
+  note. Per-factor [0,100] normalizations (z-score cap, persistence formula, variación cap,
+  categoria criticidad lookup) are v1 implementation constants, calibration-pending like every
+  other threshold in this bounded context (`AI_ENGINE_SPEC.md` §10.4). `bandear_clasificacion`
+  (Etapa 6's own DEC-015 banding) is REUSED, not reimplemented, for `resultados_ia.clasificacion` —
+  single source of truth between the ML branch's own preliminary verdict and the composed IRE's
+  final one. `debe_generar_anomalia_ml` implements the v1 ML-only anomaly policy (§8/§10.3): a
+  suministro whose ML score ALONE lands `"Crítico"` AND breaches no R1-R6 rule gets one
+  `'Patrón Irregular'` anomaly (rule hits are canonical, never duplicated by this policy).
+  `motor/infrastructure/resultados_ia_repository.py` (`SqlResultadosIaRepository`) is THE
+  convergence write, one call for the whole lote: upsert `resultados_ia` (by `(suministro_id,
+  lote_id)`, RD-023, one row RETURNING per suministro — the same per-row `RETURNING` discipline
+  `modelos_ia_repository.py` already established, for the same reason: a raw multi-row `INSERT ...
+  RETURNING` cannot be safely correlated back to its own input rows), backfill
+  `feature_vectors.resultado_ia_id` (nullable FK filled in here, §14's write order), soft-delete-
+  then-insert `anomalias` (mirrors `predicciones`' own reasoning — no natural key to upsert
+  against), upsert `ire` (1:1, `uq_ire_resultado_ia`), and soft-delete-then-CONDITIONAL-insert
+  `impacto_economico` (`None` IEE, cold-start, means NO row — the one hybrid of the two
+  strategies, since a plain upsert cannot express "this row should stop existing" across a
+  retry). `ProcesarLote._componer_ire_e_iee` orchestrates all of the above over the SAME
+  population Etapa 6 scored, reusing `vectores`/`reglas`/`predicciones` — and, like every stage
+  after Etapa 1, NEVER influences `estado_final`.
 
 ### Single-transaction atomicity, no explicit locking
 

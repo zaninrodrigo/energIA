@@ -139,6 +139,49 @@ class InformeMLSchema(BaseModel):
     top_10: list[PrediccionResumenSchema]
 
 
+class DistribucionIRESchema(BaseModel):
+    minimo: int
+    p50: float
+    p95: float
+    maximo: int
+
+
+class TopFactorSchema(BaseModel):
+    factor: str
+    contribution: float
+
+
+class IreSuministroResumenSchema(BaseModel):
+    suministro_id: str
+    numero_suministro: str
+    ire: int
+    nivel: str
+    clasificacion: str
+    top_factores: list[TopFactorSchema]
+
+
+class InformeIRESchema(BaseModel):
+    lote_id: str
+    suministros_evaluados: int
+    distribucion: DistribucionIRESchema | None
+    conteo_por_nivel: dict[str, int]
+    top_10: list[IreSuministroResumenSchema]
+    anomalias_persistidas_por_tipo: dict[str, int]
+
+
+class IeeSuministroResumenSchema(BaseModel):
+    suministro_id: str
+    numero_suministro: str
+    iee_kwh: float
+
+
+class InformeIEESchema(BaseModel):
+    lote_id: str
+    total_kwh_estimado: float
+    suministros_con_iee: int
+    top_5: list[IeeSuministroResumenSchema]
+
+
 class ProcesarLoteResponseSchema(BaseModel):
     estado_final: str
     informe: InformeValidacionSchema
@@ -146,3 +189,5 @@ class ProcesarLoteResponseSchema(BaseModel):
     features: ResumenFeaturesSchema
     reglas: InformeReglasSchema
     ml: InformeMLSchema
+    ire: InformeIRESchema
+    iee: InformeIEESchema
