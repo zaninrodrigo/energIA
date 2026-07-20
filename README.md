@@ -1,135 +1,122 @@
 # EnergIA
 
-Plataforma de inteligencia operacional que detecta consumos eléctricos anómalos y prioriza inspecciones técnicas mediante reglas de negocio, estadística e Inteligencia Artificial.
+**Plataforma de soporte a la decisión que detecta consumos eléctricos anómalos y prioriza inspecciones técnicas**, combinando reglas de negocio, análisis estadístico e Inteligencia Artificial. Para cada suministro calcula un Índice de Riesgo Energético (IRE, 0-100) y un Impacto Económico Estimado (IEE), y produce un ranking de inspección que explica, factor por factor, por qué cada medidor es sospechoso.
 
-## Problema y solución
+Está construida para una distribuidora eléctrica: procesa los datos de facturación por lotes, analiza el histórico de cada medidor y le dice al equipo técnico **a qué inspeccionar primero y por qué** — sin reemplazar el criterio del inspector, sino ordenándole el trabajo.
 
-Las distribuidoras eléctricas administran cientos de miles de suministros cuyos consumos se actualizan en cada lote de facturación. Analizar manualmente esos volúmenes para detectar anomalías es lento, depende de la experiencia de cada operador y suele derivar en inspecciones sobre suministros de bajo impacto mientras casos relevantes pasan desapercibidos.
+---
 
-EnergIA incorpora un Motor de Inteligencia Energética que analiza automáticamente cada consumo procesado, combinando reglas de negocio del dominio eléctrico, análisis estadístico de históricos e Isolation Forest (Scikit-Learn). Con ese análisis calcula, para cada suministro, un Índice de Riesgo Energético (IRE, escala 0-100) y un Impacto Económico Estimado (IEE), y genera un ranking priorizado de inspecciones que se integra con el sistema de RRHH para crear órdenes de trabajo. El objetivo es asistir la toma de decisiones de analistas e inspectores, no reemplazar su criterio técnico.
+## Qué hace hoy
 
-## Estado del proyecto
+El sistema funciona de punta a punta: un lote de facturación entra crudo y sale con cada medidor puntuado, clasificado y georreferenciado.
 
-Sprint 0 — esqueleto de backend y frontend. El repositorio contiene la especificación funcional, de negocio, de arquitectura y de dominio, el andamiaje inicial del backend (FastAPI, Clean Architecture, endpoint de salud, cobertura de tests ≥ 90%) sobre el cual se construirán los bounded contexts, y ahora también el andamiaje inicial del frontend (Vite, React, TypeScript, cobertura de tests ≥ 85% según RNF-006) con un primer recorrido vertical funcional: listado paginado de suministros contra la API real.
-
-## Mapa de documentación
-
-| Carpeta | Documentos | Estado |
-|---|---|---|
-| `docs/01-business` | PRODUCT_VISION.md, BUSINESS_ANALYSIS.md | Completo / Borrador |
-| `docs/02-requirements` | SOFTWARE_REQUIREMENTS_SPECIFICATION.md, USER_STORIES.md, ACCEPTANCE_CRITERIA.md | Completo |
-| `docs/03-architecture` | DOMAIN_MODEL.md, DATABASE_DESIGN.md, SOFTWARE_ARCHITECTURE_DOCUMENT.md, API_SPEC.md | Completo / Completo / Esqueleto / Pendiente |
-| `docs/04-ai` | AI_ENGINE_SPEC.md, DATA_SCIENCE_NOTEBOOK.md | Pendiente |
-| `docs/05-devops` | SECURITY_SPEC.md, TESTING_SPEC.md, DEPLOYMENT_SPEC.md, ROADMAP.md | Pendiente |
-
-Para el detalle de estado de cada documento y la deuda documental conocida, ver [`PROJECT_MASTER_SPEC.md`](./PROJECT_MASTER_SPEC.md).
-
-## Stack planificado
-
-- **Backend:** Python, FastAPI
-- **Frontend:** React, TypeScript
-- **Base de datos:** PostgreSQL
-- **Inteligencia Artificial:** Scikit-Learn, Isolation Forest
-- **Contenedores:** Docker
-- **Testing:** Pytest, Playwright
-- **Origen de datos:** Oracle (facturación por lotes)
-- **Arquitectura:** Clean Architecture + Domain-Driven Design
-
-## Base de datos local
-
-PostgreSQL 16 corre en Docker para desarrollo local. El DDL ejecutable (24 tablas, particionado de `consumos`, restricciones CHECK mapeadas a invariantes de dominio) vive en [`docker/postgres/init/`](./docker/postgres/init/); las decisiones detrás de ese diseño están documentadas en [`docs/03-architecture/DATABASE_DESIGN.md`](./docs/03-architecture/DATABASE_DESIGN.md).
-
-Requisitos: Docker y Docker Compose.
-
-```bash
-cp env.example .env        # ajustar credenciales si hace falta
-docker compose up -d db
-docker compose ps           # esperar "healthy"
-```
-
-Conexión (puerto host **5434**, no 5432 — ver DATABASE_DESIGN.md §2):
-
-```bash
-psql -h localhost -p 5434 -U energia -d energia
-# o sin instalar psql en el host:
-docker exec -it energia-db psql -U energia -d energia
-```
-
-## Backend
-
-API FastAPI (Clean Architecture + DDD, ver `docs/03-architecture/adr/ADR-001` y siguientes). Requiere Python 3.12 y la base de datos local levantada (sección anterior).
-
-```bash
-cd backend
-make install   # crea .venv e instala el proyecto en modo editable con dependencias de dev
-make test      # unit + integration, con gate de cobertura del 90%
-make run       # uvicorn con reload en http://localhost:8000
-```
-
-Detalle completo (targets de Makefile, estructura, variables de entorno) en [`backend/README.md`](./backend/README.md).
-
-## Frontend
-
-Aplicación React + TypeScript (Vite), con un primer recorrido vertical completo: listado paginado
-de suministros contra la API real (`GET /api/v1/suministros`). Requiere Node 22 y pnpm.
-
-```bash
-cd frontend
-pnpm install
-pnpm dev     # http://localhost:5173 (por defecto apunta a http://localhost:8000)
-```
-
-Detalle completo (scripts disponibles, variables de entorno, arquitectura, estrategia de testing,
-cómo probar contra el backend real sin CORS) en [`frontend/README.md`](./frontend/README.md).
-
-## Datos sintéticos
-
-`backend/src/energia/tools/synthetic/` genera un dataset determinístico de clientes,
-suministros, lecturas y consumos, y lo carga en una instancia de EnergIA a través de su propia
-API de importación (no escribe directo a la base). Sirve para tener datos de prueba realistas
-—con estacionalidad, tendencia y anomalías de consumo conocidas— sin depender de acceso a Oracle
-(todavía no existe, ADR-004) ni de un archivo histórico real.
-
-**Uso rápido** (con la API corriendo, `cd backend && make run` en otra terminal):
-
-```bash
-cd backend
-make seed-synthetic BASE_URL=http://localhost:8000 SCALE=small SEED=42
-```
-
-| Concepto | Qué es |
+| Capacidad | Detalle |
 |---|---|
-| `--scale` | Tamaño del dataset: `small` (100 suministros/24 meses), `medium` (1000/36), `large` (5000/36) |
-| `--seed` | Semilla determinística: misma semilla + escala → mismo dataset y manifiesto, byte a byte. Cada identidad natural (`numero_suministro`, `numero_cliente`, `codigo_lote`) incluye la semilla (p. ej. `SYN-S42-SUM-00001`), así que dos semillas distintas nunca colisionan ni se pisan entre sí al cargarse contra la misma instancia |
-| Anomalías de fuerza de regla | `sudden_drop` (caída 60-80%, permanente), `zero_consumption_streak` (3-6 meses en cero), `gradual_decline` (-5%/mes durante 12 meses), `spike` (un mes 3-5x, no fraudulento) — cada una calibrada para disparar, con margen, alguna regla R1/R2/R3 (`AI_ENGINE_SPEC.md` sec. 8) |
-| Anomalías sub-umbral | `sudden_drop_leve` (caída 30-50%, deliberadamente por debajo del -60% de R2) y `spike_leve` (multiplicador 1.8-2.6x, por debajo del +200% de R3) — a estas solo las puede detectar el motor estadístico o Isolation Forest, nunca las reglas de negocio; existen para aislar el aporte real de esas dos ramas del motor |
-| `manifest.json` | Ground truth: qué suministro recibió qué anomalía, en qué período y con qué parámetros — se escribe en `datasets/synthetic/<scale>-seed<seed>/manifest.json`. Para `sudden_drop(_leve)`/`spike(_leve)`, `parametros.pct_change_first_month` es el cambio porcentual REALIZADO (calculado directo de los `kwh` persistidos, nunca a partir del parámetro sorteado), para que ningún consumidor de calibración tenga que re-derivarlo |
+| **Importación de datos** | Clientes, suministros, lecturas, consumos y lotes se cargan por API, con validación e idempotencia (una re-importación no duplica ni corrompe). |
+| **Motor de Inteligencia Energética** | Pipeline de 8 etapas: validación de integridad → detección de duplicidades → 17 features → indicadores estadísticos → reglas de negocio → Isolation Forest → composición del IRE → estimación del IEE. |
+| **Ranking de riesgo** | Los suministros de un lote procesado se ordenan por IRE descendente: la lista priorizada de inspección (RN-009). |
+| **Explicabilidad (RN-012)** | Cada puntaje trae su desglose: qué factor aportó cuántos puntos y por qué, con el aporte del modelo de IA marcado honestamente como aproximación. |
+| **Mapa de riesgo** | Los medidores se grafican geolocalizados, coloreados y dimensionados por su nivel de riesgo. |
+| **Riesgo por barrio** | Vista agregada por localidad y barrio, coloreada por su medidor de mayor potencial — para decidir a qué zona mandar la cuadrilla. |
 
-El manifiesto es lo que le da valor al dataset: al no depender de datos reales etiquetados
-(que no existen todavía), es la única forma de saber con certeza qué debería detectar el Motor
-de Inteligencia Energética al procesar este dataset — la referencia para calibrar y probar sus
-Etapas 3 a 6 (reglas de negocio, estadística e Isolation Forest, `docs/04-ai/AI_ENGINE_SPEC.md`
-secciones 6 a 9) antes de tener datos de producción reales.
+Tres pantallas web consumen todo esto: **Suministros**, **Ranking de Riesgo** (con mapa) y **Riesgo por Barrio**.
 
-Detalle completo (flags, estructura de módulos) en [`backend/README.md`](./backend/README.md).
+---
+
+## Cómo verlo funcionar
+
+Requisitos: Docker, Python 3.12, Node 22 y pnpm.
+
+```bash
+# 1. Base de datos (PostgreSQL 16 en Docker, puerto host 5434)
+cp env.example .env
+docker compose up -d db
+
+# 2. Backend (FastAPI) — en una terminal
+cd backend && make install && make run       # http://localhost:8000
+
+# 3. Datos de prueba con anomalías conocidas — en otra terminal
+cd backend && make seed-synthetic BASE_URL=http://localhost:8000 SCALE=small SEED=42
+
+# 4. Procesar algunos lotes por el motor (para poblar el ranking)
+curl -X POST http://localhost:8000/api/v1/motor/lotes/LOTE-SYN-S42-2023-07/procesar
+
+# 5. Frontend — en otra terminal
+cd frontend && pnpm install && pnpm dev       # http://localhost:5173
+```
+
+Abrí **http://localhost:5173**, entrá a **Ranking de Riesgo**, elegí un lote y hacé clic en el medidor de mayor riesgo del mapa: se abre el desglose de por qué fue marcado. Ese panel es el corazón del sistema.
+
+Guías detalladas: [`backend/README.md`](./backend/README.md) · [`frontend/README.md`](./frontend/README.md).
+
+---
+
+## Cómo funciona por dentro
+
+- **Arquitectura:** Clean Architecture + Domain-Driven Design. Cada bounded context (clientes, suministros, consumos, motor) tiene sus capas de dominio, aplicación, infraestructura y presentación. Las decisiones están registradas como ADR en [`docs/03-architecture/adr/`](./docs/03-architecture/adr/).
+- **Motor híbrido:** reglas explícitas (auditables), estadística (z-score, percentiles de cohorte) e Isolation Forest no supervisado convergen en el IRE. El diseño completo, con sus 18 decisiones validadas, está en [`docs/04-ai/AI_ENGINE_SPEC.md`](./docs/04-ai/AI_ENGINE_SPEC.md).
+- **Datos sintéticos con verdad conocida:** el generador ([`backend/src/energia/tools/synthetic/`](./backend/src/energia/tools/synthetic/)) crea medidores con estacionalidad, tendencia y anomalías plantadas, y escribe un `manifest.json` con qué anomalía tiene cada suministro. Es la referencia para medir cuánto detecta el motor sin depender de datos reales etiquetados (que todavía no existen).
+
+**Stack:** Python/FastAPI · React/TypeScript/Vite · PostgreSQL 16 · Scikit-Learn (Isolation Forest) · Docker · Pytest/Playwright · Leaflet (mapas).
+
+---
+
+## Calidad
+
+| Métrica | Estado |
+|---|---|
+| Tests backend | ~965, gate de cobertura 90% |
+| Tests frontend | 169, gate de cobertura 85% (RNF-006) |
+| Integración continua | GitHub Actions (backend + frontend) en cada push |
+| Base de datos | DDL ejecutable, 24 tablas, restricciones CHECK mapeadas a invariantes de dominio |
+
+Todo el código pasó por desarrollo dirigido por tests (TDD) y por una revisión adversarial de contexto fresco antes de integrarse.
+
+---
+
+## Estado y alcance
+
+El sistema está **funcionando de punta a punta**. Para ser transparente sobre qué es permanente y qué es andamiaje de demostración:
+
+- **Permanente:** toda la arquitectura, el motor de IA, la base de datos, los endpoints y las pantallas.
+- **Datos de demostración:** los medidores, sus números de rutafolio, sus coordenadas de Formosa y sus barrios son sintéticos (generados/rellenados), a la espera de los datos reales de producción.
+
+**Pendientes conocidos** (ninguno bloquea la operación; detalle en [`PROJECT_MASTER_SPEC.md`](./PROJECT_MASTER_SPEC.md)):
+
+1. Integrar rutafolio, georreferencia y barrio al pipeline de importación (hoy se cargan por backfill).
+2. Recalibrar los pesos del IRE con datos reales (DEC-014).
+3. Definir la matriz de roles y permisos al implementar autenticación.
+
+---
+
+## Documentación
+
+Índice completo y estado de cada documento en [`PROJECT_MASTER_SPEC.md`](./PROJECT_MASTER_SPEC.md).
+
+| Carpeta | Contenido | Estado |
+|---|---|---|
+| `docs/01-business` | Visión de producto, análisis de negocio, reglas de negocio | Completo |
+| `docs/02-requirements` | SRS (IEEE 29148), historias de usuario, criterios de aceptación | Completo |
+| `docs/03-architecture` | Modelo de dominio, diseño de base de datos, ADRs, especificación de API | Completo / DDL ejecutable / 7 ADR aceptados |
+| `docs/04-ai` | Especificación del Motor de Inteligencia Energética | Aceptado (v1.0.0) |
+| `docs/05-devops` | Seguridad, testing, despliegue, roadmap | Pendiente |
+
+---
 
 ## Estructura del repositorio
 
 ```
 energIA/
-├── backend/           # API FastAPI (Clean Architecture + DDD) — esqueleto Sprint 0
-├── frontend/          # Aplicación React/TypeScript (Vite) — esqueleto Sprint 0
-├── docker/            # Definiciones de contenedores y orquestación local
-├── datasets/          # Muestras de datos (los datasets crudos no se versionan)
-├── diagrams/          # Diagramas de arquitectura y de dominio
-├── scripts/           # Scripts de soporte (ETL, utilidades)
+├── backend/                # API FastAPI (Clean Architecture + DDD) + motor de IA + generador sintético
+├── frontend/               # Aplicación React/TypeScript (Vite): 3 pantallas con mapas
+├── docker/                 # PostgreSQL local + DDL ejecutable (docker/postgres/init/)
 ├── docs/
-│   ├── 01-business/       # Visión de producto y análisis de negocio
-│   ├── 02-requirements/   # SRS, historias de usuario, criterios de aceptación
-│   ├── 03-architecture/   # Modelo de dominio, base de datos, arquitectura, API
-│   ├── 04-ai/              # Motor de IA y análisis de datos
-│   └── 05-devops/         # Seguridad, testing, despliegue, roadmap
-├── PROJECT_MASTER_SPEC.md # Índice maestro de toda la documentación
-├── CLAUDE.md              # Instrucciones para asistentes de IA que trabajen en el repositorio
+│   ├── 01-business/            # Visión de producto y análisis de negocio
+│   ├── 02-requirements/        # SRS, historias de usuario, criterios de aceptación
+│   ├── 03-architecture/        # Dominio, base de datos, arquitectura, API, ADRs
+│   ├── 04-ai/                  # Especificación del motor de IA
+│   └── 05-devops/              # Seguridad, testing, despliegue, roadmap
+├── PROJECT_MASTER_SPEC.md  # Índice maestro de documentación y deuda conocida
+├── CLAUDE.md               # Instrucciones para asistentes de IA que trabajen en el repositorio
 └── README.md
 ```
