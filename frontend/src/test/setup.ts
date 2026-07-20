@@ -13,7 +13,7 @@ vi.mock("leaflet", () => {
   const heat = { addTo: () => heat, setLatLngs: () => heat };
   const group = { addTo: () => group, clearLayers: () => group, addLayer: () => group };
   const marker = { bindPopup: () => marker, on: () => marker, addTo: () => marker };
-  const map = { setView: () => map, remove: () => undefined };
+  const map = { setView: () => map, fitBounds: () => map, remove: () => undefined };
   const tile = { addTo: () => tile };
   return {
     default: {
@@ -22,6 +22,7 @@ vi.mock("leaflet", () => {
       layerGroup: () => group,
       circleMarker: () => marker,
       heatLayer: () => heat,
+      latLngBounds: () => ({}),
     },
   };
 });

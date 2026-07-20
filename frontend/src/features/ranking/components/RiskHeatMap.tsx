@@ -87,10 +87,12 @@ export function RiskHeatMap({ items, onSelect }: RiskHeatMapProps) {
     }
 
     markers.clearLayers();
+    const latlngs: Array<[number, number]> = [];
     for (const item of items) {
       if (item.latitud === null || item.longitud === null) {
         continue;
       }
+      latlngs.push([item.latitud, item.longitud]);
       const marker = L.circleMarker([item.latitud, item.longitud], {
         radius: nivelToMarkerRadius(item.ire_nivel),
         color: "#ffffff",
@@ -101,6 +103,14 @@ export function RiskHeatMap({ items, onSelect }: RiskHeatMapProps) {
       marker.bindPopup(popupHtml(item));
       marker.on("click", () => onSelectRef.current?.(item));
       marker.addTo(markers);
+    }
+
+    // Frame whatever is currently shown: the demo's meters span several Formosa towns (Formosa
+    // capital, Clorinda, Pirané, El Colorado), so a fixed center/zoom would leave most off-screen;
+    // filtering by nivel can also narrow the set to a single town. Falls back to nothing (keeping
+    // the initial Formosa-centered view) when no row is georeferenced.
+    if (latlngs.length > 0) {
+      map.fitBounds(L.latLngBounds(latlngs), { padding: [30, 30], maxZoom: 13 });
     }
   }, [items]);
 
