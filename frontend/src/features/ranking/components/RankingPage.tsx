@@ -100,9 +100,13 @@ export function RankingPage() {
             <>
               <div className="flex flex-col gap-2">
                 <h2 className="text-sm font-semibold text-slate-700">
-                  Ubicación de los medidores (mapa de calor por riesgo)
+                  Ubicación de los medidores por riesgo
                 </h2>
-                <RiskHeatMap items={rankingQuery.data.items} />
+                <p className="text-xs text-slate-500">
+                  Cada punto es un medidor: más grande y rojo, mayor riesgo. Haga clic en uno para
+                  ver por qué fue marcado.
+                </p>
+                <RiskHeatMap items={rankingQuery.data.items} onSelect={setSelectedItem} />
               </div>
               <RankingTable items={rankingQuery.data.items} onSelect={setSelectedItem} />
             </>

@@ -7,11 +7,11 @@ import { RiskHeatMap } from "./RiskHeatMap";
 // can't provide). These tests verify the component mounts and exposes an accessible figure; the
 // row→point math it feeds Leaflet is covered for real in heatPoints.test.ts.
 describe("RiskHeatMap", () => {
-  it("renders an accessible map figure", () => {
+  it("renders an accessible map figure with a legend", () => {
     render(<RiskHeatMap items={rankingFixture.items} />);
-    expect(
-      screen.getByRole("figure", { name: /mapa de calor de riesgo/i }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("figure", { name: /mapa de riesgo/i })).toBeInTheDocument();
+    // The legend spells out the color scale (addresses "the map isn't clear").
+    expect(screen.getByText("Crítico")).toBeInTheDocument();
   });
 
   it("mounts without crashing when there are no georeferenced rows", () => {
