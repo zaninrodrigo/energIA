@@ -708,12 +708,114 @@ Por último corre la Etapa 6 (§9, Isolation Forest, US-011/RF-006): agrupa los 
 
 **Idempotencia y concurrencia**: una segunda solicitud sobre un lote ya `Procesado` responde 409 (RD-010). Una solicitud concurrente contra el MISMO lote `Pendiente`/`Error` se resuelve por una transición optimista (`UPDATE ... WHERE estado IN (...)`, AI_ENGINE_SPEC.md §2.3): solo una gana la carrera hacia `Procesando`, la otra recibe 409. Un lote que aterrizó en `Error` admite reintento (`Error → Procesando`, decisión de negocio 2026-07-13): una nueva solicitud vuelve a correr los chequeos desde cero.
 
+### GET /api/v1/motor/lotes/{codigo_lote}/resultados
+
+El ranking IRE de un lote ya procesado — la fuente de datos del dashboard: prioriza inspecciones por IRE descendente (RN-009, `BUSINESS_ANALYSIS.md` §15: "las inspecciones deberán priorizarse según el IRE y el Impacto Económico Estimado"). Lee el lado de escritura de Etapas 7-8 (`resultados_ia` + `ire` + `anomalias` + `impacto_economico`), unido a `suministros`/`categorias_tarifarias` solo para mostrar campos de contexto (localidad, categoría). Set-based: una consulta con joins + agregación JSON para `anomalias` (nunca N+1).
+
+**Path param**:
+
+| Parámetro | Tipo | Notas |
+|---|---|---|
+| `codigo_lote` | string | Clave natural del `Lote` (`lotes.codigo_lote`) |
+
+**404 vs. un 200 vacío — la distinción que importa acá.** 404 solo cuando `codigo_lote` no resuelve a ningún `lotes` no soft-deleted (mismo lookup que usa `POST .../procesar`). Un lote que EXISTE pero todavía no tiene filas `resultados_ia` (importado pero no procesado — sigue `Pendiente`; o procesado antes de que existiera la Etapa 7) es un lote REAL con un ranking VACÍO — 200, `items: []`, `total: 0`, `resumen.total_resultados: 0` — nunca 404: el lote no está "no encontrado", está "todavía no analizado".
+
+**Query params**:
+
+| Parámetro | Tipo | Default | Notas |
+|---|---|---|---|
+| `limit` | integer | 50 | Rango 1-200 |
+| `offset` | integer | 0 | ≥ 0 |
+| `nivel` | string \| null | (ninguno) | Filtra por `ire.nivel` (columna generada, §10.2). Una de las 5 bandas exactas: `"Muy Bajo"`, `"Bajo"`, `"Medio"`, `"Alto"`, `"Crítico"` — cualquier otro valor responde 422 (enum de Pydantic, ver más abajo) |
+| `clasificacion` | string \| null | (ninguno) | Filtra por `resultados_ia.clasificacion` (DEC-015 aplicado al IRE compuesto). Una de las 4 bandas exactas: `"Normal"`, `"Atención"`, `"Alto Riesgo"`, `"Crítico"` — cualquier otro valor responde 422 |
+
+Ambos filtros afectan `items`/`total`. **`resumen` NUNCA cambia con los filtros** — ver más abajo.
+
+**Response 200** — ejemplo real (dataset sintético, semilla 42, `LOTE-SYN-S42-2022-07`, `?limit=1`):
+
+```json
+{
+  "items": [
+    {
+      "suministro_id": "a1efd6d0-...-...",
+      "numero_suministro": "SYN-S42-SUM-00070",
+      "ire_valor": 70,
+      "ire_nivel": "Alto",
+      "clasificacion": "Alto Riesgo",
+      "score_anomalia": -0.034,
+      "probabilidad": 0.9696,
+      "localidad": "Formosa",
+      "categoria_tarifaria": "Industrial",
+      "anomalias": [
+        {
+          "tipo": "Patrón Irregular",
+          "severidad": "Crítica",
+          "descripcion": "Score de anomalía del modelo global: 97/100 (aproximación por atribución de features)"
+        }
+      ],
+      "observaciones": [
+        { "factor": "score_ia", "contribution": 31.6189, "reason": "Score del modelo de IA: 97.0/100 (aproximación por atribución de features)" },
+        { "factor": "historial_consumos", "contribution": 4.2354, "reason": "Desviación de -1.30 desvíos estándar respecto de la línea base histórica" },
+        { "factor": "persistencia_anomalias", "contribution": 16.3043, "reason": "5 anomalía(s) previa(s) registrada(s) y racha actual de 0 período(s) consecutivos en cero consumo" },
+        { "factor": "variacion_porcentual", "contribution": 0.172, "reason": "Variación de -3% respecto de el período anterior" },
+        { "factor": "impacto_economico", "contribution": 10.8696, "reason": "Impacto económico estimado: 1067.3 kWh no facturados" },
+        { "factor": "consumo_promedio", "contribution": 4.1818, "reason": "Consumo promedio de 8886.4 kWh (percentil 95 respecto del lote)" },
+        { "factor": "categoria_tarifaria", "contribution": 2.9348, "reason": "Categoría tarifaria Industrial (criticidad 90/100)" }
+      ],
+      "iee_kwh": 1067.34
+    }
+  ],
+  "total": 94,
+  "limit": 1,
+  "offset": 0,
+  "resumen": {
+    "total_resultados": 94,
+    "conteo_por_nivel": { "Muy Bajo": 70, "Bajo": 17, "Medio": 2, "Alto": 5, "Crítico": 0 },
+    "conteo_por_clasificacion": { "Normal": 70, "Atención": 17, "Alto Riesgo": 7, "Crítico": 0 },
+    "con_anomalias": 9,
+    "suma_iee_kwh": 16181.36
+  }
+}
+```
+
+| Campo | Tipo | Notas |
+|---|---|---|
+| `items` | array | Una fila por suministro analizado en este lote, ordenadas por `ire_valor` DESCENDENTE (RN-009), `numero_suministro` ascendente como desempate determinístico. Página según `limit`/`offset`, filtrada según `nivel`/`clasificacion` |
+| `items[].ire_valor` | integer | El IRE compuesto (§10.1), ya redondeado (half-up) — igual semántica que `ire.top_10[].ire` del endpoint `POST /procesar` |
+| `items[].ire_nivel` | string | Las 5 bandas de la columna generada `ire.nivel` (§10.2) |
+| `items[].clasificacion` | string | DEC-015 aplicado al IRE compuesto — `resultados_ia.clasificacion` |
+| `items[].score_anomalia` | number \| null | Score crudo de Isolation Forest (`decision_function`, `resultados_ia.score_anomalia`) — puede ser negativo |
+| `items[].probabilidad` | number \| null | Probabilidad normalizada [0,1] de Etapa 6 (`resultados_ia.probabilidad`) |
+| `items[].localidad` | string \| null | De `suministros.localidad` |
+| `items[].categoria_tarifaria` | string | Nombre de `categorias_tarifarias` (no el UUID) |
+| `items[].anomalias` | array | Filas de `anomalias` para este `resultados_ia` (excluye soft-deleted): `{ "tipo", "severidad", "descripcion" }` |
+| `items[].observaciones` | array | El desglose de explicabilidad DEC-016, **ya parseado** en objetos estructurados desde el JSON almacenado en `resultados_ia.observaciones` (texto) — nunca se devuelve el texto crudo. Cada entrada: `{ "factor", "contribution", "reason" }`. Un valor corrupto/no parseable devuelve `[]` defensivamente (lectura sobre datos ya persistidos: nunca debería pasar en la práctica, pero una fila corrupta no debe romper el ranking completo) |
+| `items[].iee_kwh` | number \| null | De `impacto_economico.monto_estimado` donde `moneda = 'kWh'`; `null` cuando el suministro no tiene fila (cold-start, sin IEE calculado en Etapa 7-8) — nunca un `0.0` fabricado |
+| `total` | integer | Cantidad de resultados que matchean los filtros aplicados (`nivel`/`clasificacion`) — metadata de paginación, misma convención que el resto de los endpoints de listado |
+| `resumen` | object | Contadores del lote COMPLETO — ver nota debajo |
+| `resumen.total_resultados` | integer | Cantidad TOTAL de `resultados_ia` de este lote, sin filtrar — deliberadamente un nombre de campo distinto al `total` de más arriba (que sí refleja los filtros), para no confundir los dos en el mismo payload |
+| `resumen.conteo_por_nivel` | object | Conteo por cada una de las 5 bandas de `ire.nivel`: `{ "Muy Bajo": n, "Bajo": n, "Medio": n, "Alto": n, "Crítico": n }` |
+| `resumen.conteo_por_clasificacion` | object | Conteo por cada una de las 4 bandas de `resultados_ia.clasificacion`: `{ "Normal": n, "Atención": n, "Alto Riesgo": n, "Crítico": n }` |
+| `resumen.con_anomalias` | integer | Cuántos suministros de este lote tienen al menos una fila `anomalias` activa |
+| `resumen.suma_iee_kwh` | number | Suma de `iee_kwh` de todos los suministros de este lote con IEE (los cold-start sin fila contribuyen `0`) |
+
+**`resumen` es SIEMPRE del lote completo, sin filtrar.** Es la misma convención que la mayoría de los dashboards usa para sus tarjetas de resumen: filtrar la tabla (`?nivel=Alto`) no debe hacer que las tarjetas de resumen "salten" a mostrar solo el subconjunto filtrado — confirmado contra el dataset real de arriba: sin filtro, `total: 94`; con `?nivel=Alto`, `total: 5` pero `resumen.total_resultados` se mantiene en `94`.
+
+**Errores**:
+
+| Código | Causa |
+|---|---|
+| 404 | No existe un lote (no soft-deleted) con ese `codigo_lote`. |
+| 422 | `nivel` o `clasificacion` fuera del enum cerrado que cada uno declara (ver la tabla de query params arriba). |
+
+**Todas las tablas unidas excluyen soft-deleted** (`deleted_at IS NULL`): `resultados_ia`, `suministros`, `categorias_tarifarias`, `ire`, `impacto_economico`, `anomalias` — un suministro soft-deleted después de haber sido analizado desaparece del ranking (y de `resumen`) en la siguiente consulta, sin necesidad de reprocesar el lote.
+
 ## Contenido pendiente (otros contextos)
 
 - Convenciones generales de la API (formato de URLs, versionado, paginación, filtros y ordenamiento).
 - Formato estándar de request/response (JSON, envoltorios de éxito y error).
 - Autenticación y autorización (JWT, roles, scopes) y su relación con SECURITY_SPEC.md.
-- Endpoints por contexto delimitado restante: Inspecciones, Integración con RRHH. Gestión de Consumos ya no tiene pendientes propios: `Lectura`, `Lote de Facturación` y `Consumo` (§4.3, completo) tienen endpoints. El Motor de Inteligencia Energética tiene sus Etapas 1-6 documentadas (ver sección propia arriba), incluido un `GET` pendiente para consultar `feature_vectors`/`predicciones` (Etapas 3/6); las Etapas 7-8 quedan pendientes. (Gestión de Clientes, Gestión de Suministros, Gestión de Consumos y Motor de Inteligencia Energética: ver secciones propias arriba.)
+- Endpoints por contexto delimitado restante: Inspecciones, Integración con RRHH. Gestión de Consumos ya no tiene pendientes propios: `Lectura`, `Lote de Facturación` y `Consumo` (§4.3, completo) tienen endpoints. El Motor de Inteligencia Energética tiene sus Etapas 1-8 documentadas (ver sección propia arriba), incluido el `GET` de consulta del ranking IRE/resumen de un lote (Etapas 7-8); queda pendiente un `GET` para consultar `feature_vectors`/`predicciones` de un suministro/lote (Etapas 3/6). (Gestión de Clientes, Gestión de Suministros, Gestión de Consumos y Motor de Inteligencia Energética: ver secciones propias arriba.)
 - Modelos de datos (schemas Pydantic) de entrada y salida por endpoint.
 - Catálogo de códigos de error y formato estándar de mensajes de error.
 - Estrategia de versionado de la API y política de compatibilidad hacia atrás.

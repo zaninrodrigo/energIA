@@ -6,6 +6,7 @@ contract.
 
 from datetime import date
 from decimal import Decimal
+from enum import StrEnum
 
 from pydantic import BaseModel
 
@@ -191,3 +192,86 @@ class ProcesarLoteResponseSchema(BaseModel):
     ml: InformeMLSchema
     ire: InformeIRESchema
     iee: InformeIEESchema
+
+
+# ---------------------------------------------------------------------------------------------
+# GET /api/v1/motor/lotes/{codigo_lote}/resultados -- the IRE ranking of a processed lote (the
+# dashboard's data source, RN-009: inspection prioritization by IRE + Impacto Económico Estimado).
+# ---------------------------------------------------------------------------------------------
+
+
+class NivelFiltro(StrEnum):
+    """Query-param validation for `?nivel=` -- mirrors `domain.ire.NIVELES_IRE` (the 5 bands of
+    the generated `ire.nivel` column, `docker/postgres/init/01_schema.sql`). Kept as an explicit
+    Enum (not derived dynamically from that tuple) so FastAPI/Pydantic auto-validates an unknown
+    value as a 422 and documents the closed set in the generated OpenAPI schema -- the same manual
+    sync discipline `domain.ire.TIPOS_ANOMALIA`'s own docstring already accepts for its mirrored
+    literal list."""
+
+    MUY_BAJO = "Muy Bajo"
+    BAJO = "Bajo"
+    MEDIO = "Medio"
+    ALTO = "Alto"
+    CRITICO = "Crítico"
+
+
+class ClasificacionFiltro(StrEnum):
+    """Query-param validation for `?clasificacion=` -- mirrors `domain.isolation_forest.
+    CLASIFICACION_*` constants (the 4-band `ck_resultados_ia_clasificacion` CHECK). See
+    `NivelFiltro`'s docstring for why this is an explicit Enum."""
+
+    NORMAL = "Normal"
+    ATENCION = "Atención"
+    ALTO_RIESGO = "Alto Riesgo"
+    CRITICO = "Crítico"
+
+
+class AnomaliaRankingSchema(BaseModel):
+    tipo: str
+    severidad: str
+    descripcion: str | None
+
+
+class ObservacionSchema(BaseModel):
+    """One entry of DEC-016's explicability breakdown -- parsed from `resultados_ia.observaciones`
+    (stored as JSON text), never returned as raw text."""
+
+    factor: str
+    contribution: float
+    reason: str
+
+
+class ResultadoRankingItemSchema(BaseModel):
+    suministro_id: str
+    numero_suministro: str
+    ire_valor: int
+    ire_nivel: str
+    clasificacion: str
+    score_anomalia: float | None
+    probabilidad: float | None
+    localidad: str | None
+    categoria_tarifaria: str
+    anomalias: list[AnomaliaRankingSchema]
+    observaciones: list[ObservacionSchema]
+    iee_kwh: float | None
+
+
+class ResumenRankingSchema(BaseModel):
+    """Whole-lote summary counts (dashboard summary cards) -- UNFILTERED by `?nivel=`/
+    `?clasificacion=`, see `domain.resultados_ranking.ResumenRanking`'s docstring. `total_
+    resultados` is deliberately a different field name than this response's own (filtered)
+    `total`, to avoid confusing the two in the same JSON payload."""
+
+    total_resultados: int
+    conteo_por_nivel: dict[str, int]
+    conteo_por_clasificacion: dict[str, int]
+    con_anomalias: int
+    suma_iee_kwh: float
+
+
+class ResultadosRankingPageSchema(BaseModel):
+    items: list[ResultadoRankingItemSchema]
+    total: int
+    limit: int
+    offset: int
+    resumen: ResumenRankingSchema

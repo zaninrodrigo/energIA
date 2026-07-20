@@ -5,7 +5,7 @@ See docs/03-architecture/API_SPEC.md ("Contexto: Motor de Inteligencia Energéti
 contract.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from energia.contexts.motor.application.procesar_lote import (
@@ -37,8 +37,13 @@ from energia.contexts.motor.infrastructure.predicciones_repository import (
 from energia.contexts.motor.infrastructure.resultados_ia_repository import (
     SqlResultadosIaRepository,
 )
+from energia.contexts.motor.infrastructure.resultados_ranking_repository import (
+    SqlResultadosRankingRepository,
+)
 from energia.contexts.motor.infrastructure.validacion_data_source import SqlValidacionDataSource
 from energia.contexts.motor.presentation.schemas import (
+    AnomaliaRankingSchema,
+    ClasificacionFiltro,
     DistribucionIRESchema,
     DistribucionScoreSchema,
     DriftLoteSchema,
@@ -55,19 +60,27 @@ from energia.contexts.motor.presentation.schemas import (
     IreSuministroResumenSchema,
     LecturaNearDuplicateSchema,
     ModeloEntrenadoSchema,
+    NivelFiltro,
+    ObservacionSchema,
     PeriodoConflictivoSchema,
     PeriodosConflictivosSuministroSchema,
     PrediccionResumenSchema,
     ProcesarLoteResponseSchema,
     ReglaHitSchema,
     ReglasSuministroSchema,
+    ResultadoRankingItemSchema,
+    ResultadosRankingPageSchema,
     ResumenFeaturesSchema,
+    ResumenRankingSchema,
     ResumenReglasSchema,
     TopFactorSchema,
 )
 from energia.shared.db import get_db_session
 
 motor_router = APIRouter(prefix="/api/v1/motor", tags=["motor"])
+
+_DEFAULT_PAGE_LIMIT = 50
+_MAX_PAGE_LIMIT = 200
 
 
 def _to_response(resultado: ResultadoProcesamiento) -> ProcesarLoteResponseSchema:
@@ -352,3 +365,98 @@ async def procesar_lote(
 
     await session.commit()
     return _to_response(resultado)
+
+
+@motor_router.get("/lotes/{codigo_lote}/resultados", response_model=ResultadosRankingPageSchema)
+async def obtener_resultados_lote(
+    codigo_lote: str,
+    limit: int = Query(default=_DEFAULT_PAGE_LIMIT, ge=1, le=_MAX_PAGE_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    nivel: NivelFiltro | None = Query(default=None),
+    clasificacion: ClasificacionFiltro | None = Query(default=None),
+    session: AsyncSession = Depends(get_db_session),
+) -> ResultadosRankingPageSchema:
+    """The IRE ranking of a processed lote (Etapas 7-8, AI_ENGINE_SPEC.md §14) -- the dashboard's
+    data source: prioritizes inspections by IRE descending (RN-009, `BUSINESS_ANALYSIS.md` §15:
+    "las inspecciones deberán priorizarse según el IRE y el Impacto Económico Estimado").
+
+    **404 vs. an empty 200, the distinction that matters here**: 404 only when `codigo_lote`
+    itself does not resolve to a (non-soft-deleted) `lotes` row -- reusing `LoteProcesamientoPort.
+    obtener_estado_actual`, the SAME lookup `POST .../procesar` uses for its own 404. A lote that
+    EXISTS but has no `resultados_ia` rows yet (imported but not yet processed, still `Pendiente`;
+    or processed before Etapa 7 existed) is a REAL lote with an EMPTY ranking -- 200, `items: []`,
+    `total: 0`, `resumen.total_resultados: 0` -- never 404: the lote is not "not found", it is
+    simply "not analyzed yet".
+
+    `?nivel=`/`?clasificacion=` filter `items`/`total` (422 on a value outside the closed sets
+    `NivelFiltro`/`ClasificacionFiltro` declare -- FastAPI/Pydantic's own Enum validation, no
+    manual check needed). `resumen` is ALWAYS the whole lote's UNFILTERED summary (dashboard
+    cards) -- see `ResumenRankingSchema`'s docstring.
+    """
+    lote_port = SqlLoteProcesamientoPort(session)
+    estado_actual = await lote_port.obtener_estado_actual(codigo_lote)
+    if estado_actual is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"lote no encontrado: {codigo_lote}",
+        )
+
+    repository = SqlResultadosRankingRepository(session)
+    nivel_valor = nivel.value if nivel is not None else None
+    clasificacion_valor = clasificacion.value if clasificacion is not None else None
+
+    filas = await repository.listar(
+        estado_actual.id,
+        limit=limit,
+        offset=offset,
+        nivel=nivel_valor,
+        clasificacion=clasificacion_valor,
+    )
+    total = await repository.contar(
+        estado_actual.id, nivel=nivel_valor, clasificacion=clasificacion_valor
+    )
+    resumen = await repository.resumen(estado_actual.id)
+
+    return ResultadosRankingPageSchema(
+        items=[
+            ResultadoRankingItemSchema(
+                suministro_id=str(fila.suministro_id),
+                numero_suministro=fila.numero_suministro,
+                ire_valor=fila.ire_valor,
+                ire_nivel=fila.ire_nivel,
+                clasificacion=fila.clasificacion,
+                score_anomalia=fila.score_anomalia,
+                probabilidad=fila.probabilidad,
+                localidad=fila.localidad,
+                categoria_tarifaria=fila.categoria_tarifaria,
+                anomalias=[
+                    AnomaliaRankingSchema(
+                        tipo=anomalia.tipo,
+                        severidad=anomalia.severidad,
+                        descripcion=anomalia.descripcion,
+                    )
+                    for anomalia in fila.anomalias
+                ],
+                observaciones=[
+                    ObservacionSchema(
+                        factor=factor.factor,
+                        contribution=factor.contribution,
+                        reason=factor.reason,
+                    )
+                    for factor in fila.observaciones
+                ],
+                iee_kwh=fila.iee_kwh,
+            )
+            for fila in filas
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+        resumen=ResumenRankingSchema(
+            total_resultados=resumen.total_resultados,
+            conteo_por_nivel=resumen.conteo_por_nivel,
+            conteo_por_clasificacion=resumen.conteo_por_clasificacion,
+            con_anomalias=resumen.con_anomalias,
+            suma_iee_kwh=resumen.suma_iee_kwh,
+        ),
+    )
