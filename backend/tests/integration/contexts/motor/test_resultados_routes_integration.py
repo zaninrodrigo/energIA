@@ -375,3 +375,28 @@ async def test_soft_deleted_suministro_is_excluded_from_the_ranking(
     assert body["total"] == 4
     assert body["resumen"]["total_resultados"] == 4
     assert "SUM-RANK-COLD" not in {item["numero_suministro"] for item in body["items"]}
+
+
+async def test_barrios_aggregates_meters_and_bands_by_the_worst_meter(
+    motor_client: AsyncClient, db_session: AsyncSession
+) -> None:
+    await _seed_lote_analizado(motor_client, db_session)
+
+    response = await motor_client.get(f"/api/v1/motor/lotes/{_CODIGO_LOTE}/barrios")
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    # Every analyzed meter is counted exactly once across the (localidad, barrio) buckets.
+    assert sum(barrio["total_medidores"] for barrio in items) == 5
+    # Ordered by the worst meter (ire_maximo) descending -- the "potential" ordering.
+    maximos = [barrio["ire_maximo"] for barrio in items]
+    assert maximos == sorted(maximos, reverse=True)
+    for barrio in items:
+        assert barrio["ire_promedio"] <= barrio["ire_maximo"]
+        assert barrio["nivel"] in {"Muy Bajo", "Bajo", "Medio", "Alto", "Crítico"}
+
+
+async def test_barrios_returns_404_for_an_unknown_lote(motor_client: AsyncClient) -> None:
+    response = await motor_client.get("/api/v1/motor/lotes/NO-EXISTE-9999/barrios")
+
+    assert response.status_code == 404

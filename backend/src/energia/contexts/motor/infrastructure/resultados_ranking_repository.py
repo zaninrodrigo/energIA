@@ -34,8 +34,52 @@ from energia.contexts.motor.domain.isolation_forest import (
 )
 from energia.contexts.motor.domain.resultados_ranking import (
     AnomaliaRankingRow,
+    BarrioRiesgoRow,
     ResultadoRankingRow,
     ResumenRanking,
+)
+
+
+def _nivel_desde_valor(valor: int) -> str:
+    """Band an IRE value (0-100) into its nivel, mirroring the DB's generated `ire.nivel` column
+    (`docker/postgres/init/01_schema.sql`): 0-20 Muy Bajo / 21-40 Bajo / 41-60 Medio / 61-80 Alto /
+    81-100 Crítico. Used for a BARRIO's mean IRE, which has no stored `nivel` of its own."""
+    if valor <= 20:
+        indice = 0
+    elif valor <= 40:
+        indice = 1
+    elif valor <= 60:
+        indice = 2
+    elif valor <= 80:
+        indice = 3
+    else:
+        indice = 4
+    return NIVELES_IRE[indice]
+
+
+_BARRIOS_SQL = text(
+    """
+    SELECT
+        s.localidad,
+        s.barrio,
+        count(*) AS total_medidores,
+        round(avg(i.valor))::int AS ire_promedio,
+        max(i.valor)::int AS ire_maximo,
+        count(*) FILTER (WHERE anom.n > 0) AS con_anomalias,
+        avg(s.latitud) AS latitud,
+        avg(s.longitud) AS longitud
+    FROM resultados_ia r
+    JOIN suministros s ON s.id = r.suministro_id AND s.deleted_at IS NULL
+    JOIN ire i ON i.resultado_ia_id = r.id AND i.deleted_at IS NULL
+    LEFT JOIN LATERAL (
+        SELECT count(*) AS n
+        FROM anomalias a
+        WHERE a.resultado_ia_id = r.id AND a.deleted_at IS NULL
+    ) anom ON true
+    WHERE r.lote_id = :lote_id AND r.deleted_at IS NULL
+    GROUP BY s.localidad, s.barrio
+    ORDER BY max(i.valor) DESC
+    """
 )
 
 # Mirrors `ck_resultados_ia_clasificacion` (`docker/postgres/init/01_schema.sql`) -- same 4
@@ -274,3 +318,20 @@ class SqlResultadosRankingRepository:
             con_anomalias=row.con_anomalias,
             suma_iee_kwh=float(row.suma_iee_kwh),
         )
+
+    async def barrios(self, lote_id: UUID) -> list[BarrioRiesgoRow]:
+        result = await self._session.execute(_BARRIOS_SQL, {"lote_id": lote_id})
+        return [
+            BarrioRiesgoRow(
+                localidad=row.localidad,
+                barrio=row.barrio,
+                total_medidores=row.total_medidores,
+                ire_promedio=row.ire_promedio,
+                ire_maximo=row.ire_maximo,
+                nivel=_nivel_desde_valor(row.ire_maximo),
+                con_anomalias=row.con_anomalias,
+                latitud=(float(row.latitud) if row.latitud is not None else None),
+                longitud=(float(row.longitud) if row.longitud is not None else None),
+            )
+            for row in result
+        ]

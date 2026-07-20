@@ -1,4 +1,5 @@
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import { BarriosPage } from "./features/barrios/components/BarriosPage";
 import { RankingPage } from "./features/ranking/components/RankingPage";
 import { SuministrosPage } from "./features/suministros/components/SuministrosPage";
 
@@ -25,6 +26,9 @@ function App() {
             <NavLink to="/ranking" className={navLinkClassName}>
               Ranking de Riesgo
             </NavLink>
+            <NavLink to="/barrios" className={navLinkClassName}>
+              Riesgo por Barrio
+            </NavLink>
           </nav>
         </div>
       </header>
@@ -33,6 +37,7 @@ function App() {
           <Route path="/" element={<Navigate to="/ranking" replace />} />
           <Route path="/suministros" element={<SuministrosPage />} />
           <Route path="/ranking" element={<RankingPage />} />
+          <Route path="/barrios" element={<BarriosPage />} />
         </Routes>
       </main>
     </div>

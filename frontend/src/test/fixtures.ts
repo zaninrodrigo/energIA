@@ -1,5 +1,6 @@
 import type { SuministrosPage } from "../features/suministros/types";
 import type { LotesPage, ResultadosRankingPage } from "../features/ranking/types";
+import type { BarriosRiesgoPage } from "../features/barrios/types";
 
 /**
  * Single source of truth for the `GET /api/v1/suministros` mock payload, shared by:
@@ -142,4 +143,47 @@ export const rankingFixture: ResultadosRankingPage = {
     con_anomalias: 9,
     suma_iee_kwh: 16181.36,
   },
+};
+
+/**
+ * `GET /api/v1/motor/lotes/{codigo_lote}/barrios` mock payload -- two localidades so the localidad
+ * selector has something to switch between; barrios ordered worst-IRE-max first, matching the
+ * backend contract.
+ */
+export const barriosFixture: BarriosRiesgoPage = {
+  items: [
+    {
+      localidad: "El Colorado",
+      barrio: "Centro",
+      total_medidores: 10,
+      ire_promedio: 24,
+      ire_maximo: 62,
+      nivel: "Alto",
+      con_anomalias: 1,
+      latitud: -26.28,
+      longitud: -59.36,
+    },
+    {
+      localidad: "El Colorado",
+      barrio: "Villa Hermosa",
+      total_medidores: 5,
+      ire_promedio: 15,
+      ire_maximo: 33,
+      nivel: "Bajo",
+      con_anomalias: 0,
+      latitud: -26.33,
+      longitud: -59.34,
+    },
+    {
+      localidad: "Formosa",
+      barrio: "Obrero",
+      total_medidores: 2,
+      ire_promedio: 29,
+      ire_maximo: 42,
+      nivel: "Medio",
+      con_anomalias: 1,
+      latitud: -26.17,
+      longitud: -58.19,
+    },
+  ],
 };

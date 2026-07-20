@@ -1,5 +1,5 @@
 import { http, HttpResponse } from "msw";
-import { lotesFixture, rankingFixture, suministrosFixture } from "../fixtures";
+import { barriosFixture, lotesFixture, rankingFixture, suministrosFixture } from "../fixtures";
 
 export const handlers = [
   http.get("http://localhost:8000/api/v1/suministros", () => {
@@ -10,5 +10,8 @@ export const handlers = [
   }),
   http.get("http://localhost:8000/api/v1/motor/lotes/:codigoLote/resultados", () => {
     return HttpResponse.json(rankingFixture);
+  }),
+  http.get("http://localhost:8000/api/v1/motor/lotes/:codigoLote/barrios", () => {
+    return HttpResponse.json(barriosFixture);
   }),
 ];

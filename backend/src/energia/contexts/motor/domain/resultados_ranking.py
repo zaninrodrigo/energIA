@@ -25,6 +25,7 @@ from energia.contexts.motor.domain.ire import FactorContribucion
 __all__ = [
     "AnomaliaRankingRow",
     "ResultadoRankingRow",
+    "BarrioRiesgoRow",
     "ResumenRanking",
     "ResultadosRankingRepository",
 ]
@@ -76,6 +77,30 @@ class ResultadoRankingRow:
 
 
 @dataclass(frozen=True, slots=True)
+class BarrioRiesgoRow:
+    """A processed lote's risk aggregated to one (localidad, barrio) -- feeds the barrio-level heat
+    view (`GET .../barrios`): "which neighbourhoods concentrate the anomalous-consumption risk".
+    `ire_promedio` is the mean IRE of the barrio's analyzed meters; `ire_maximo` is its highest
+    single IRE -- and `nivel` bands `ire_maximo` (NOT the mean), because "does this barrio have
+    potential for anomalous consumption" is about its WORST meter, not its average: one Crítico
+    meter among many calm ones must not be diluted to green. Both are on the 0-100 `ire.valor`
+    scale; `nivel` uses the SAME 5 bands as `ire.nivel`.
+    `latitud`/`longitud` are the barrio's centroid (mean of its meters' coordinates), for placing it
+    on the map -- `None` when none of the barrio's meters are georeferenced. `barrio` is `None` for
+    meters whose barrio was never relevado (grouped together as one "sin barrio" bucket)."""
+
+    localidad: str | None
+    barrio: str | None
+    total_medidores: int
+    ire_promedio: int
+    ire_maximo: int
+    nivel: str
+    con_anomalias: int
+    latitud: float | None
+    longitud: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class ResumenRanking:
     """Whole-lote summary counts (the dashboard's summary cards) -- deliberately UNFILTERED by
     `?nivel=`/`?clasificacion=`, the same "KPI cards don't move when you filter the table"
@@ -124,4 +149,10 @@ class ResultadosRankingRepository(Protocol):
         `ResumenRanking` with every count at `0` (`conteo_por_nivel`/`conteo_por_clasificacion`
         still keyed by all 5/4 bands) -- never raises -- when the lote has no `resultados_ia` rows
         at all (imported but not yet processed, or processed before Etapa 7 existed)."""
+        ...  # pragma: no cover — Protocol stub, never executed directly
+
+    async def barrios(self, lote_id: UUID) -> list[BarrioRiesgoRow]:
+        """This lote's risk aggregated per (localidad, barrio), ordered by `ire_promedio`
+        descending (highest-risk barrios first). Empty list when the lote has no `resultados_ia`
+        rows yet. Excludes every soft-deleted row across the joined tables."""
         ...  # pragma: no cover — Protocol stub, never executed directly

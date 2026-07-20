@@ -278,3 +278,24 @@ class ResultadosRankingPageSchema(BaseModel):
     limit: int
     offset: int
     resumen: ResumenRankingSchema
+
+
+class BarrioRiesgoSchema(BaseModel):
+    """A (localidad, barrio) aggregate for the barrio-level heat view (`GET .../barrios`)."""
+
+    localidad: str | None
+    barrio: str | None
+    total_medidores: int
+    ire_promedio: int
+    ire_maximo: int
+    nivel: str
+    con_anomalias: int
+    latitud: float | None
+    longitud: float | None
+
+
+class BarriosRiesgoPageSchema(BaseModel):
+    """Every (localidad, barrio) of a processed lote, ordered by `ire_promedio` descending -- the
+    frontend derives the localidad selector from these and filters client-side."""
+
+    items: list[BarrioRiesgoSchema]

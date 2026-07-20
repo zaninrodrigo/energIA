@@ -43,6 +43,8 @@ from energia.contexts.motor.infrastructure.resultados_ranking_repository import 
 from energia.contexts.motor.infrastructure.validacion_data_source import SqlValidacionDataSource
 from energia.contexts.motor.presentation.schemas import (
     AnomaliaRankingSchema,
+    BarrioRiesgoSchema,
+    BarriosRiesgoPageSchema,
     ClasificacionFiltro,
     DistribucionIRESchema,
     DistribucionScoreSchema,
@@ -462,4 +464,41 @@ async def obtener_resultados_lote(
             con_anomalias=resumen.con_anomalias,
             suma_iee_kwh=resumen.suma_iee_kwh,
         ),
+    )
+
+
+@motor_router.get("/lotes/{codigo_lote}/barrios", response_model=BarriosRiesgoPageSchema)
+async def obtener_barrios_lote(
+    codigo_lote: str,
+    session: AsyncSession = Depends(get_db_session),
+) -> BarriosRiesgoPageSchema:
+    """A processed lote's risk aggregated per (localidad, barrio), ordered by mean IRE descending
+    -- feeds the barrio-level heat view ("which neighbourhoods concentrate the anomalous-consumption
+    risk", per localidad). Same 404-vs-empty-200 rule as `.../resultados`: 404 only when the lote
+    itself does not exist; an existing but unprocessed lote returns `items: []`."""
+    lote_port = SqlLoteProcesamientoPort(session)
+    estado_actual = await lote_port.obtener_estado_actual(codigo_lote)
+    if estado_actual is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"lote no encontrado: {codigo_lote}",
+        )
+
+    repository = SqlResultadosRankingRepository(session)
+    filas = await repository.barrios(estado_actual.id)
+    return BarriosRiesgoPageSchema(
+        items=[
+            BarrioRiesgoSchema(
+                localidad=fila.localidad,
+                barrio=fila.barrio,
+                total_medidores=fila.total_medidores,
+                ire_promedio=fila.ire_promedio,
+                ire_maximo=fila.ire_maximo,
+                nivel=fila.nivel,
+                con_anomalias=fila.con_anomalias,
+                latitud=fila.latitud,
+                longitud=fila.longitud,
+            )
+            for fila in filas
+        ]
     )
