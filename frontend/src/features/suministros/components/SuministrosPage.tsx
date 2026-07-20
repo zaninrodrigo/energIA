@@ -28,7 +28,8 @@ export function SuministrosPage() {
   const { data } = query;
 
   return (
-    <section>
+    <section className="flex flex-col gap-4">
+      <h1 className="text-xl font-semibold text-slate-900">Suministros</h1>
       {data.items.length === 0 ? <EmptyState /> : <SuministrosTable items={data.items} />}
       <Pagination
         total={data.total}

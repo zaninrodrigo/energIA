@@ -1,5 +1,6 @@
 import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 // The backend (`backend/src/energia/api/app.py`) has no CORS middleware configured, and
 // backend/ is read-only reference for this project. Both the dev server and the preview
@@ -15,7 +16,10 @@ const backendProxy = {
 };
 
 export default defineConfig({
-  plugins: [react()],
+  // @tailwindcss/vite compiles the `@import "tailwindcss"` entry (src/styles/index.css) at
+  // build/dev time. It only participates in the CSS pipeline -- transparent to Vitest's
+  // component tests, which run against jsdom and never invoke the CSS build.
+  plugins: [react(), tailwindcss()],
   server: {
     proxy: backendProxy,
   },

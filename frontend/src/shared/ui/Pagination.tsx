@@ -1,3 +1,5 @@
+import { Button } from "./Button";
+
 export interface PaginationProps {
   total: number;
   limit: number;
@@ -16,14 +18,17 @@ export function Pagination({ total, limit, offset, onPrevious, onNext }: Paginat
   const rangeLabel = total === 0 ? `Mostrando 0 de 0` : `Mostrando ${from}–${to} de ${total}`;
 
   return (
-    <nav aria-label="Paginación de suministros">
-      <button type="button" onClick={onPrevious} disabled={!hasPrevious}>
+    <nav
+      aria-label="Paginación de suministros"
+      className="flex items-center justify-between gap-4 px-1 py-3"
+    >
+      <Button variant="secondary" size="sm" onClick={onPrevious} disabled={!hasPrevious}>
         Anterior
-      </button>
-      <span>{rangeLabel}</span>
-      <button type="button" onClick={onNext} disabled={!hasNext}>
+      </Button>
+      <span className="text-sm text-slate-500">{rangeLabel}</span>
+      <Button variant="secondary" size="sm" onClick={onNext} disabled={!hasNext}>
         Siguiente
-      </button>
+      </Button>
     </nav>
   );
 }

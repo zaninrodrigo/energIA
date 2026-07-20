@@ -133,3 +133,43 @@ que resuelve el mockeo del E2E sin piezas adicionales — la razón concreta de 
   (`SuministroSchema`); ante el primer cambio de forma de esa respuesta, el desajuste se manifiesta
   como fallas de tests (`api.test.ts`, `hooks.test.tsx`) contra los fixtures compartidos
   (`src/test/fixtures.ts`), no como un error silencioso en producción.
+
+## Adenda (2026-07-20): sistema de diseño y CSS utilitario
+
+Hasta este sprint el frontend no tenía ningún framework de CSS ni tokens de diseño: HTML semántico
+sin una sola clase de estilos. La pantalla siguiente (Ranking de Riesgo, el "Dashboard Ejecutivo"
+mencionado en el Contexto de este ADR) exige un sistema de diseño real — una escala de color de
+riesgo semántica y validada por contraste, tipografía y espaciado consistentes, y un kit de
+componentes reutilizables (`Badge`, `Card`/`StatCard`, `Button`, `Drawer`) — que ya no se puede
+resolver a mano pantalla por pantalla.
+
+**Decisión: Tailwind CSS v4, vía el plugin oficial `@tailwindcss/vite`.** La v4 reemplaza el
+pipeline de PostCSS + `tailwind.config.js` de versiones anteriores por un único punto de entrada
+CSS (`src/styles/index.css`, `@import "tailwindcss";` + un bloque `@theme` con los tokens propios
+del proyecto) y detección automática de contenido, sin lista de globs que mantener. El plugin solo
+participa en el pipeline de CSS de Vite (`pnpm dev`/`pnpm build`); es transparente para Vitest, que
+corre los tests de componente contra jsdom sin invocar ese pipeline.
+
+Alternativas consideradas:
+
+- **CSS Modules / CSS vanilla:** rechazado porque no trae un sistema de tokens resuelto (espaciado,
+  tipografía, escala de color) — cada componente nuevo repetiría las mismas decisiones de diseño en
+  lugar de heredarlas de un tema central, exactamente el problema que este sprint necesita cerrar.
+- **Otro framework utilitario (p. ej. UnoCSS):** capacidades comparables, pero sin ninguna ventaja
+  concreta para este proyecto frente a un ecosistema y documentación más chicos; no se paga el costo
+  de una herramienta menos establecida sin una razón real.
+- **Librería de componentes con estilos propios (p. ej. MUI, Chakra UI):** rechazada porque impone
+  su propio lenguaje visual y sistema de temas, un bundle más grande, y menos control fino sobre la
+  escala de color de riesgo (5 niveles, validada por contraste WCAG AA) que este proyecto necesita
+  definir a medida — no adoptar el criterio visual de un tercero para una decisión de negocio como
+  el semáforo de riesgo del IRE.
+
+### Cobertura E2E extendida a la pantalla de Ranking de Riesgo
+
+Con la pantalla de Ranking de Riesgo, `/` pasa a redirigir a `/ranking` (el Dashboard Ejecutivo,
+ahora la puerta de entrada de la demo) en lugar de mostrar directamente Suministros. El smoke E2E
+(`e2e/smoke.spec.ts`) se extendió de un escenario a dos por ese motivo: uno confirma que `/` carga
+el Ranking de Riesgo con datos de API (mockeando también `GET /api/v1/lotes` y `GET
+.../resultados`, además de `GET /api/v1/suministros`), el otro confirma que la navegación a
+Suministros sigue funcionando. Sigue sin depender de un backend real ni de un Service Worker de
+MSW — mismo criterio que el resto de este ADR.

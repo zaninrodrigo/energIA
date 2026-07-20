@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens for EnergIA's frontend.
+ *
+ * Only genuinely custom, semantically-reserved colors are declared here (brand accent + the
+ * 5-step risk scale). Everything else -- neutral grays, spacing, typography scale, radii --
+ * uses Tailwind v4's built-in defaults (the `slate` gray ramp, default type scale, etc.), which
+ * are already accessible and idiomatic; redeclaring them here would just drift out of sync with
+ * upstream Tailwind for no benefit.
+ *
+ * Light theme only: EnergIA is an internal operator tool, not a public product, so a dark-mode
+ * toggle is out of scope (see ADR-008 addendum, 2026-07-20).
+ *
+ * Risk scale + brand accent hex values and contrast ratios are computed against WCAG using the
+ * `dataviz` skill's `contrast()` helper (relative luminance / WCAG 2 contrast ratio, the same
+ * formula any AA checker uses) -- see the Phase 1 report for the full numbers. Every level here
+ * is a "soft badge" pair: a near-white tint (`-risk-*`) as background and a dark, saturated
+ * ink (`-risk-*-fg`) as text, which is what makes every step clear WCAG AA (>= 4.5:1) reliably,
+ * including hues (amber/orange) that fail AA when used as a solid fill with white text.
+ */
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+  /* Brand accent: deep teal, distinct from every step of the risk scale below so it never reads
+     as a risk signal. #0f766e on white = 5.47:1 (button text, AA); white on #0f766e = 5.47:1. */
+  --color-brand: #0f766e;
+  --color-brand-hover: #0b5450;
+  --color-brand-subtle: #ccfbf1;
+
+  /* Risk scale (ire_nivel, 5 steps, calm green -> red). Contribution/contrast documented in the
+     Phase 1 report. Reused for `clasificacion` (4 steps) and `anomalias.severidad` (4 steps) via
+     small pure mapping functions in features/ranking (Phase 2) -- never a second color scale. */
+  --color-risk-very-low: #dcfce7;
+  --color-risk-very-low-fg: #166534;
+  --color-risk-low: #ecfccb;
+  --color-risk-low-fg: #3f6212;
+  --color-risk-medium: #fef3c7;
+  --color-risk-medium-fg: #78350f;
+  --color-risk-high: #ffedd5;
+  --color-risk-high-fg: #7c2d12;
+  --color-risk-critical: #fee2e2;
+  --color-risk-critical-fg: #7f1d1d;
+}
+
+@layer base {
+  body {
+    @apply bg-slate-50 font-sans text-slate-900 antialiased;
+  }
+}

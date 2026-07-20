@@ -30,6 +30,20 @@ describe("apiGet", () => {
     expect(capturedUrl?.searchParams.has("numero_cliente")).toBe(false);
   });
 
+  it("issues a bare request with no query string when params is an empty object", async () => {
+    let capturedUrl: URL | undefined;
+    server.use(
+      http.get("http://localhost:8000/api/v1/ping", ({ request }) => {
+        capturedUrl = new URL(request.url);
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+
+    await apiGet("/api/v1/ping", { params: {} });
+
+    expect(capturedUrl?.search).toBe("");
+  });
+
   it("throws an ApiError carrying status, statusText and the parsed body when the response is not ok", async () => {
     server.use(
       http.get("http://localhost:8000/api/v1/ping", () =>

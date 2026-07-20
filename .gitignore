@@ -27,6 +27,11 @@ coverage/
 playwright-report/
 test-results/
 
+# One-off real-data validation runs against a scratch DB/backend (never `energia`) -- see
+# frontend/README.md, "Validación manual con datos reales". Throwaway output, not part of the
+# app or the automated test suite.
+frontend/scratch-validation/
+
 # Environment
 .env
 .env.*
