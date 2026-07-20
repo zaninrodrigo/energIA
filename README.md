@@ -10,7 +10,7 @@ EnergIA incorpora un Motor de Inteligencia Energética que analiza automáticame
 
 ## Estado del proyecto
 
-Sprint 0 — esqueleto de backend. El repositorio contiene la especificación funcional, de negocio, de arquitectura y de dominio, y ahora también el andamiaje inicial del backend (FastAPI, Clean Architecture, endpoint de salud, cobertura de tests ≥ 90%) sobre el cual se construirán los bounded contexts.
+Sprint 0 — esqueleto de backend y frontend. El repositorio contiene la especificación funcional, de negocio, de arquitectura y de dominio, el andamiaje inicial del backend (FastAPI, Clean Architecture, endpoint de salud, cobertura de tests ≥ 90%) sobre el cual se construirán los bounded contexts, y ahora también el andamiaje inicial del frontend (Vite, React, TypeScript, cobertura de tests ≥ 85% según RNF-006) con un primer recorrido vertical funcional: listado paginado de suministros contra la API real.
 
 ## Mapa de documentación
 
@@ -68,6 +68,20 @@ make run       # uvicorn con reload en http://localhost:8000
 
 Detalle completo (targets de Makefile, estructura, variables de entorno) en [`backend/README.md`](./backend/README.md).
 
+## Frontend
+
+Aplicación React + TypeScript (Vite), con un primer recorrido vertical completo: listado paginado
+de suministros contra la API real (`GET /api/v1/suministros`). Requiere Node 22 y pnpm.
+
+```bash
+cd frontend
+pnpm install
+pnpm dev     # http://localhost:5173 (por defecto apunta a http://localhost:8000)
+```
+
+Detalle completo (scripts disponibles, variables de entorno, arquitectura, estrategia de testing,
+cómo probar contra el backend real sin CORS) en [`frontend/README.md`](./frontend/README.md).
+
 ## Datos sintéticos
 
 `backend/src/energia/tools/synthetic/` genera un dataset determinístico de clientes,
@@ -104,7 +118,7 @@ Detalle completo (flags, estructura de módulos) en [`backend/README.md`](./back
 ```
 energIA/
 ├── backend/           # API FastAPI (Clean Architecture + DDD) — esqueleto Sprint 0
-├── frontend/          # Aplicación React/TypeScript — vacío por ahora
+├── frontend/          # Aplicación React/TypeScript (Vite) — esqueleto Sprint 0
 ├── docker/            # Definiciones de contenedores y orquestación local
 ├── datasets/          # Muestras de datos (los datasets crudos no se versionan)
 ├── diagrams/          # Diagramas de arquitectura y de dominio

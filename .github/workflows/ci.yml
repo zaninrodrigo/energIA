@@ -61,3 +61,53 @@ jobs:
       - name: Test (unit + integration, coverage gate enforced via pyproject.toml)
         working-directory: backend
         run: pytest
+
+  frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      # actions/setup-node's `cache: pnpm` shells out to `pnpm store path`, so pnpm must already
+      # be on PATH -- this step must come after "Set up pnpm", not before.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install (frozen lockfile)
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (eslint)
+        working-directory: frontend
+        run: pnpm lint
+
+      - name: Typecheck (tsc --noEmit)
+        working-directory: frontend
+        run: pnpm typecheck
+
+      - name: Test (unit + component, coverage gate enforced via vite.config.ts)
+        working-directory: frontend
+        run: pnpm test
+
+      - name: Build (vite build)
+        working-directory: frontend
+        run: pnpm build
+
+      - name: Install Playwright browsers (chromium)
+        working-directory: frontend
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Mocks /api/v1/suministros at the network level via page.route() against a `vite preview`
+      # build compiled with VITE_API_BASE_URL="" (see e2e/playwright.config.ts): no real backend
+      # involved. A real-backend E2E job lands with the Dashboard Ejecutivo slice.
+      - name: Test E2E (Playwright smoke, mocked API)
+        working-directory: frontend
+        run: pnpm run test:e2e

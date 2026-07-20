@@ -17,8 +17,15 @@ htmlcov/
 # Node
 node_modules/
 dist/
+dist-e2e/
 build/
 coverage/
+.vite/
+*.local
+
+# Playwright (frontend/e2e/)
+playwright-report/
+test-results/
 
 # Environment
 .env
