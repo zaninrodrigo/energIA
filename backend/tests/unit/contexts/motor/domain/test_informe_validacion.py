@@ -32,6 +32,12 @@ def _sin_lectura(fila: ConsumoValidacionRow) -> ConsumoValidacionRow:
     return replace(fila, lectura_id=None, lectura_anterior=None, lectura_actual=None)
 
 
+def _excluyente(fila: ConsumoValidacionRow) -> ConsumoValidacionRow:
+    """A fila that trips an EXCLUDING check (V7: dias_facturados <= 0), unlike V1 which only
+    annotates. `lectura_dias_facturados` matched to 0 too so only V7 fires, not also V3."""
+    return replace(fila, dias_facturados=0, lectura_dias_facturados=0)
+
+
 def test_all_suministros_valid_yields_100_percent_and_threshold_met() -> None:
     lote_id = uuid4()
     filas = [_fila_valida() for _ in range(4)]  # 4 distinct suministros, no findings
@@ -51,7 +57,7 @@ def test_one_invalid_suministro_out_of_twenty_still_meets_threshold() -> None:
     """1/20 excluded => 95% valid, exactly at DEC-004's threshold (>=95%)."""
     lote_id = uuid4()
     filas = [_fila_valida() for _ in range(19)]
-    filas.append(_sin_lectura(_fila_valida()))
+    filas.append(_excluyente(_fila_valida()))
 
     informe = construir_informe(lote_id, filas)
 
@@ -63,7 +69,7 @@ def test_one_invalid_suministro_out_of_twenty_still_meets_threshold() -> None:
 
 def test_below_threshold_reports_umbral_incumplido() -> None:
     lote_id = uuid4()
-    filas = [_fila_valida(), _sin_lectura(_fila_valida())]
+    filas = [_fila_valida(), _excluyente(_fila_valida())]
 
     informe = construir_informe(lote_id, filas)
 
@@ -73,22 +79,38 @@ def test_below_threshold_reports_umbral_incumplido() -> None:
     assert informe.umbral_cumplido is False
 
 
+def test_v1_missing_lectura_annotates_but_does_not_exclude() -> None:
+    """V1 is informative-only (CHECKS_INFORMATIVOS): a whole no-lecturas dataset (real historical
+    data) must NOT be 100% excluded -- it is annotated in `hallazgos` but stays valid for scoring."""
+    lote_id = uuid4()
+    filas = [_sin_lectura(_fila_valida()) for _ in range(3)]
+
+    informe = construir_informe(lote_id, filas)
+
+    assert informe.suministros_excluidos == 0
+    assert informe.fraccion_valida == Decimal("1")
+    assert informe.umbral_cumplido is True
+    # Still reported (annotated), just not driving exclusion.
+    assert {h.check for h in informe.hallazgos} == {"V1"}
+    assert informe.exclusiones == ()
+
+
 def test_exclusion_aggregates_every_motivo_for_a_suministro() -> None:
     lote_id = uuid4()
     suministro_id = uuid4()
-    fila = replace(
-        _sin_lectura(_fila_valida(suministro_id)),
-        dias_facturados=0,
-    )
+    # Both an informative finding (V1, sin lectura) and an excluding one (V7, dias 0): only the
+    # excluding one appears in the exclusion motivos; V1 is annotated in `hallazgos` instead.
+    fila = replace(_sin_lectura(_fila_valida(suministro_id)), dias_facturados=0)
 
     informe = construir_informe(lote_id, [fila])
 
     assert informe.suministros_excluidos == 1
     exclusion = informe.exclusiones[0]
     assert exclusion.suministro_id == suministro_id
-    checks_disparados = {motivo.split(":")[0] for motivo in exclusion.motivos}
-    assert "V1" in checks_disparados
-    assert "V7" in checks_disparados
+    checks_excluyentes = {motivo.split(":")[0] for motivo in exclusion.motivos}
+    assert "V7" in checks_excluyentes
+    assert "V1" not in checks_excluyentes  # informative-only, never excludes
+    assert "V1" in {h.check for h in informe.hallazgos}  # but still reported
 
 
 def test_empty_chain_does_not_raise_zero_division() -> None:

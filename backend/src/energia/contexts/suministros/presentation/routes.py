@@ -80,6 +80,9 @@ async def import_suministros(
                 barrio=item.barrio,
                 estado=item.estado,
                 fecha_alta=item.fecha_alta,
+                medidor=item.medidor,
+                latitud=item.latitud,
+                longitud=item.longitud,
             )
         )
 
@@ -145,6 +148,9 @@ async def list_suministros(
                 barrio=suministro.barrio,
                 estado=suministro.estado,
                 fecha_alta=suministro.fecha_alta,
+                medidor=suministro.medidor,
+                latitud=suministro.latitud,
+                longitud=suministro.longitud,
             )
             for suministro in suministros
         ],

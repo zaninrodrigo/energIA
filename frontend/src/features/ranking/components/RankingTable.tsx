@@ -13,13 +13,13 @@ export interface RankingTableProps {
 const columns: TableColumn<ResultadoRankingItem>[] = [
   {
     key: "numero_suministro",
-    header: "Número de suministro",
+    header: "Ruta-folio (suministro)",
     render: (row) => row.numero_suministro,
   },
   {
-    key: "rutafolio",
-    header: "Rutafolio",
-    render: (row) => <span className="tabular-nums">{row.rutafolio ?? "—"}</span>,
+    key: "medidor",
+    header: "Medidor",
+    render: (row) => <span className="tabular-nums">{row.medidor ?? "—"}</span>,
   },
   { key: "localidad", header: "Localidad", render: (row) => row.localidad ?? "—" },
   {

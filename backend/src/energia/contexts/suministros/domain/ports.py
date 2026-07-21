@@ -34,6 +34,9 @@ class SuministroSourceRecord:
     barrio: str | None = None
     estado: str | None = None
     fecha_alta: str | None = None
+    medidor: str | None = None
+    latitud: float | None = None
+    longitud: float | None = None
 
 
 class SuministroSource(Protocol):

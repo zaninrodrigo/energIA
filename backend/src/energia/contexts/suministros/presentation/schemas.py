@@ -35,6 +35,9 @@ class SuministroImportItem(BaseModel):
     barrio: str | None = None
     estado: str | None = None
     fecha_alta: str | None = None
+    medidor: str | None = None
+    latitud: float | None = None
+    longitud: float | None = None
 
 
 class RejectedRecordSchema(BaseModel):
@@ -63,6 +66,9 @@ class SuministroSchema(BaseModel):
     barrio: str | None
     estado: str
     fecha_alta: date
+    medidor: str | None
+    latitud: float | None
+    longitud: float | None
 
 
 class SuministrosPageSchema(BaseModel):

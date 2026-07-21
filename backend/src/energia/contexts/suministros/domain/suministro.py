@@ -27,6 +27,7 @@ _NUMERO_SUMINISTRO_MAX_LENGTH = 30
 _LOCALIDAD_MAX_LENGTH = 100
 _BARRIO_MAX_LENGTH = 100
 _ESTADO_MAX_LENGTH = 15
+_MEDIDOR_MAX_LENGTH = 20
 
 # `suministros.estado` has no CHECK constraint (unlike `clientes.estado`): DOMAIN_MODEL.md §7.2
 # does not enumerate closed values for it, so 01_schema.sql deliberately leaves it an open
@@ -66,6 +67,11 @@ class Suministro:
     estado: str = _ESTADO_DEFAULT
     localidad: str | None = None
     barrio: str | None = None
+    # medidor: serial del aparato físico (numero_suministro es el ruta-folio). Geo-referencia
+    # opcional del punto de suministro (REAL_DATA_IMPORT_SPEC.md).
+    medidor: str | None = None
+    latitud: float | None = None
+    longitud: float | None = None
 
     @staticmethod
     def create(
@@ -77,6 +83,9 @@ class Suministro:
         estado: str | None = None,
         localidad: str | None = None,
         barrio: str | None = None,
+        medidor: str | None = None,
+        latitud: float | None = None,
+        longitud: float | None = None,
         id: UUID | None = None,
     ) -> "Suministro":
         """Validate and build a `Suministro`; raises `SuministroValidationError` on any
@@ -144,6 +153,16 @@ class Suministro:
         if barrio is not None and len(barrio) > _BARRIO_MAX_LENGTH:
             errors.append(f"barrio no puede superar {_BARRIO_MAX_LENGTH} caracteres")
 
+        medidor_limpio = medidor.strip() if medidor is not None else None
+        if medidor_limpio is not None and len(medidor_limpio) > _MEDIDOR_MAX_LENGTH:
+            errors.append(f"medidor no puede superar {_MEDIDOR_MAX_LENGTH} caracteres")
+
+        if latitud is not None and not (-90 <= latitud <= 90):
+            errors.append(f"latitud fuera de rango [-90, 90]: {latitud}")
+
+        if longitud is not None and not (-180 <= longitud <= 180):
+            errors.append(f"longitud fuera de rango [-180, 180]: {longitud}")
+
         if errors:
             raise SuministroValidationError(errors)
 
@@ -164,4 +183,7 @@ class Suministro:
             estado=estado_limpio,
             localidad=localidad,
             barrio=barrio,
+            medidor=medidor_limpio,
+            latitud=latitud,
+            longitud=longitud,
         )

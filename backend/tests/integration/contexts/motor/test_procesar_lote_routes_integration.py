@@ -536,9 +536,18 @@ async def test_error_lote_retry_upserts_feature_vectors_without_duplicating(
         dias_facturados=31,
         kwh=Decimal("100.000"),
     )
-    # A second consumo with NO lectura (V1) -- this suministro is excluded, so 1/2 valid (50%)
-    # keeps the lote below DEC-004's 95% threshold -> Error.
     suministro_invalido = await insert_suministro(db_session, numero_suministro="SUM-FVR-RETRY-BAD")
+    # A consumo whose lectura reports different dias_facturados (99 != 31) trips V3, an EXCLUDING
+    # check -- V1 (sin lectura) is informative-only now and no longer excludes. One consumo, so the
+    # completeness gate still passes; this suministro is excluded -> 1/2 valid (50%) -> Error.
+    lectura_desajustada = await insert_lectura(
+        db_session,
+        suministro_id=suministro_invalido,
+        fecha_lectura=date(2024, 1, 31),
+        lectura_anterior=Decimal("0.000"),
+        lectura_actual=Decimal("50.000"),
+        dias_facturados=99,
+    )
     await insert_consumo(
         db_session,
         suministro_id=suministro_invalido,
@@ -547,6 +556,7 @@ async def test_error_lote_retry_upserts_feature_vectors_without_duplicating(
         fecha_fin=date(2024, 1, 31),
         dias_facturados=31,
         kwh=Decimal("50.000"),
+        lectura_id=lectura_desajustada,
     )
 
     primera = await motor_client.post("/api/v1/motor/lotes/LOTE-FVR-RETRY/procesar")
@@ -797,6 +807,17 @@ async def test_ml_runs_even_when_lote_lands_in_error_and_retry_stays_idempotent(
         kwh=Decimal("100.000"),
     )
     suministro_invalido = await insert_suministro(db_session, numero_suministro="SUM-ML-RETRY-BAD")
+    # A consumo whose lectura reports different dias_facturados (99 != 31) trips V3, an EXCLUDING
+    # check -- V1 (sin lectura) is informative-only now and no longer excludes. One consumo, so the
+    # completeness gate still passes; this suministro is excluded -> 1/2 valid (50%) -> Error.
+    lectura_desajustada = await insert_lectura(
+        db_session,
+        suministro_id=suministro_invalido,
+        fecha_lectura=date(2024, 1, 31),
+        lectura_anterior=Decimal("0.000"),
+        lectura_actual=Decimal("50.000"),
+        dias_facturados=99,
+    )
     await insert_consumo(
         db_session,
         suministro_id=suministro_invalido,
@@ -805,6 +826,7 @@ async def test_ml_runs_even_when_lote_lands_in_error_and_retry_stays_idempotent(
         fecha_fin=date(2024, 1, 31),
         dias_facturados=31,
         kwh=Decimal("50.000"),
+        lectura_id=lectura_desajustada,
     )
 
     primera = await motor_client.post("/api/v1/motor/lotes/LOTE-ML-RETRY/procesar")

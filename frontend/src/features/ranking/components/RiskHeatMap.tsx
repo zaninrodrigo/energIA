@@ -21,11 +21,11 @@ export interface RiskHeatMapProps {
 }
 
 function popupHtml(item: ResultadoRankingItem): string {
-  const rutafolio = item.rutafolio ?? "—";
+  const medidor = item.medidor ?? "—";
   return `
     <div style="font-size:12px;line-height:1.4">
-      <strong>${item.numero_suministro}</strong><br/>
-      Rutafolio: ${rutafolio}<br/>
+      <strong>${item.numero_suministro}</strong> (ruta-folio)<br/>
+      Medidor: ${medidor}<br/>
       IRE: <strong>${item.ire_valor}</strong> (${item.ire_nivel})
     </div>`;
 }

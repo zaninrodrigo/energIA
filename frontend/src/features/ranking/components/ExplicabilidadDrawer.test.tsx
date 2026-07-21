@@ -6,7 +6,7 @@ import type { ResultadoRankingItem } from "../types";
 const baseItem: ResultadoRankingItem = {
   suministro_id: "1",
   numero_suministro: "SYN-S42-SUM-00070",
-  rutafolio: "90000000070",
+  medidor: "334604",
   latitud: -26.1189,
   longitud: -58.1731,
   ire_valor: 70,

@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 from uuid import UUID
 
-from energia.contexts.motor.domain.checks import Hallazgo, ejecutar_checks
+from energia.contexts.motor.domain.checks import (
+    CHECKS_INFORMATIVOS,
+    Hallazgo,
+    ejecutar_checks,
+)
 from energia.contexts.motor.domain.completitud import UMBRAL_COMPLETITUD_MINIMA
 from energia.contexts.motor.domain.ports import ConsumoValidacionRow
 
@@ -50,8 +54,12 @@ def construir_informe(lote_id: UUID, filas: list[ConsumoValidacionRow]) -> Infor
     """
     hallazgos = ejecutar_checks(filas)
 
+    # Informative-only checks (CHECKS_INFORMATIVOS, e.g. V1) are reported in `hallazgos` but never
+    # drive an exclusion: a missing lectura annotates the suministro, it does not drop it.
     motivos_por_suministro: dict[UUID, list[str]] = defaultdict(list)
     for hallazgo in hallazgos:
+        if hallazgo.check in CHECKS_INFORMATIVOS:
+            continue
         motivos_por_suministro[hallazgo.suministro_id].append(
             f"{hallazgo.check}: {hallazgo.motivo}"
         )

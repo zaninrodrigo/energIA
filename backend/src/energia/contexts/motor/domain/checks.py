@@ -28,6 +28,14 @@ TOLERANCIA_KWH_LECTURA = Decimal("0.500")
 _UN_DIA = timedelta(days=1)
 
 
+# Checks that ANNOTATE but do NOT exclude the suministro from scoring. V1 (consumo sin lectura,
+# lectura_id NULL) is informative-only: the FK is nullable and real/historical data legitimately
+# arrives without meter readings (AI_ENGINE_SPEC.md §4.1's own note; REAL_DATA_IMPORT_SPEC.md) --
+# a missing lectura does not make the consumo's kWh unanalyzable, so it must not drop the suministro
+# (which, applied to a whole no-lecturas dataset, would exclude 100% of it and fail every lote).
+CHECKS_INFORMATIVOS: frozenset[str] = frozenset({"V1"})
+
+
 @dataclass(frozen=True, slots=True)
 class Hallazgo:
     """One finding from a single Etapa 1 check against one consumo/suministro."""

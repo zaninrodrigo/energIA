@@ -8,7 +8,7 @@ const items: ResultadoRankingItem[] = [
   {
     suministro_id: "1",
     numero_suministro: "SYN-S42-SUM-00070",
-    rutafolio: "90000000070",
+    medidor: "334604",
     latitud: -26.1189,
     longitud: -58.1731,
     ire_valor: 70,
@@ -28,7 +28,7 @@ const items: ResultadoRankingItem[] = [
   {
     suministro_id: "2",
     numero_suministro: "SYN-S42-SUM-00071",
-    rutafolio: "90000000071",
+    medidor: "26185402",
     latitud: -26.3,
     longitud: -58.05,
     ire_valor: 10,
@@ -48,8 +48,8 @@ describe("RankingTable", () => {
   it("renders the expected column headers", () => {
     render(<RankingTable items={items} onSelect={vi.fn()} />);
 
-    expect(screen.getByRole("columnheader", { name: "Número de suministro" })).toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: "Rutafolio" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Ruta-folio (suministro)" })).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Medidor" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Localidad" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "Categoría tarifaria" })).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "IRE" })).toBeInTheDocument();
@@ -70,7 +70,7 @@ describe("RankingTable", () => {
     render(<RankingTable items={items} onSelect={vi.fn()} />);
 
     expect(screen.getByText("SYN-S42-SUM-00070")).toBeInTheDocument();
-    expect(screen.getByText("90000000070")).toBeInTheDocument();
+    expect(screen.getByText("334604")).toBeInTheDocument();
     expect(screen.getByText("Formosa")).toBeInTheDocument();
     expect(screen.getByText("Industrial")).toBeInTheDocument();
     // Two dashes: item 2's `localidad` and its `iee_kwh`, both null.

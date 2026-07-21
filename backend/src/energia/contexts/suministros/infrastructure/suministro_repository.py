@@ -70,6 +70,9 @@ class SqlAlchemySuministroRepository:
             "barrio": suministro.barrio,
             "estado": suministro.estado,
             "fecha_alta": suministro.fecha_alta,
+            "medidor": suministro.medidor,
+            "latitud": suministro.latitud,
+            "longitud": suministro.longitud,
         }
         insert_stmt = pg_insert(SuministroModel).values(**values)
         upsert_stmt = insert_stmt.on_conflict_do_update(
@@ -107,6 +110,9 @@ class SqlAlchemySuministroRepository:
             "barrio": suministro.barrio,
             "estado": suministro.estado,
             "fecha_alta": suministro.fecha_alta,
+            "medidor": suministro.medidor,
+            "latitud": suministro.latitud,
+            "longitud": suministro.longitud,
             "deleted_at": None,
         }
         stmt = (
@@ -158,4 +164,7 @@ def _to_domain(model: SuministroModel) -> Suministro:
         estado=model.estado,
         localidad=model.localidad,
         barrio=model.barrio,
+        medidor=model.medidor,
+        latitud=(float(model.latitud) if model.latitud is not None else None),
+        longitud=(float(model.longitud) if model.longitud is not None else None),
     )

@@ -6,9 +6,9 @@
 
 | Versión | Fecha | Estado | Autor |
 |---|---|---|---|
-| 0.1.0 | 2026-07-21 | Propuesto (pendiente de desarrollo) | Rodrigo Zanin |
+| 0.2.0 | 2026-07-21 | Implementado | Rodrigo Zanin |
 
-Documenta el formato real de los datos de consumo entregados por la distribuidora, su mapeo al modelo de dominio, y dos correcciones/decisiones que surgen de conocer ese formato. Es la especificación para desarrollar el futuro adaptador de importación real. **Ninguna implementación se hace en este documento**: se acordó documentar ahora y desarrollar después.
+Documenta el formato real de los datos de consumo entregados por la distribuidora, su mapeo al modelo de dominio, y las correcciones/decisiones que surgieron al conocer ese formato. **Implementado el 2026-07-21** en `backend/src/energia/tools/real_import/`: la primera entrega real (100 medidores de Formosa) se importó con 0 rechazos y se procesó bimestre a bimestre por el Motor.
 
 > **Privacidad.** El archivo fuente contiene datos personales reales (titular, CUIT, coordenadas de domicilio). No se versiona (`/*.csv` está en `.gitignore`; el repositorio es público). Los ejemplos de este documento están enmascarados.
 
@@ -86,9 +86,16 @@ El consumo real de Formosa es **fuertemente estacional** (el aire acondicionado 
 
 ---
 
-## 6. Pendiente de desarrollo
+## 6. Implementación (2026-07-21)
 
-1. **Migración de esquema:** agregar `suministros.medidor` (varchar, nullable); reconciliar/eliminar `rutafolio` (D3).
-2. **Adaptador de importación:** leer el CSV (latin-1, `;`), mapear según §2.1, crear clientes/suministros/lotes/consumos vía la API de importación (no escribir directo a la base), con la limpieza de §4.
-3. **Generador sintético:** evaluar si se adapta a períodos bimestrales para seguir sirviendo de banco de pruebas coherente con el formato real.
-4. Actualizar `docs/03-architecture/DATABASE_DESIGN.md` y `DOMAIN_MODEL.md` con `medidor` y la aclaración ruta-folio = número de suministro.
+Módulo `backend/src/energia/tools/real_import/`:
+
+- `periods.py` — bimestre → `codigo_lote` `REAL-{AAAA}-B{n}` + límites de fecha (puro, testeado).
+- `parser.py` — CSV (latin-1, `;`) → filas estructuradas; limpieza del prefijo `"B  "` y espacios.
+- `mapper.py` — filas → payloads de clientes/suministros/lotes/consumos (CUIT como `numero_cliente`; categoría por defecto `Residencial`, ver ítem 20 de `PROJECT_MASTER_SPEC.md`).
+- `loader.py` — POST por la API en orden de FK (clientes → suministros → lotes → consumos); reporta rechazos sin abortar (a diferencia del generador sintético).
+- `cli.py` — `python -m energia.tools.real_import --file "<ruta.csv>" --base-url http://localhost:8000`.
+
+Correcciones asociadas ya aplicadas: `medidor` agregado y `rutafolio` eliminado (esquema + write-path + frontend); V1 (consumo sin lectura) pasó a chequeo **informativo** (`CHECKS_INFORMATIVOS`, `motor/domain/checks.py`) para no excluir un dataset histórico sin lecturas.
+
+**Pendiente:** adaptar el generador sintético a períodos bimestrales (hoy es mensual) para que el banco de pruebas siga siendo coherente con el formato real; actualizar `DATABASE_DESIGN.md`/`DOMAIN_MODEL.md` con `medidor`.

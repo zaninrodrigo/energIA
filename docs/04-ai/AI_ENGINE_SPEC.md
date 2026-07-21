@@ -255,7 +255,7 @@ condiciones solo son detectables **en tiempo de análisis** cruzando la cadena i
 
 | # | Chequeo | Fuente | Detalle |
 |---|---|---|---|
-| V1 | Consumo sin lectura asociada | RD-018 | `consumos.lectura_id IS NULL` (la FK es nullable; los históricos pueden no traer detalle) |
+| V1 | Consumo sin lectura asociada | RD-018 | `consumos.lectura_id IS NULL` (la FK es nullable; los históricos pueden no traer detalle). **Chequeo informativo (2026-07-21):** V1 ANOTA pero NO excluye — un dato histórico sin lecturas (como la primera entrega real, `REAL_DATA_IMPORT_SPEC.md`) no debe excluir el 100 % del lote; la falta de lectura no vuelve inanalizable el kWh del consumo. Ver `CHECKS_INFORMATIVOS` en `motor/domain/checks.py`. |
 | V2 | Coherencia kwh vs delta de lectura | RD-013 | Con `lectura_id` presente: comparar `kwh` contra `lectura_actual − lectura_anterior` dentro de una tolerancia |
 | V3 | Coherencia de días facturados | RD-014 | `consumos.dias_facturados` vs `lecturas.dias_facturados`; ambos > 0 |
 | V4 | Continuidad de períodos por suministro | RD-017 | Huecos o solapamientos entre `(fecha_inicio, fecha_fin)` consecutivos del mismo suministro |

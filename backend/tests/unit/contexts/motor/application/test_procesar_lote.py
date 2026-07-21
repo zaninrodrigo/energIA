@@ -377,22 +377,7 @@ async def test_complete_lote_below_threshold_transitions_to_error() -> None:
         ),
         consumos_activos=1,
     )
-    fila_invalida = _fila_valida()
-    fila_invalida = ConsumoValidacionRow(
-        consumo_id=fila_invalida.consumo_id,
-        suministro_id=fila_invalida.suministro_id,
-        fecha_inicio=fila_invalida.fecha_inicio,
-        fecha_fin=fila_invalida.fecha_fin,
-        dias_facturados=fila_invalida.dias_facturados,
-        kwh=fila_invalida.kwh,
-        lectura_id=None,
-        lectura_anterior=None,
-        lectura_actual=None,
-        lectura_dias_facturados=None,
-        prev_fecha_inicio=None,
-        prev_fecha_fin=None,
-        categoria_deleted_at=None,
-    )
+    fila_invalida = _fila_excluida()
     use_case = _construir_use_case(
         lote_port=lote_port,
         validacion_source=FakeValidacionDataSource({lote_id: [fila_invalida]}),
@@ -551,19 +536,20 @@ def _periodos_conflictivos_pair(suministro_id: UUID, *, lote_id: UUID) -> list[P
 
 
 def _fila_excluida(suministro_id: UUID | None = None) -> ConsumoValidacionRow:
-    """A `ConsumoValidacionRow` Etapa 1's V1 excludes (no lectura associated)."""
+    """A `ConsumoValidacionRow` Etapa 1 EXCLUDES (V7: dias_facturados <= 0). Not V1 -- V1 is
+    informative-only now (CHECKS_INFORMATIVOS), it annotates but never excludes."""
     base = _fila_valida(suministro_id)
     return ConsumoValidacionRow(
         consumo_id=base.consumo_id,
         suministro_id=base.suministro_id,
         fecha_inicio=base.fecha_inicio,
         fecha_fin=base.fecha_fin,
-        dias_facturados=base.dias_facturados,
+        dias_facturados=0,
         kwh=base.kwh,
-        lectura_id=None,
-        lectura_anterior=None,
-        lectura_actual=None,
-        lectura_dias_facturados=None,
+        lectura_id=base.lectura_id,
+        lectura_anterior=base.lectura_anterior,
+        lectura_actual=base.lectura_actual,
+        lectura_dias_facturados=0,
         prev_fecha_inicio=None,
         prev_fecha_fin=None,
         categoria_deleted_at=None,

@@ -96,7 +96,7 @@ _LISTAR_SQL_BASE = """
     SELECT
         s.id AS suministro_id,
         s.numero_suministro,
-        s.rutafolio,
+        s.medidor,
         s.latitud,
         s.longitud,
         s.localidad,
@@ -251,7 +251,7 @@ class SqlResultadosRankingRepository:
             ResultadoRankingRow(
                 suministro_id=row.suministro_id,
                 numero_suministro=row.numero_suministro,
-                rutafolio=row.rutafolio,
+                medidor=row.medidor,
                 latitud=(float(row.latitud) if row.latitud is not None else None),
                 longitud=(float(row.longitud) if row.longitud is not None else None),
                 ire_valor=int(row.ire_valor),

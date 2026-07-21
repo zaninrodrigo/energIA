@@ -114,12 +114,12 @@ CREATE TABLE suministros (
     -- sí los explicita); se deja abierto en lugar de inventar un enum no documentado.
     estado                  varchar(15) NOT NULL DEFAULT 'Activo',
     fecha_alta              date        NOT NULL,
-    -- Identificador numérico de 11 dígitos del medidor físico instalado ("el DNI del
-    -- medidor"): clave natural del equipo, distinta de numero_suministro (que identifica
-    -- el punto de suministro, no el medidor). Nullable: medidores legacy/históricos
-    -- pueden no tener este dato relevado todavía (ver ck_suministros_rutafolio_formato
-    -- y el índice único parcial uq_suministros_rutafolio más abajo).
-    rutafolio               varchar(11),
+    -- Serial del medidor físico instalado (número de medidor). Distinto de numero_suministro,
+    -- que es el RUTA-FOLIO del punto de suministro (11 dígitos, clave natural fija): el aparato
+    -- se reemplaza si se rompe, el punto de suministro es fijo. Longitud variable (los datos
+    -- reales muestran 4-10 dígitos). Nullable: puede no estar relevado. Sin restricción de
+    -- unicidad (un serial podría reaparecer al reinstalarse). Ver REAL_DATA_IMPORT_SPEC.md.
+    medidor                 varchar(20),
     -- Geo-referencia del punto de suministro, para graficar anomalías en un mapa
     -- (ACCEPTANCE_CRITERIA.md: "las anomalías deberán agruparse por localidad" al
     -- consultar el mapa). Nullable: suministros legacy/históricos pueden no tener
@@ -136,26 +136,16 @@ CREATE TABLE suministros (
         FOREIGN KEY (cliente_id) REFERENCES clientes (id), -- RD-002/RD-006
     CONSTRAINT fk_suministros_categoria_tarifaria
         FOREIGN KEY (categoria_tarifaria_id) REFERENCES categorias_tarifarias (id), -- RD-005/RD-008
-    -- Exactamente 11 dígitos numéricos. No valida unicidad acá (ver el índice único
-    -- parcial uq_suministros_rutafolio más abajo, que además excluye soft-deleted).
-    CONSTRAINT ck_suministros_rutafolio_formato
-        CHECK (rutafolio IS NULL OR rutafolio ~ '^[0-9]{11}$'),
     CONSTRAINT ck_suministros_latitud_rango
         CHECK (latitud IS NULL OR latitud BETWEEN -90 AND 90),
     CONSTRAINT ck_suministros_longitud_rango
         CHECK (longitud IS NULL OR longitud BETWEEN -180 AND 180)
 );
 
+-- numero_suministro ES el ruta-folio (11 dígitos), clave natural única del punto de suministro
+-- entre los vigentes (REAL_DATA_IMPORT_SPEC.md, decisión D1).
 CREATE UNIQUE INDEX uq_suministros_numero_suministro
     ON suministros (numero_suministro) WHERE deleted_at IS NULL;
-
--- rutafolio identifica de forma única al medidor físico ("el DNI del medidor") entre los
--- suministros vigentes -- mismo criterio que uq_suministros_numero_suministro. La cláusula
--- "AND rutafolio IS NOT NULL" es redundante con cómo Postgres trata NULL en índices únicos
--- (nunca los compara entre sí), pero se deja explícita para que la intención de "parcial
--- por soft delete Y por dato opcional" quede clara en el propio DDL.
-CREATE UNIQUE INDEX uq_suministros_rutafolio
-    ON suministros (rutafolio) WHERE deleted_at IS NULL AND rutafolio IS NOT NULL;
 
 CREATE TRIGGER trg_suministros_set_updated_at
     BEFORE UPDATE ON suministros

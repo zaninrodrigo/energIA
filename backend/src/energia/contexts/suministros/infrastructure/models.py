@@ -17,6 +17,7 @@ this model is never used to INSERT/UPDATE that table, only to SELECT from it.
 
 import uuid
 from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -37,6 +38,9 @@ class SuministroModel(Base):
     barrio: Mapped[str | None] = mapped_column(default=None)
     estado: Mapped[str] = mapped_column()
     fecha_alta: Mapped[date] = mapped_column()
+    medidor: Mapped[str | None] = mapped_column(default=None)
+    latitud: Mapped[Decimal | None] = mapped_column(default=None)
+    longitud: Mapped[Decimal | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column()
     updated_at: Mapped[datetime | None] = mapped_column(default=None)
     deleted_at: Mapped[datetime | None] = mapped_column(default=None)

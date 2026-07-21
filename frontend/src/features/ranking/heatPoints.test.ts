@@ -6,7 +6,7 @@ function item(overrides: Partial<ResultadoRankingItem>): ResultadoRankingItem {
   return {
     suministro_id: "s1",
     numero_suministro: "SYN-S42-SUM-00001",
-    rutafolio: "90000000001",
+    medidor: "26185402",
     latitud: -26.18,
     longitud: -58.17,
     ire_valor: 50,

@@ -31,6 +31,9 @@ _COMPARABLE_FIELDS = (
     "barrio",
     "estado",
     "fecha_alta",
+    "medidor",
+    "latitud",
+    "longitud",
 )
 
 
@@ -151,6 +154,9 @@ class ImportSuministros:
                     estado=record.estado,
                     localidad=record.localidad,
                     barrio=record.barrio,
+                    medidor=record.medidor,
+                    latitud=record.latitud,
+                    longitud=record.longitud,
                 )
             except SuministroValidationError as error:
                 rejected.append(RejectedRecord(record=record, reasons=error.errors))
@@ -174,6 +180,9 @@ class ImportSuministros:
                         estado=candidate.estado,
                         localidad=candidate.localidad,
                         barrio=candidate.barrio,
+                        medidor=candidate.medidor,
+                        latitud=candidate.latitud,
+                        longitud=candidate.longitud,
                     )
                     try:
                         await self._repository.resurrect(resurrected_suministro)
@@ -196,6 +205,9 @@ class ImportSuministros:
                     estado=candidate.estado,
                     localidad=candidate.localidad,
                     barrio=candidate.barrio,
+                    medidor=candidate.medidor,
+                    latitud=candidate.latitud,
+                    longitud=candidate.longitud,
                 )
                 is_new = False
             else:

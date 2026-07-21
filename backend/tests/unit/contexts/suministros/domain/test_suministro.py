@@ -125,6 +125,31 @@ def test_create_rejects_barrio_over_the_schema_length_limit() -> None:
     assert any("barrio" in reason for reason in exc_info.value.errors)
 
 
+def test_create_accepts_and_strips_medidor_and_coordinates() -> None:
+    suministro = _create(medidor=" 334604 ", latitud=-26.1848, longitud=-58.1953)
+
+    assert suministro.medidor == "334604"
+    assert suministro.latitud == -26.1848
+    assert suministro.longitud == -58.1953
+
+
+def test_create_rejects_medidor_over_the_schema_length_limit() -> None:
+    """`suministros.medidor` is varchar(20) (docker/postgres/init/01_schema.sql)."""
+    with pytest.raises(SuministroValidationError) as exc_info:
+        _create(medidor="9" * 21)
+
+    assert any("medidor" in reason for reason in exc_info.value.errors)
+
+
+def test_create_rejects_coordinates_out_of_range() -> None:
+    with pytest.raises(SuministroValidationError) as exc_info:
+        _create(latitud=-100.0, longitud=200.0)
+
+    reasons = exc_info.value.errors
+    assert any("latitud" in reason for reason in reasons)
+    assert any("longitud" in reason for reason in reasons)
+
+
 def test_create_rejects_estado_over_the_schema_length_limit() -> None:
     """`suministros.estado` is varchar(15) (docker/postgres/init/01_schema.sql)."""
     with pytest.raises(SuministroValidationError) as exc_info:
