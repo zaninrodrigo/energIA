@@ -55,3 +55,7 @@ datasets/raw/
 *.pkl
 *.joblib
 mlruns/
+
+# Datos reales de la distribuidora (PII: titular, CUIT, coordenadas de domicilios).
+# NUNCA versionar: el repositorio es público. Guardar en datasets/raw/ (ya ignorado) si se necesita.
+/*.csv
