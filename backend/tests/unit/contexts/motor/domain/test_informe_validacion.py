@@ -81,7 +81,7 @@ def test_below_threshold_reports_umbral_incumplido() -> None:
 
 def test_v1_missing_lectura_annotates_but_does_not_exclude() -> None:
     """V1 is informative-only (CHECKS_INFORMATIVOS): a whole no-lecturas dataset (real historical
-    data) must NOT be 100% excluded -- it is annotated in `hallazgos` but stays valid for scoring."""
+    data) must NOT be 100% excluded -- it is annotated in `hallazgos`, not excluded."""
     lote_id = uuid4()
     filas = [_sin_lectura(_fila_valida()) for _ in range(3)]
 
